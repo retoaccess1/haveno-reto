@@ -131,7 +131,9 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     // risk factor so the relation between the risk categories stays the same as with the default values.
     // We must not change those values as it could lead to invalid offers if amount becomes lower then new trade limit.
     // Increasing might be ok, but needs more thought as well...
-    private static final BigInteger DEFAULT_TRADE_LIMIT_VERY_LOW_RISK = HavenoUtils.xmrToAtomicUnits(100);
+    
+    private static final BigInteger CRYPTO_TRADE_LIMIT_RISK = HavenoUtils.xmrToAtomicUnits(500);
+    private static final BigInteger DEFAULT_TRADE_LIMIT_VERY_LOW_RISK = HavenoUtils.xmrToAtomicUnits(96);
     private static final BigInteger DEFAULT_TRADE_LIMIT_LOW_RISK = HavenoUtils.xmrToAtomicUnits(50);
     private static final BigInteger DEFAULT_TRADE_LIMIT_MID_RISK = HavenoUtils.xmrToAtomicUnits(25);
     private static final BigInteger DEFAULT_TRADE_LIMIT_HIGH_RISK = HavenoUtils.xmrToAtomicUnits(12.5);
@@ -288,7 +290,7 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
 
             // Global
             CASH_DEPOSIT = new PaymentMethod(CASH_DEPOSIT_ID, 4 * DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(CashDepositAccount.SUPPORTED_CURRENCIES)),
-            PAY_BY_MAIL = new PaymentMethod(PAY_BY_MAIL_ID, 8 * DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(PayByMailAccount.SUPPORTED_CURRENCIES)),
+            PAY_BY_MAIL = new PaymentMethod(PAY_BY_MAIL_ID, 8 * DAY, DEFAULT_TRADE_LIMIT_MID_RISK, getAssetCodes(PayByMailAccount.SUPPORTED_CURRENCIES)),
             CASH_AT_ATM = new PaymentMethod(CASH_AT_ATM_ID, 4 * DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(CashAtAtmAccount.SUPPORTED_CURRENCIES)),
             MONEY_GRAM = new PaymentMethod(MONEY_GRAM_ID, 4 * DAY, DEFAULT_TRADE_LIMIT_MID_RISK, getAssetCodes(MoneyGramAccount.SUPPORTED_CURRENCIES)),
             WESTERN_UNION = new PaymentMethod(WESTERN_UNION_ID, 4 * DAY, DEFAULT_TRADE_LIMIT_MID_RISK, getAssetCodes(WesternUnionAccount.SUPPORTED_CURRENCIES)),
@@ -342,10 +344,10 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
             PROMPT_PAY = new PaymentMethod(PROMPT_PAY_ID, DAY, DEFAULT_TRADE_LIMIT_LOW_RISK, getAssetCodes(PromptPayAccount.SUPPORTED_CURRENCIES)),
 
             // Cryptos
-            BLOCK_CHAINS = new PaymentMethod(BLOCK_CHAINS_ID, DAY, DEFAULT_TRADE_LIMIT_VERY_LOW_RISK, Arrays.asList()),
+            BLOCK_CHAINS = new PaymentMethod(BLOCK_CHAINS_ID, DAY, CRYPTO_TRADE_LIMIT_RISK, Arrays.asList()),
             
             // Cryptos with 1 hour trade period
-            BLOCK_CHAINS_INSTANT = new PaymentMethod(BLOCK_CHAINS_INSTANT_ID, TimeUnit.HOURS.toMillis(1), DEFAULT_TRADE_LIMIT_VERY_LOW_RISK, Arrays.asList())
+            BLOCK_CHAINS_INSTANT = new PaymentMethod(BLOCK_CHAINS_INSTANT_ID, TimeUnit.HOURS.toMillis(1), CRYPTO_TRADE_LIMIT_RISK, Arrays.asList())
     );
 
     // TODO: delete this override method, which overrides the paymentMethods variable, when all payment methods supported using structured form api, and make paymentMethods private
