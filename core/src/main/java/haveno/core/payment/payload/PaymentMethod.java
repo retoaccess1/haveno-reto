@@ -500,7 +500,9 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
 
         // We use the class field maxTradeLimit only for mapping the risk factor.
         long riskFactor;
-        if (maxTradeLimit == DEFAULT_TRADE_LIMIT_VERY_LOW_RISK.longValueExact())
+        if (maxTradeLimit == CRYPTO_TRADE_LIMIT_RISK.longValueExact())
+            riskFactor = 1;
+        else if (maxTradeLimit == DEFAULT_TRADE_LIMIT_VERY_LOW_RISK.longValueExact())
             riskFactor = 1;
         else if (maxTradeLimit == DEFAULT_TRADE_LIMIT_LOW_RISK.longValueExact())
             riskFactor = 2;
