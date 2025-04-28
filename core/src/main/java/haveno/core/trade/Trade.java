@@ -787,12 +787,15 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model {
     }
 
     public boolean isFinished() {
-        return isPayoutUnlocked() && isCompleted() && !getProtocol().needsToResendPaymentReceivedMessages();
+        return isPayoutUnlocked() && isCompleted();
     }
 
     public void resetToPaymentSentState() {
         setState(Trade.State.BUYER_SENT_PAYMENT_SENT_MSG);
-        for (TradePeer peer : getAllPeers()) peer.setPaymentReceivedMessage(null);
+        for (TradePeer peer : getAllPeers()) {
+            peer.setPaymentReceivedMessage(null);
+            peer.setPaymentReceivedMessageState(MessageState.UNDEFINED);
+        }
         setPayoutTxHex(null);
     }
 
@@ -809,6 +812,10 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model {
 
     public void requestPersistence() {
         if (processModel.getTradeManager() != null) processModel.getTradeManager().requestPersistence();
+    }
+
+    public void persistNow(@Nullable Runnable completeHandler) {
+        processModel.getTradeManager().persistNow(completeHandler);
     }
 
     public TradeProtocol getProtocol() {
@@ -1450,10 +1457,8 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model {
                 log.info("Creating fee estimate tx for {} {}", getClass().getSimpleName(), getId());
                 saveWallet(); // save wallet before creating fee estimate tx
                 MoneroTxWallet feeEstimateTx = createPayoutTx();
-                BigInteger feeEstimate = feeEstimateTx.getFee();
-                double feeDiff = payoutTx.getFee().subtract(feeEstimate).abs().doubleValue() / feeEstimate.doubleValue(); // TODO: use BigDecimal?
-                if (feeDiff > XmrWalletService.MINER_FEE_TOLERANCE) throw new IllegalArgumentException("Miner fee is not within " + (XmrWalletService.MINER_FEE_TOLERANCE * 100) + "% of estimated fee, expected " + feeEstimate + " but was " + payoutTx.getFee());
-                log.info("Payout tx fee {} is within tolerance, diff %={}", payoutTx.getFee(), feeDiff);
+                HavenoUtils.verifyMinerFee(feeEstimateTx.getFee(), payoutTx.getFee());
+                log.info("Payout tx fee {} is within tolerance");
             }
 
             // set signed payout tx hex
@@ -1852,7 +1857,7 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model {
 
         this.state = state;
         requestPersistence();
-        UserThread.await(() -> {
+        UserThread.execute(() -> {
             stateProperty.set(state);
             phaseProperty.set(state.getPhase());
         });
@@ -1884,7 +1889,7 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model {
 
         this.payoutState = payoutState;
         requestPersistence();
-        UserThread.await(() -> payoutStateProperty.set(payoutState));
+        UserThread.execute(() -> payoutStateProperty.set(payoutState));
     }
 
     public void setDisputeState(DisputeState disputeState) {
@@ -2101,6 +2106,7 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model {
     private MessageState getPaymentSentMessageState() {
         if (isPaymentReceived()) return MessageState.ACKNOWLEDGED;
         if (getSeller().getPaymentSentMessageStateProperty().get() == MessageState.ACKNOWLEDGED) return MessageState.ACKNOWLEDGED;
+        if (getSeller().getPaymentSentMessageStateProperty().get() == MessageState.NACKED) return MessageState.NACKED;
         switch (state) {
             case BUYER_SENT_PAYMENT_SENT_MSG:
                 return MessageState.SENT;

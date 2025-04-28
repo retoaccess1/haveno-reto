@@ -110,7 +110,6 @@ public class XmrWalletService extends XmrWalletBase {
     public static final String MONERO_BINS_DIR = Config.appDataDir().getAbsolutePath();
     public static final String MONERO_WALLET_RPC_NAME = Utilities.isWindows() ? "monero-wallet-rpc.exe" : "monero-wallet-rpc";
     public static final String MONERO_WALLET_RPC_PATH = MONERO_BINS_DIR + File.separator + MONERO_WALLET_RPC_NAME;
-    public static final double MINER_FEE_TOLERANCE = 0.25; // miner fee must be within percent of estimated fee
     public static final MoneroTxPriority PROTOCOL_FEE_PRIORITY = MoneroTxPriority.DEFAULT;
     public static final int MONERO_LOG_LEVEL = -1; // monero library log level, -1 to disable
     private static final MoneroNetworkType MONERO_NETWORK_TYPE = getMoneroNetworkType();
@@ -767,9 +766,8 @@ public class XmrWalletService extends XmrWalletBase {
 
                 // verify miner fee
                 BigInteger minerFeeEstimate = getFeeEstimate(tx.getWeight());
-                double minerFeeDiff = tx.getFee().subtract(minerFeeEstimate).abs().doubleValue() / minerFeeEstimate.doubleValue();
-                if (minerFeeDiff > MINER_FEE_TOLERANCE) throw new RuntimeException("Miner fee is not within " + (MINER_FEE_TOLERANCE * 100) + "% of estimated fee, expected " + minerFeeEstimate + " but was " + tx.getFee() + ", diff%=" + minerFeeDiff);
-                log.info("Trade miner fee {} is within tolerance, diff%={}", tx.getFee(), minerFeeDiff);
+                HavenoUtils.verifyMinerFee(minerFeeEstimate, tx.getFee());
+                log.info("Trade miner fee {} is within tolerance");
 
                 // verify proof to fee address
                 BigInteger actualTradeFee = BigInteger.ZERO;
@@ -1367,11 +1365,16 @@ public class XmrWalletService extends XmrWalletBase {
                  }, THREAD_ID);
             } else {
 
-                // force restart main wallet if connection changed while syncing
-                if (wallet != null) {
-                    log.warn("Force restarting main wallet because connection changed while syncing");
-                    forceRestartMainWallet();
+                // check if ignored
+                if (wallet == null || isShutDownStarted) return;
+                if (HavenoUtils.connectionConfigsEqual(connection, wallet.getDaemonConnection())) {
+                    updatePollPeriod();
+                    return;
                 }
+
+                // force restart main wallet if connection changed while syncing
+                log.warn("Force restarting main wallet because connection changed while syncing");
+                forceRestartMainWallet();
             }
         });
 
@@ -1448,7 +1451,7 @@ public class XmrWalletService extends XmrWalletBase {
                         try {
                             syncWithProgress(true); // repeat sync to latest target height
                         } catch (Exception e) {
-                            log.warn("Error syncing wallet with progress on startup: " + e.getMessage());
+                            if (wallet != null) log.warn("Error syncing wallet with progress on startup: " + e.getMessage());
                             forceCloseMainWallet();
                             requestSwitchToNextBestConnection(sourceConnection);
                             maybeInitMainWallet(true, numSyncAttempts - 1); // re-initialize wallet and sync again
