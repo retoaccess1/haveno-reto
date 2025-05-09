@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=Haveno
+Name=RetoSwap
 Comment=A decentralized monero exchange network.
 Exec=/home/amnesia/Persistent/haveno/App/utils/exec.sh
 Icon=/home/amnesia/Persistent/haveno/App/utils/icon.png
