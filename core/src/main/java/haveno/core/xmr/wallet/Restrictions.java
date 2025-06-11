@@ -26,7 +26,7 @@ import java.math.BigInteger;
 public class Restrictions {
 
     // configure restrictions
-    public static final double MIN_SECURITY_DEPOSIT_PCT = 0.15;
+    public static final double MIN_SECURITY_DEPOSIT_PCT = 0.05;
     public static final double MAX_SECURITY_DEPOSIT_PCT = 0.5;
     public static BigInteger MIN_TRADE_AMOUNT = HavenoUtils.xmrToAtomicUnits(0.1);
     public static BigInteger MIN_SECURITY_DEPOSIT = HavenoUtils.xmrToAtomicUnits(0.1);
