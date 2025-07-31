@@ -48,11 +48,11 @@ mkdir -p "${assets_dir}" || { echo_red "Failed to create directory ${assets_dir}
 
 # Download resources
 echo_blue "Downloading resources for Haveno on Tails ..."
-wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/haveno-dex/haveno/raw/master/scripts/install_tails/assets/exec.sh || { echo_red "Failed to download resource (exec.sh)."; exit 1; }
-wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/haveno-dex/haveno/raw/master/scripts/install_tails/assets/install.sh || { echo_red "Failed to download resource (install.sh)."; exit 1; }
-wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/haveno-dex/haveno/raw/master/scripts/install_tails/assets/haveno.desktop || { echo_red "Failed to resource (haveno.desktop)."; exit 1; }
-wget "${wget_flags}" -cqP "${assets_dir}" https://raw.githubusercontent.com/haveno-dex/haveno/master/scripts/install_tails/assets/icon.png || { echo_red "Failed to download resource (icon.png)."; exit 1; }
-wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/haveno-dex/haveno/raw/master/scripts/install_tails/assets/haveno.yml || { echo_red "Failed to download resource (haveno.yml)."; exit 1; }
+wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/retoaccess1/haveno-reto/raw/master/scripts/install_tails/assets/exec.sh || { echo_red "Failed to download resource (exec.sh)."; exit 1; }
+wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/retoaccess1/haveno-reto/raw/master/scripts/install_tails/assets/install.sh || { echo_red "Failed to download resource (install.sh)."; exit 1; }
+wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/retoaccess1/haveno-reto/raw/master/scripts/install_tails/assets/haveno.desktop || { echo_red "Failed to resource (haveno.desktop)."; exit 1; }
+wget "${wget_flags}" -cqP "${assets_dir}" https://raw.githubusercontent.com/retoaccess1/haveno-reto/master/scripts/install_tails/assets/icon.png || { echo_red "Failed to download resource (icon.png)."; exit 1; }
+wget "${wget_flags}" -cqP "${assets_dir}" https://github.com/retoaccess1/haveno-reto/raw/master/scripts/install_tails/assets/haveno.yml || { echo_red "Failed to download resource (haveno.yml)."; exit 1; }
 
 
 # Create persistent directory
