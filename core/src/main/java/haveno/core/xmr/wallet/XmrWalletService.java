@@ -59,11 +59,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javafx.beans.property.LongProperty;
@@ -91,7 +87,6 @@ import monero.wallet.model.MoneroIncomingTransfer;
 import monero.wallet.model.MoneroOutputQuery;
 import monero.wallet.model.MoneroOutputWallet;
 import monero.wallet.model.MoneroSubaddress;
-import monero.wallet.model.MoneroSyncResult;
 import monero.wallet.model.MoneroTxConfig;
 import monero.wallet.model.MoneroTxPriority;
 import monero.wallet.model.MoneroTxQuery;
@@ -142,7 +137,6 @@ public class XmrWalletService extends XmrWalletBase {
 
     private ChangeListener<? super Number> walletInitListener;
     private TradeManager tradeManager;
-    private ExecutorService syncWalletThreadPool = Executors.newFixedThreadPool(10); // TODO: adjust based on connection type
 
     private final Object lock = new Object();
     private TaskLooper pollLooper;
@@ -245,7 +239,10 @@ public class XmrWalletService extends XmrWalletBase {
 
     @Override
     public void saveWallet() {
-        saveWallet(shouldBackup(wallet));
+        synchronized (walletLock) {
+            saveWallet(shouldBackup(wallet));
+            lastSaveTimeMs = System.currentTimeMillis();
+        }
     }
 
     private boolean shouldBackup(MoneroWallet wallet) {
@@ -256,11 +253,6 @@ public class XmrWalletService extends XmrWalletBase {
         synchronized (walletLock) {
             saveWallet(getWallet(), backup);
         }
-    }
-
-    @Override
-    public void requestSaveWallet() {
-        ThreadUtils.submitToPool(() -> saveWallet()); // save wallet off main thread
     }
 
     public boolean isWalletAvailable() {
@@ -360,23 +352,6 @@ public class XmrWalletService extends XmrWalletBase {
         return useNativeXmrWallet && MoneroUtils.isNativeLibraryLoaded();
     }
 
-    /**
-     * Sync the given wallet in a thread pool with other wallets.
-     */
-    public MoneroSyncResult syncWallet(MoneroWallet wallet) {
-        synchronized (HavenoUtils.getDaemonLock()) { // TODO: lock defeats purpose of thread pool
-            Callable<MoneroSyncResult> task = () -> {
-                return wallet.sync();
-            };
-            Future<MoneroSyncResult> future = syncWalletThreadPool.submit(task);
-            try {
-                return future.get();
-            } catch (Exception e) {
-                throw new MoneroError(e.getMessage());
-            }
-        }
-    }
-
     public void saveWallet(MoneroWallet wallet) {
         saveWallet(wallet, false);
     }
@@ -455,7 +430,7 @@ public class XmrWalletService extends XmrWalletBase {
                 if (Boolean.TRUE.equals(txConfig.getRelay())) {
                     cachedTxs.addFirst(tx);
                     cacheWalletInfo();
-                    requestSaveWallet();
+                    saveWallet();
                 }
                 return tx;
             }
@@ -473,7 +448,7 @@ public class XmrWalletService extends XmrWalletBase {
                 if (Boolean.TRUE.equals(txConfig.getRelay())) {
                     for (MoneroTxWallet tx : txs) cachedTxs.addFirst(tx);
                     cacheWalletInfo();
-                    requestSaveWallet();
+                    saveWallet();
                 }
                 return txs;
             }
@@ -483,7 +458,7 @@ public class XmrWalletService extends XmrWalletBase {
     public List<String> relayTxs(List<String> metadatas) {
         synchronized (walletLock) {
             List<String> txIds = wallet.relayTxs(metadatas);
-            requestSaveWallet();
+            saveWallet();
             return txIds;
         }
     }
@@ -575,8 +550,9 @@ public class XmrWalletService extends XmrWalletBase {
 
             // freeze outputs
             for (String keyImage : unfrozenKeyImages) wallet.freezeOutput(keyImage);
+            cacheNonPoolTxs();
             cacheWalletInfo();
-            requestSaveWallet();
+            saveWallet();
         }
     }
 
@@ -597,8 +573,28 @@ public class XmrWalletService extends XmrWalletBase {
 
             // thaw outputs
             for (String keyImage : frozenKeyImages) wallet.thawOutput(keyImage);
+            cacheNonPoolTxs();
             cacheWalletInfo();
-            requestSaveWallet();
+            saveWallet();
+        }
+    }
+
+    private void cacheNonPoolTxs() {
+
+        // get non-pool txs
+        List<MoneroTxWallet> nonPoolTxs = wallet.getTxs(new MoneroTxQuery().setIncludeOutputs(true).setInTxPool(false));
+
+        // replace non-pool txs in cache
+        for (MoneroTxWallet nonPoolTx : nonPoolTxs) {
+            boolean replaced = false;
+            for (int i = 0; i < cachedTxs.size(); i++) {
+                if (cachedTxs.get(i).getHash().equals(nonPoolTx.getHash())) {
+                    cachedTxs.set(i, nonPoolTx);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) cachedTxs.add(nonPoolTx);
         }
     }
 
@@ -1056,7 +1052,7 @@ public class XmrWalletService extends XmrWalletBase {
         // swap trade payout to available if applicable
         if (tradeManager == null) return;
         Trade trade = tradeManager.getTrade(offerId);
-        if (trade == null || trade.isPayoutUnlocked()) swapAddressEntryToAvailable(offerId, XmrAddressEntry.Context.TRADE_PAYOUT);
+        if (trade == null || trade.isPayoutFinalized()) swapAddressEntryToAvailable(offerId, XmrAddressEntry.Context.TRADE_PAYOUT);
     }
 
     public synchronized void swapPayoutAddressEntryToAvailable(String offerId) {
@@ -1200,7 +1196,7 @@ public class XmrWalletService extends XmrWalletBase {
         Stream<XmrAddressEntry> available = getFundedAvailableAddressEntries().stream();
         available = Stream.concat(available, getAddressEntries(XmrAddressEntry.Context.ARBITRATOR).stream());
         available = Stream.concat(available, getAddressEntries(XmrAddressEntry.Context.OFFER_FUNDING).stream().filter(entry -> !tradeManager.getOpenOfferManager().getOpenOffer(entry.getOfferId()).isPresent()));
-        available = Stream.concat(available, getAddressEntries(XmrAddressEntry.Context.TRADE_PAYOUT).stream().filter(entry -> tradeManager.getTrade(entry.getOfferId()) == null || tradeManager.getTrade(entry.getOfferId()).isPayoutUnlocked()));
+        available = Stream.concat(available, getAddressEntries(XmrAddressEntry.Context.TRADE_PAYOUT).stream().filter(entry -> tradeManager.getTrade(entry.getOfferId()) == null || tradeManager.getTrade(entry.getOfferId()).isPayoutFinalized()));
         return available.filter(addressEntry -> getBalanceForSubaddress(addressEntry.getSubaddressIndex()).compareTo(BigInteger.ZERO) > 0);
     }
 
@@ -1444,7 +1440,7 @@ public class XmrWalletService extends XmrWalletBase {
                     long date = localDateTime.toEpochSecond(ZoneOffset.UTC);
                     user.setWalletCreationDate(date);
                 }
-                walletHeight.set(wallet.getHeight());
+                if (wallet != null) walletHeight.set(wallet.getHeight());
                 isClosingWallet = false;
             }
 
@@ -1464,7 +1460,7 @@ public class XmrWalletService extends XmrWalletBase {
                         }
 
                         // sync main wallet
-                        log.info("Syncing main wallet");
+                        log.info("Syncing main wallet from height " + walletHeight.get());
                         long time = System.currentTimeMillis();
                         MoneroRpcConnection sourceConnection = xmrConnectionService.getConnection();
                         try {
@@ -1999,7 +1995,7 @@ public class XmrWalletService extends XmrWalletBase {
         doPollWallet(true);
     }
 
-    private void doPollWallet(boolean updateTxs) {
+    public void doPollWallet(boolean updateTxs) {
 
         // skip if shut down started
         if (isShutDownStarted) return;
@@ -2036,13 +2032,7 @@ public class XmrWalletService extends XmrWalletBase {
             // sync wallet if behind daemon
             if (walletHeight.get() < xmrConnectionService.getTargetHeight()) {
                 synchronized (walletLock) { // avoid long sync from blocking other operations
-
-                    // TODO: local tests have timing failures unless sync called directly
-                    if (xmrConnectionService.getTargetHeight() - walletHeight.get() < XmrWalletBase.DIRECT_SYNC_WITHIN_BLOCKS) {
-                        syncMainWallet();
-                    } else {
-                        syncWithProgress();
-                    }
+                    syncWithProgress();
                 }
             }
 
@@ -2052,6 +2042,7 @@ public class XmrWalletService extends XmrWalletBase {
                 synchronized (walletLock) { // avoid long fetch from blocking other operations
                     synchronized (HavenoUtils.getDaemonLock()) {
                         MoneroRpcConnection sourceConnection = xmrConnectionService.getConnection();
+                        if (lastPollTxsTimestamp == 0) lastPollTxsTimestamp = System.currentTimeMillis(); // set initial timestamp
                         try {
                             cachedTxs = wallet.getTxs(new MoneroTxQuery().setIncludeOutputs(true));
                             lastPollTxsTimestamp = System.currentTimeMillis();
@@ -2082,7 +2073,7 @@ public class XmrWalletService extends XmrWalletBase {
                     pollInProgress = false;
                 }
             }
-            saveWalletWithDelay();
+            saveWalletIfElapsedTime();
 
             // cache wallet info last
             synchronized (walletLock) {
@@ -2094,14 +2085,6 @@ public class XmrWalletService extends XmrWalletBase {
                     }
                 }
             }
-        }
-    }
-
-    private MoneroSyncResult syncMainWallet() {
-        synchronized (walletLock) {
-            MoneroSyncResult result = syncWallet(wallet);
-            walletHeight.set(wallet.getHeight());
-            return result;
         }
     }
 
@@ -2135,6 +2118,7 @@ public class XmrWalletService extends XmrWalletBase {
         BigInteger unlockedBalance = wallet.getUnlockedBalance();
         cachedSubaddresses = wallet.getSubaddresses(0);
         cachedOutputs = wallet.getOutputs();
+        if (cachedTxs == null) cachedTxs = wallet.getTxs(new MoneroTxQuery().setIncludeOutputs(true).setInTxPool(false));
 
         // cache and notify changes
         if (cachedHeight == null) {

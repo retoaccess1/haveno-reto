@@ -79,7 +79,9 @@ configure(subprojects) {
         slf4jVersion = '1.7.30'
         sparkVersion = '2.5.2'
 
-        os = osdetector.os == 'osx' ? 'mac' : osdetector.os == 'windows' ? 'win' : osdetector.os
+        def osName = osdetector.os == 'osx' ? 'mac' : osdetector.os == 'windows' ? 'win' : osdetector.os
+        def osArch = System.getProperty("os.arch").toLowerCase()
+        os = (osName == 'mac' && (osArch.contains('aarch64') || osArch.contains('arm'))) ? 'mac-aarch64' : osName
     }
 
     repositories {
@@ -610,7 +612,7 @@ configure(project(':desktop')) {
     apply plugin: 'com.github.johnrengelman.shadow'
     apply from: 'package/package.gradle'
 
-    version = '1.2.0-SNAPSHOT'
+    version = '1.2.1-SNAPSHOT'
 
     jar.manifest.attributes(
         "Implementation-Title": project.name,
