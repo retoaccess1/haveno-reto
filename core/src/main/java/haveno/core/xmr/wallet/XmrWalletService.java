@@ -300,7 +300,9 @@ public class XmrWalletService extends XmrWalletBase {
     }
 
     public boolean isProxyApplied(boolean wasWalletSynced) {
-        return xmrConnectionService.isProxyApplied() || preferences.isProxyApplied(wasWalletSynced);
+        MoneroRpcConnection connection = xmrConnectionService.getConnection();
+        if (connection != null && connection.isOnion()) return true; // must use proxy if connected to onion
+        return xmrConnectionService.isProxyApplied() && preferences.isProxyApplied(wasWalletSynced);
     }
 
     public String getWalletPassword() {
@@ -1899,8 +1901,10 @@ public class XmrWalletService extends XmrWalletBase {
         List<Trade> trades = tradeManager.getAllTrades();
         for (Trade trade : trades) {
             tasks.add(() -> {
-                if (trade.walletExists()) {
-                    trade.changeWalletPassword(oldPassword, newPassword); // TODO (woodser): this unnecessarily connects and syncs unopen wallets and leaves open
+                synchronized (trade.getWalletLock()) {
+                    if (trade.walletExists()) {
+                        trade.changeWalletPassword(oldPassword, newPassword); // TODO (woodser): this unnecessarily connects and syncs unopen wallets and leaves open
+                    }
                 }
             });
         }
@@ -1951,7 +1955,7 @@ public class XmrWalletService extends XmrWalletBase {
         synchronized (walletLock) {
             if (isShutDownStarted || isPolling()) return;
             updatePollPeriod();
-            pollLooper = new TaskLooper(() -> pollWallet());
+            pollLooper = new TaskLooper(() -> new Thread(() -> pollWallet()).start());
             pollLooper.start(pollPeriodMs);
         }
     }
@@ -2073,7 +2077,7 @@ public class XmrWalletService extends XmrWalletBase {
                     pollInProgress = false;
                 }
             }
-            saveWalletIfElapsedTime();
+            requestSaveWalletIfElapsedTime();
 
             // cache wallet info last
             synchronized (walletLock) {

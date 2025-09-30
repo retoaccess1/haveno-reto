@@ -382,8 +382,7 @@ public abstract class DisputeManager<T extends DisputeList<Dispute>> extends Sup
                                              ResultHandler resultHandler,
                                              FaultHandler faultHandler) {
         log.info("Opening dispute for {} {}, dispute {}",
-                DisputeOpenedMessage.class.getSimpleName(), trade.getClass().getSimpleName(),
-                dispute.getTradeId(), dispute.getId());
+                trade.getClass().getSimpleName(), dispute.getTradeId(), dispute.getId());
 
         // arbitrator cannot open disputes
         if (trade.isArbitrator()) {
@@ -430,20 +429,24 @@ public abstract class DisputeManager<T extends DisputeList<Dispute>> extends Sup
         // save state
         persistNow(null);
 
-        String disputeInfo = getDisputeInfo(dispute);
-        String sysMsg = dispute.isSupportTicket() ?
-                Res.get("support.youOpenedTicket", disputeInfo, Version.VERSION) :
-                Res.get("support.youOpenedDispute", disputeInfo, Version.VERSION);
-
-        ChatMessage chatMessage = new ChatMessage(
-                getSupportType(),
-                dispute.getTradeId(),
-                keyRing.getPubKeyRing().hashCode(),
-                false,
-                Res.get("support.systemMsg", sysMsg),
-                p2PService.getAddress());
-        chatMessage.setSystemMessage(true);
-        dispute.addAndPersistChatMessage(chatMessage);
+        // add dispute system message once
+        boolean hasSystemMessage = dispute.getChatMessages().stream().anyMatch(ChatMessage::isSystemMessage);
+        if (!hasSystemMessage) {
+            String disputeInfo = getDisputeInfo(dispute);
+            String sysMsg = dispute.isSupportTicket() ?
+                    Res.get("support.youOpenedTicket", disputeInfo, Version.VERSION) :
+                    Res.get("support.youOpenedDispute", disputeInfo, Version.VERSION);
+            ChatMessage chatMessage = new ChatMessage(
+                    getSupportType(),
+                    dispute.getTradeId(),
+                    keyRing.getPubKeyRing().hashCode(),
+                    false,
+                    Res.get("support.systemMsg", sysMsg),
+                    p2PService.getAddress());
+            chatMessage.setSystemMessage(true);
+            dispute.addAndPersistChatMessage(chatMessage);
+        }
+        ChatMessage chatMessage = dispute.getChatMessages().get(dispute.getChatMessages().size() - 1); // last message // TODO: why can't this be assigned to local variable above?
 
         // try to import latest multisig info
         try {
@@ -1178,9 +1181,10 @@ public abstract class DisputeManager<T extends DisputeList<Dispute>> extends Sup
     }
 
     public boolean canSendChatMessages(Dispute dispute) {
+        if (dispute.isClosed()) return false;
         Optional<Trade> tradeOptional = findTrade(dispute);
         if (!tradeOptional.isPresent()) {
-            log.warn("Dispute trade {} does not exist", dispute.getTradeId());
+            //log.warn("Dispute trade {} does not exist", dispute.getTradeId());
             return false;
         }
         Trade trade = tradeOptional.get();
