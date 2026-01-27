@@ -3,7 +3,7 @@
   <id>exchange.haveno.Haveno</id>
   <!-- <icon type="stock">exchange.haveno.Haveno</icon> -->
   <launchable type="desktop-id">exchange.haveno.Haveno.desktop</launchable>
-  <name>Haveno</name>
+  <name>RetoSwap</name>
   <summary>Decentralized P2P exchange built on Monero and Tor</summary>
   <categories>
     <category>Office</category>
@@ -28,7 +28,7 @@
   </supports>
 
   <description>
-    <p>Haveno (pronounced ha‧ve‧no) is a platform for people who want to exchange Monero for fiat currencies like EUR, GBP, and USD or other cryptocurrencies like BTC, ETH, and BCH.</p>
+    <p>RetoSwap is a platform for people who want to exchange Monero for fiat currencies like EUR, GBP, and USD or other cryptocurrencies like BTC, ETH, and BCH.</p>
     <ul>
       <li>All communications are routed through Tor, to preserve your privacy
       </li>
@@ -42,16 +42,16 @@
   </description>
   <screenshots>
     <screenshot type="default">
-      <image>https://github.com/haveno-dex/haveno/blob/master/desktop/package/linux/preview.png</image>
+      <image>https://github.com/retoaccess1/haveno-reto/blob/master/desktop/package/linux/preview.png</image>
       <caption>Recent Trades page</caption>
     </screenshot>
   </screenshots>
 
   <developer id="exchange.haveno">
-    <name>woodser</name>
+    <name>The RetoSwap contributors</name>
   </developer>
-  <url type="homepage">https://haveno.exchange</url>
-  <url type="bugtracker">https://github.com/haveno-dex/haveno/issues</url>
+  <url type="homepage">https://retoswap.com</url>
+  <url type="bugtracker">https://github.com/retoaccess1/haveno-reto/issues</url>
   <content_rating type="oars-1.1">
     <content_attribute id="social-chat">moderate</content_attribute>
     <content_attribute id="social-info">moderate</content_attribute>
