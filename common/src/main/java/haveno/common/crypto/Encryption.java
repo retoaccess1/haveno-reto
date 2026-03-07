@@ -20,6 +20,7 @@ package haveno.common.crypto;
 import haveno.common.util.Hex;
 import haveno.common.util.Utilities;
 import java.io.ByteArrayOutputStream;
+import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -28,6 +29,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
+import java.security.SecureRandom;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
@@ -36,6 +38,7 @@ import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.Mac;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.OAEPParameterSpec;
 import javax.crypto.spec.PSource;
 import javax.crypto.spec.SecretKeySpec;
@@ -47,7 +50,9 @@ public class Encryption {
     private static final String ASYM_CIPHER = "RSA/ECB/OAEPWithSHA-256AndMGF1PADDING";
 
     public static final String SYM_KEY_ALGO = "AES";
-    private static final String SYM_CIPHER = "AES";
+    private static final String SYM_CIPHER = "AES/CBC/PKCS5Padding";
+    private static final String SYM_CIPHER_LEGACY = "AES"; // used only to decrypt legacy ECB-encrypted data
+    private static final int IV_SIZE = 16; // AES block size in bytes
 
     private static final String HMAC = "HmacSHA256";
 
@@ -72,9 +77,16 @@ public class Encryption {
 
     public static byte[] encrypt(byte[] payload, SecretKey secretKey) throws CryptoException {
         try {
+            byte[] iv = new byte[IV_SIZE];
+            new SecureRandom().nextBytes(iv);
             Cipher cipher = Cipher.getInstance(SYM_CIPHER);
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey);
-            return cipher.doFinal(payload);
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, new IvParameterSpec(iv));
+            byte[] ciphertext = cipher.doFinal(payload);
+            // Prepend the IV to the ciphertext so it is available for decryption
+            byte[] result = new byte[IV_SIZE + ciphertext.length];
+            System.arraycopy(iv, 0, result, 0, IV_SIZE);
+            System.arraycopy(ciphertext, 0, result, IV_SIZE, ciphertext.length);
+            return result;
         } catch (Throwable e) {
             log.error("error in encrypt", e);
             throw new CryptoException(e);
@@ -82,8 +94,22 @@ public class Encryption {
     }
 
     public static byte[] decrypt(byte[] encryptedPayload, SecretKey secretKey) throws CryptoException {
+        // Try the current CBC format first: [16-byte IV | ciphertext]
+        if (encryptedPayload.length > IV_SIZE) {
+            try {
+                byte[] iv = Arrays.copyOfRange(encryptedPayload, 0, IV_SIZE);
+                byte[] ciphertext = Arrays.copyOfRange(encryptedPayload, IV_SIZE, encryptedPayload.length);
+                Cipher cipher = Cipher.getInstance(SYM_CIPHER);
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, new IvParameterSpec(iv));
+                return cipher.doFinal(ciphertext);
+            } catch (Throwable e) {
+                // CBC decryption failed — fall through to legacy ECB decryption
+                log.warn("CBC decryption failed, attempting legacy ECB decryption for backward compatibility");
+            }
+        }
+        // Legacy fallback: decrypt data that was encrypted with AES/ECB before this fix
         try {
-            Cipher cipher = Cipher.getInstance(SYM_CIPHER);
+            Cipher cipher = Cipher.getInstance(SYM_CIPHER_LEGACY);
             cipher.init(Cipher.DECRYPT_MODE, secretKey);
             return cipher.doFinal(encryptedPayload);
         } catch (Throwable e) {
