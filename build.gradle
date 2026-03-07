@@ -829,7 +829,7 @@ configure(project(':daemon')) {
             exclude(module: 'animal-sniffer-annotations')
             exclude(module: 'guava')
         }
-        runtimeOnly("io.grpc:grpc-netty-shaded:$grpcVersion") {
+        implementation("io.grpc:grpc-netty-shaded:$grpcVersion") {
             exclude(module: 'animal-sniffer-annotations')
             exclude(module: 'guava')
         }
