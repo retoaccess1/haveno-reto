@@ -38,6 +38,7 @@ import lombok.extern.slf4j.Slf4j;
 public class GrpcServer {
 
     private final Server server;
+    private final Config config;
 
     @Inject
     public GrpcServer(CoreContext coreContext,
@@ -58,6 +59,7 @@ public class GrpcServer {
                       GrpcNotificationsService notificationsService,
                       GrpcXmrConnectionService moneroConnectionsService,
                       GrpcXmrNodeService moneroNodeService) {
+        this.config = config;
         this.server = ServerBuilder.forPort(config.apiPort)
                 .addService(shutdownService)
                 .intercept(passwordAuthInterceptor)
@@ -98,6 +100,11 @@ public class GrpcServer {
         try {
             server.start();
             log.info("listening on port {}", server.getPort());
+            if (config.apiPassword.isEmpty()) {
+                log.warn("WARNING: gRPC API started with no password set. " +
+                        "All API calls will be rejected. " +
+                        "Set --apiPassword=<password> to enable API access.");
+            }
         } catch (IOException ex) {
             throw new UncheckedIOException(ex);
         }
