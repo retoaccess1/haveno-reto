@@ -22,15 +22,16 @@ import com.google.inject.Singleton;
 import haveno.common.config.Config;
 import haveno.core.api.CoreContext;
 import haveno.daemon.grpc.interceptor.PasswordAuthInterceptor;
+import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import static io.grpc.ServerInterceptors.interceptForward;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Server;
-import io.grpc.ServerBuilder;
 import lombok.extern.slf4j.Slf4j;
 
 @Singleton
@@ -58,7 +59,7 @@ public class GrpcServer {
                       GrpcNotificationsService notificationsService,
                       GrpcXmrConnectionService moneroConnectionsService,
                       GrpcXmrNodeService moneroNodeService) {
-        this.server = ServerBuilder.forPort(config.apiPort)
+        this.server = NettyServerBuilder.forAddress(new InetSocketAddress(config.apiHost, config.apiPort))
                 .addService(shutdownService)
                 .intercept(passwordAuthInterceptor)
                 .addService(interceptForward(accountService, config.disableRateLimits ? interceptors() : accountService.interceptors()))
@@ -97,7 +98,7 @@ public class GrpcServer {
     public void start() {
         try {
             server.start();
-            log.info("listening on port {}", server.getPort());
+            log.info("listening on {}:{}", server.getListenSockets(), server.getPort());
         } catch (IOException ex) {
             throw new UncheckedIOException(ex);
         }

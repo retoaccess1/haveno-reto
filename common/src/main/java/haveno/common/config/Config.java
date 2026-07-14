@@ -114,6 +114,7 @@ public class Config {
     public static final String USER_AGENT = "userAgent";
     public static final String NUM_CONNECTIONS_FOR_BTC = "numConnectionsForBtc";
     public static final String API_PASSWORD = "apiPassword";
+    public static final String API_HOST = "apiHost";
     public static final String API_PORT = "apiPort";
     public static final String PREVENT_PERIODIC_SHUTDOWN_AT_SEED_NODE = "preventPeriodicShutdownAtSeedNode";
     public static final String REPUBLISH_MAILBOX_ENTRIES = "republishMailboxEntries";
@@ -216,6 +217,7 @@ public class Config {
     public final String userAgent;
     public final int numConnectionsForBtc;
     public final String apiPassword;
+    public final String apiHost;
     public final int apiPort;
     public final boolean preventPeriodicShutdownAtSeedNode;
     public final boolean republishMailboxEntries;
@@ -647,6 +649,11 @@ public class Config {
                         .withRequiredArg()
                         .defaultsTo("");
 
+        ArgumentAcceptingOptionSpec<String> apiHostOpt =
+                parser.accepts(API_HOST, "gRPC API host (default: 127.0.0.1)")
+                        .withRequiredArg()
+                        .defaultsTo("127.0.0.1");
+
         ArgumentAcceptingOptionSpec<Integer> apiPortOpt =
                 parser.accepts(API_PORT, "gRPC API port")
                         .withRequiredArg()
@@ -816,6 +823,7 @@ public class Config {
             this.numConnectionsForBtc = options.valueOf(numConnectionsForBtcOpt);
 
             this.apiPassword = options.valueOf(apiPasswordOpt);
+            this.apiHost = options.valueOf(apiHostOpt);
             this.apiPort = options.valueOf(apiPortOpt);
             this.preventPeriodicShutdownAtSeedNode = options.valueOf(preventPeriodicShutdownAtSeedNodeOpt);
             this.republishMailboxEntries = options.valueOf(republishMailboxEntriesOpt);
