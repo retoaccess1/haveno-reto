@@ -20,14 +20,18 @@ package haveno.core.offer.placeoffer.tasks;
 import haveno.common.taskrunner.Task;
 import haveno.common.taskrunner.TaskRunner;
 import haveno.core.account.witness.AccountAgeWitnessService;
+import haveno.core.monetary.Price;
+import haveno.core.monetary.Volume;
 import haveno.core.offer.Offer;
 import haveno.core.offer.OfferDirection;
+import haveno.core.offer.OfferRestrictions;
 import haveno.core.offer.placeoffer.PlaceOfferModel;
 import haveno.core.payment.PaymentAccount;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.trade.Trade;
 import haveno.core.trade.messages.TradeMessage;
 import haveno.core.user.User;
+import haveno.core.util.VolumeUtil;
 import haveno.core.xmr.wallet.Restrictions;
 import org.bitcoinj.core.Coin;
 
@@ -60,6 +64,17 @@ public class ValidateOffer extends Task<PlaceOfferModel> {
     }
 
     public static void validateOffer(Offer offer, AccountAgeWitnessService accountAgeWitnessService, User user) {
+        validateOffer(offer, accountAgeWitnessService, user, true);
+    }
+
+    /**
+     * Validate the offer.
+     *
+     * @param requirePrice true if the price must be currently available, which is required to post the offer but not
+     *                     afterwards. A market based offer's price is derived from the price feed at runtime, so it can
+     *                     be temporarily unavailable, which is not an indication that the offer is invalid.
+     */
+    public static void validateOffer(Offer offer, AccountAgeWitnessService accountAgeWitnessService, User user, boolean requirePrice) {
 
         // Coins
         checkBINotNullOrZero(offer.getAmount(), "Amount");
@@ -123,12 +138,16 @@ public class ValidateOffer extends Task<PlaceOfferModel> {
                 "Amount must be above minimum amount of " + HavenoUtils.atomicUnitsToXmr(minAmount) + " XMR");
         checkArgument(offer.getAmount().compareTo(offer.getMinAmount()) >= 0, "Minimum amount is larger than amount");
 
-        checkNotNull(offer.getPrice(), "Price is null");
         if (!offer.isUseMarketBasedPrice()) checkArgument(offer.getPrice().isPositive(),
                 "Price must be positive unless using market based price. price=" + offer.getPrice().toFriendlyString());
+        if (requirePrice) {
+            Price price = checkNotNull(offer.getPrice(), Offer.PRICE_NOT_AVAILABLE_MSG);
+            Volume minVolume = VolumeUtil.getAdjustedVolume(price.getVolumeByAmount(offer.getMinAmount()), offer.getPaymentMethodId());
+            checkArgument(minVolume.getValue() > 0, "Minimum payment amount must be positive at the current price");
+        }
 
-        checkArgument(offer.getOfferPayload().getMarketPriceMarginPct() > -1 && offer.getOfferPayload().getMarketPriceMarginPct() < 1,
-                "Market price margin must be greater than -100% and less than 100% but was " + (offer.getOfferPayload().getMarketPriceMarginPct() * 100) + "%");
+        checkArgument(OfferRestrictions.isValidMarketPriceMargin(offer.getDirection(), offer.getMarketPriceMarginPct()),
+                "Market price margin must be within 100% and keep the price positive but was " + (offer.getMarketPriceMarginPct() * 100) + "%");
 
         checkArgument(offer.getDate().getTime() > 0,
                 "Date must not be 0. date=" + offer.getDate().toString());
@@ -138,7 +157,6 @@ public class ValidateOffer extends Task<PlaceOfferModel> {
         checkNotNull(offer.getId(), "Id is null");
         checkNotNull(offer.getPubKeyRing(), "pubKeyRing is null");
         checkNotNull(offer.getMinAmount(), "MinAmount is null");
-        checkNotNull(offer.getPrice(), "Price is null");
         checkNotNull(offer.getVersionNr(), "VersionNr is null");
         checkArgument(offer.getMaxTradePeriod() > 0,
                 "maxTradePeriod must be positive. maxTradePeriod=" + offer.getMaxTradePeriod());

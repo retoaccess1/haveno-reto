@@ -30,27 +30,57 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFileAttributes;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Scanner;
+import java.util.UUID;
 
 @Slf4j
 public class FileUtil {
 
+    // Where corrupted store files are preserved for recovery; referenced by the
+    // popup.warning.incompatibleDB resource string shown to the user.
+    public static final String CORRUPTED_BACKUP_FOLDER = "backup_of_corrupted_data";
+
     private static final String BACKUP_DIR = "backup";
-    
-    public static void rollingBackup(File dir, String fileName, int numMaxBackupFiles) {
-        if (numMaxBackupFiles <= 0) return;
+
+    // restricts access where POSIX permissions are supported, without blocking access to existing data on failure
+    public static void setOwnerOnlyPermissions(Path path) {
+        try {
+            if (!java.nio.file.Files.getFileStore(path).supportsFileAttributeView(PosixFileAttributeView.class))
+                return;
+            var attributes = java.nio.file.Files.readAttributes(path, PosixFileAttributes.class);
+            var permissions = PosixFilePermissions.fromString(attributes.isDirectory() ? "rwx------" : "rw-------");
+            if (!attributes.permissions().equals(permissions))
+                java.nio.file.Files.setPosixFilePermissions(path, permissions);
+        } catch (IOException e) {
+            log.warn("Could not restrict permissions on {}: {}", path, e.getMessage());
+        }
+    }
+
+    // returns false if a backup copy could not be created, true otherwise (including when there is no file to back up)
+    public static boolean rollingBackup(File dir, String fileName, int numMaxBackupFiles) {
+        if (numMaxBackupFiles <= 0) return true;
         if (dir.exists()) {
             File backupDir = new File(Paths.get(dir.getAbsolutePath(), BACKUP_DIR).toString());
             if (!backupDir.exists())
                 if (!backupDir.mkdir())
                     log.warn("make dir failed.\nBackupDir=" + backupDir.getAbsolutePath());
+            if (backupDir.isDirectory()) setOwnerOnlyPermissions(backupDir.toPath());
 
             File origFile = new File(Paths.get(dir.getAbsolutePath(), fileName).toString());
             if (origFile.exists()) {
@@ -61,18 +91,26 @@ public class FileUtil {
                 if (!backupFileDir.exists())
                     if (!backupFileDir.mkdir())
                         log.warn("make backupFileDir failed.\nBackupFileDir=" + backupFileDir.getAbsolutePath());
+                if (backupFileDir.isDirectory()) setOwnerOnlyPermissions(backupFileDir.toPath());
 
                 File backupFile = new File(Paths.get(backupFileDir.getAbsolutePath(), new Date().getTime() + "_" + fileName).toString());
 
                 try {
+                    // restrict the empty destination before copying sensitive data
+                    backupFile.createNewFile();
+                    setOwnerOnlyPermissions(backupFile.toPath());
                     Files.copy(origFile, backupFile);
 
                     pruneBackup(backupFileDir, numMaxBackupFiles);
                 } catch (IOException e) {
                     log.error("Backup key failed: {}\n", e.getMessage(), e);
+                    if (backupFile.exists() && !backupFile.delete())
+                        log.error("Failed to delete partial backup file: {}", backupFile.getAbsolutePath());
+                    return false;
                 }
             }
         }
+        return true;
     }
 
     public static List<File> getBackupFiles(File dir, String fileName) {
@@ -132,29 +170,26 @@ public class FileUtil {
         deleteDirectory(file, null, true);
     }
 
-    public static void deleteDirectory(File file,
-                                       @Nullable File exclude,
-                                       boolean ignoreLockedFiles) throws IOException {
-        boolean excludeFileFound = false;
+    // Returns false if the file was kept because it is the excluded file or contains it.
+    public static boolean deleteDirectory(File file,
+                                          @Nullable File exclude,
+                                          boolean ignoreLockedFiles) throws IOException {
+        if (exclude != null && file.getAbsolutePath().equals(exclude.getAbsolutePath())) return false;
+        boolean keep = false;
         if (file.isDirectory()) {
             File[] files = file.listFiles();
             if (files != null)
-                for (File f : files) {
-                    boolean excludeFileFoundLocal = exclude != null && f.getAbsolutePath().equals(exclude.getAbsolutePath());
-                    excludeFileFound |= excludeFileFoundLocal;
-                    if (!excludeFileFoundLocal)
-                        deleteDirectory(f, exclude, ignoreLockedFiles);
-                }
+                for (File f : files)
+                    keep |= !deleteDirectory(f, exclude, ignoreLockedFiles);
         }
-        // Finally delete main file/dir if exclude file was not found in directory
-        if (!excludeFileFound && !(exclude != null && file.getAbsolutePath().equals(exclude.getAbsolutePath()))) {
-            try {
-                deleteFileIfExists(file, ignoreLockedFiles);
-            } catch (Throwable t) {
-                log.error("Could not delete file. Error=" + t.toString());
-                throw new IOException(t);
-            }
+        if (keep) return false;
+        try {
+            deleteFileIfExists(file, ignoreLockedFiles);
+        } catch (Throwable t) {
+            log.error("Could not delete file. Error=" + t.toString());
+            throw new IOException(t);
         }
+        return true;
     }
 
     public static void deleteFileIfExists(File file) throws IOException {
@@ -224,6 +259,51 @@ public class FileUtil {
         }
     }
 
+    /**
+     * Replaces target with source atomically where the filesystem supports it, so no crash window
+     * exists with neither file in place ({@link #renameFile} deletes the target first on Windows).
+     */
+    public static void atomicReplace(File source, File target) throws IOException {
+        try {
+            java.nio.file.Files.move(source.toPath(), target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            renameFile(source, target);
+        }
+    }
+
+    // Flush the replacement before touching the current file, then persist the rename.
+    public static void writeAtomically(Path target, byte[] bytes) throws IOException {
+        Path temp = java.nio.file.Files.createTempFile(target.toAbsolutePath().getParent(), "." + target.getFileName() + ".haveno-write-", ".tmp");
+        try {
+            try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.WRITE)) {
+                ByteBuffer buffer = ByteBuffer.wrap(bytes);
+                while (buffer.hasRemaining()) channel.write(buffer);
+                channel.force(true);
+            }
+            java.nio.file.Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            syncFileAndDirectory(target);
+        } finally {
+            java.nio.file.Files.deleteIfExists(temp);
+        }
+    }
+
+    // Only use for files without a live native wallet lock; closing a descriptor can release POSIX locks.
+    public static void syncFileAndDirectory(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            channel.force(true);
+        }
+        syncDirectory(path.toAbsolutePath().getParent());
+    }
+
+    public static void syncDirectory(Path path) throws IOException {
+        // Windows cannot open directory channels; flushing the renamed file also flushes its NTFS metadata.
+        if (Utilities.isWindows()) return;
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            channel.force(true);
+        }
+    }
+
     public static void copyFile(File origin, File target) throws IOException {
         if (!origin.exists()) {
             return;
@@ -257,9 +337,15 @@ public class FileUtil {
             log.warn("make dir failed");
         }
 
-        File corruptedFile = new File(Paths.get(dbDir.getAbsolutePath(), backupFolderName, fileName).toString());
+        File corruptedFile = new File(corruptedBackupDir, fileName);
         if (storageFile.exists()) {
-            renameFile(storageFile, corruptedFile);
+            // Keep the first backup at its original path for existing recovery tools.
+            try {
+                java.nio.file.Files.move(storageFile.toPath(), corruptedFile.toPath());
+            } catch (FileAlreadyExistsException e) {
+                File additionalBackup = new File(corruptedBackupDir, fileName + "." + UUID.randomUUID());
+                java.nio.file.Files.move(storageFile.toPath(), additionalBackup.toPath());
+            }
         }
     }
 

@@ -1,0 +1,262 @@
+/*
+ * This file is part of Haveno.
+ *
+ * Haveno is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at
+ * your option) any later version.
+ *
+ * Haveno is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with Haveno. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package haveno.desktop.app;
+
+import haveno.common.config.BaseCurrencyNetwork;
+import haveno.common.config.Config;
+import haveno.core.locale.Res;
+import haveno.core.user.Preferences;
+import haveno.core.util.FormattingUtils;
+import haveno.desktop.components.AutoTooltipLabel;
+import haveno.desktop.components.DarkModeToggle;
+import haveno.desktop.components.controlsfx.control.PopOver;
+import haveno.desktop.util.GUIUtil;
+import haveno.desktop.util.Transitions;
+import javafx.geometry.Bounds;
+import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.Node;
+import javafx.scene.control.Hyperlink;
+import javafx.scene.control.Label;
+import javafx.scene.image.ImageView;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
+import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
+import javafx.scene.layout.VBox;
+
+/**
+ * Persistent startup surface shown for the whole pre-app phase. It is the scene root from the
+ * first frame and owns the branding chrome (logo, version, theme toggle) once, swapping only its
+ * center content between the password prompt and the loading/connection status. Because the shell
+ * is never rebuilt or swapped, the logo stays fixed across the whole login → connecting → app flow.
+ */
+public class StartupShell extends StackPane {
+
+    // logo size, fixed so the branding never shifts across the startup phases
+    private static final double LOGO_FIT_WIDTH = 450;
+    // match the password prompt's height so progress screens preserve its centered position
+    private static final double CONTENT_HEIGHT = 140;
+    // slim landscape logo shown while tall content like the first-run wizard needs the vertical space
+    private static final double COMPACT_LOGO_FIT_WIDTH = 190;
+
+    private final StackPane appLayer = new StackPane();
+    private final StackPane overlay;
+    private final StackPane contentSlot = new StackPane();
+    private final ImageView logo = new ImageView();
+    private final Hyperlink help = new Hyperlink(Res.get("password.startup.help"));
+    private PopOver helpPopover;
+    private final Preferences preferences;
+    private final Transitions transitions;
+    private boolean compactBranding;
+    private double wizardOverlayBottom = -1;
+
+    public StartupShell(Preferences preferences, Transitions transitions) {
+        this.preferences = preferences;
+        this.transitions = transitions;
+        setId("splash");
+
+        logo.setFitWidth(LOGO_FIT_WIDTH);
+        logo.setPreserveRatio(true);
+        logo.setSmooth(true);
+        applySplashLogo();
+
+        contentSlot.setAlignment(Pos.TOP_CENTER);
+        contentSlot.setMinHeight(CONTENT_HEIGHT);
+
+        Label versionLabel = new AutoTooltipLabel(FormattingUtils.formatVersion());
+        versionLabel.setStyle("-fx-font-size: 0.9em; -fx-text-fill: -bs-color-gray-6;");
+
+        // logo above the swappable content slot, sized to its content so the whole block can be centered
+        // (and recenter on resize) rather than hugging the top
+        VBox column = new VBox(logo, contentSlot);
+        column.setAlignment(Pos.TOP_CENTER);
+        column.setMaxHeight(Region.USE_PREF_SIZE);
+        VBox.setMargin(contentSlot, new Insets(30, 0, 0, 0));
+
+        // theme toggle so the user can switch theme while logging in / connecting
+        DarkModeToggle themeToggle = new DarkModeToggle(preferences);
+        themeToggle.setFitHeight(20);
+
+        help.getStyleClass().add("no-underline");
+        help.setStyle("-fx-font-size: 0.9em;");
+        help.setVisible(false);
+        help.managedProperty().bind(help.visibleProperty());
+        help.disabledProperty().addListener((observable, oldValue, disabled) -> {
+            if (disabled) hideHelp();
+        });
+        help.setOnAction(event -> {
+            if (helpPopover.isShowing()) {
+                hideHelp();
+            } else {
+                helpPopover.show(help, -8);
+                // keep the help card and its shadow inside the application
+                Bounds bounds = localToScreen(getLayoutBounds());
+                helpPopover.setX(Math.max(bounds.getMinX() + 12,
+                        Math.min(helpPopover.getX(), bounds.getMaxX() - helpPopover.getWidth() - 12)));
+                helpPopover.setY(Math.max(bounds.getMinY() + 12,
+                        Math.min(helpPopover.getY(), bounds.getMaxY() - helpPopover.getHeight() - 12)));
+                helpPopover.getScene().getRoot().requestFocus();
+            }
+        });
+        help.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
+            if (event.getCode() == KeyCode.ENTER) {
+                help.fire();
+                event.consume();
+            }
+        });
+
+        // help (left), version (centered) and theme toggle (right) share a fixed bottom bar
+        StackPane bottomBar = new StackPane(help, versionLabel, themeToggle);
+        bottomBar.setMaxHeight(Region.USE_PREF_SIZE);
+        StackPane.setAlignment(help, Pos.CENTER_LEFT);
+        StackPane.setMargin(help, new Insets(0, 0, 0, 12));
+        StackPane.setAlignment(versionLabel, Pos.CENTER);
+        StackPane.setAlignment(themeToggle, Pos.CENTER_RIGHT);
+        StackPane.setMargin(themeToggle, new Insets(0, 12, 0, 0));
+
+        // spacers float the column vertically centered while there is room and collapse when there is not,
+        // so a short window clips the bottom bar area instead of the logo; padding keeps clear of the bottom bar
+        Region topSpacer = new Region();
+        Region bottomSpacer = new Region();
+        // keep a sliver of room above the logo even at minimum window height
+        topSpacer.setMinHeight(12);
+        VBox.setVgrow(topSpacer, Priority.ALWAYS);
+        VBox.setVgrow(bottomSpacer, Priority.ALWAYS);
+        VBox centerColumn = new VBox(topSpacer, column, bottomSpacer);
+        centerColumn.setPadding(new Insets(0, 0, 44, 0));
+
+        // hide the version label when the squashed column reaches the bar, so content never collides with it;
+        // the theme toggle sits clear at the right and stays available
+        overlay = new StackPane() {
+            @Override
+            protected void layoutChildren() {
+                super.layoutChildren();
+                double contentBottom = Math.max(centerColumn.localToParent(column.getBoundsInParent()).getMaxY(), wizardOverlayBottom);
+                versionLabel.setVisible(contentBottom <= bottomBar.getBoundsInParent().getMinY());
+            }
+        };
+        // re-evaluate the bar when content bounds change without a resize (e.g. a footer message appearing)
+        column.boundsInParentProperty().addListener((observable, oldBounds, newBounds) -> overlay.requestLayout());
+        overlay.setId("splash");
+        // full-window layer: never propagate content min size, or the shell would center it oversized and clip the top
+        overlay.setMinSize(0, 0);
+        overlay.getChildren().addAll(centerColumn, bottomBar);
+        StackPane.setAlignment(centerColumn, Pos.TOP_CENTER);
+        StackPane.setAlignment(bottomBar, Pos.BOTTOM_CENTER);
+        StackPane.setMargin(bottomBar, new Insets(0, 0, 12, 0));
+
+        getChildren().addAll(appLayer, overlay);
+    }
+
+    /** Swap startup content within the reserved space, allowing taller error messages to grow as needed. */
+    public void setContent(Region content) {
+        hideHelp();
+        help.setVisible(false);
+        helpPopover = null;
+        contentSlot.getChildren().setAll(content);
+    }
+
+    public void setHelpContent(Region content, Runnable onAutoHide) {
+        hideHelp();
+        helpPopover = new PopOver(content);
+        helpPopover.setDetachable(false);
+        helpPopover.setArrowLocation(PopOver.ArrowLocation.BOTTOM_LEFT);
+        helpPopover.setArrowSize(0);
+        helpPopover.setArrowIndent(0);
+        helpPopover.setAutoFix(false);
+        helpPopover.setAnimated(preferences.isUseAnimations());
+        helpPopover.setOnAutoHide(event -> onAutoHide.run());
+        helpPopover.getScene().addEventFilter(KeyEvent.KEY_PRESSED, event -> {
+            if (event.getCode() == KeyCode.ESCAPE) {
+                hideHelp();
+                help.requestFocus();
+                event.consume();
+            }
+        });
+        help.setDisable(false);
+        help.setVisible(true);
+    }
+
+    public void setHelpDisabled(boolean disabled) {
+        help.setDisable(disabled);
+    }
+
+    public void hideHelp() {
+        if (helpPopover != null) helpPopover.hide();
+    }
+
+    // Switch between the slim landscape logo (compact, for tall content like the first-run wizard) and the full splash
+    // logo. The wizard sizes to its content; other startup screens share a minimum content height.
+    public void setCompactBranding(boolean compact) {
+        if (compactBranding == compact) return;
+        compactBranding = compact;
+        if (compact) {
+            logo.setId("image-logo-splash-landscape");
+            logo.setFitWidth(COMPACT_LOGO_FIT_WIDTH);
+            GUIUtil.setBrandingLogo(logo, preferences, "/images/logo_splash_landscape_light_mode.png",
+                    "/images/logo_splash_landscape_dark_mode.png", COMPACT_LOGO_FIT_WIDTH, 0);
+            VBox.setMargin(contentSlot, new Insets(16, 0, 0, 0));
+            contentSlot.setMinHeight(Region.USE_COMPUTED_SIZE);
+            setWizardBackdrop(true);
+        } else {
+            logo.setFitWidth(LOGO_FIT_WIDTH);
+            applySplashLogo();
+            VBox.setMargin(contentSlot, new Insets(30, 0, 0, 0));
+            contentSlot.setMinHeight(CONTENT_HEIGHT);
+            setWizardBackdrop(false);
+        }
+    }
+
+    /** Scene-space bottom of the floating agreement card, included in the bottom-bar collision check (-1 = none). */
+    public void setWizardOverlayBottom(double bottom) {
+        if (wizardOverlayBottom == bottom) return;
+        wizardOverlayBottom = bottom;
+        overlay.requestLayout();
+    }
+
+    /** Tint the backdrop so a wizard or agreement card reads as a floating panel; compact branding keeps its tint. */
+    public void setWizardBackdrop(boolean active) {
+        if (active) {
+            if (!overlay.getStyleClass().contains("startup-wizard-backdrop")) overlay.getStyleClass().add("startup-wizard-backdrop");
+        } else if (!compactBranding) {
+            overlay.getStyleClass().remove("startup-wizard-backdrop");
+        }
+    }
+
+    // decode the theme's splash logo at device-pixel size for crisp HiDPI rendering; keeps the CSS id as fallback
+    private void applySplashLogo() {
+        boolean mainnet = Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_MAINNET;
+        logo.setId(mainnet ? "image-logo-splash" : "image-logo-splash-testnet");
+        String splashBase = mainnet ? "/images/logo_splash" : "/images/logo_splash_testnet";
+        GUIUtil.setBrandingLogo(logo, preferences, splashBase + "_light_mode.png", splashBase + "_dark_mode.png", LOGO_FIT_WIDTH, 0);
+    }
+
+    /** Place the main app UI behind the overlay, ready to be revealed when startup completes. */
+    public void setAppContent(Node app) {
+        appLayer.getChildren().setAll(app);
+    }
+
+    /** Fade the branding overlay out to reveal the app, then run the given cleanup. */
+    public void fadeOutOverlay(Runnable onFinished) {
+        transitions.fadeOutAndRemove(overlay, 1500, e -> {
+            if (onFinished != null) onFinished.run();
+        });
+    }
+}

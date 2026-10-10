@@ -74,6 +74,15 @@ public class HavenoDaemonMain extends HavenoHeadlessAppMain {
     /////////////////////////////////////////////////////////////////////////////////////
 
     @Override
+    protected int doExecute() {
+        if (config.apiPassword == null || config.apiPassword.isBlank()) {
+            System.err.println("error: Cannot start the gRPC API with an empty apiPassword; set --apiPassword to a strong secret");
+            System.exit(EXIT_FAILURE);
+        }
+        return super.doExecute();
+    }
+
+    @Override
     protected void configUserThread() {
         final ThreadFactory threadFactory = new ThreadFactoryBuilder()
                 .setNameFormat(this.getClass().getSimpleName())
@@ -128,8 +137,11 @@ public class HavenoDaemonMain extends HavenoHeadlessAppMain {
 
     @Override
     public void gracefulShutDown(ResultHandler resultHandler, boolean exit) {
+        if (grpcServer != null) { // null if shutting down early
+            grpcServer.shutdown(); // stop accepting api calls first so clients polling during a restart cannot reach the old server
+            if (!exit) grpcServer.awaitTermination(); // let a delete or restore reply out before tor goes down; on exit the stop call replies after the shutdown
+        }
         super.gracefulShutDown(resultHandler, exit);
-        if (grpcServer != null) grpcServer.shutdown(); // could be null if application attempted to shutdown early
     }
 
     /**
@@ -150,7 +162,6 @@ public class HavenoDaemonMain extends HavenoHeadlessAppMain {
             } else {
 
                 // Nonblocking, we need to stop if the login occurred through rpc.
-                // TODO: add a mode to mask password
                 ConsoleInput reader = new ConsoleInput(Integer.MAX_VALUE, Integer.MAX_VALUE, TimeUnit.MILLISECONDS);
                 Thread t = new Thread(() -> {
                     interactiveLogin(reader);
@@ -161,6 +172,8 @@ public class HavenoDaemonMain extends HavenoHeadlessAppMain {
                 AccountServiceListener accountListener = new AccountServiceListener() {
                     @Override public void onAccountCreated() { onLogin(); }
                     @Override public void onAccountOpened() { onLogin(); }
+                    @Override public void onAccountDeleted(Runnable onShutdown) { reader.cancel(); } // end the interactive login, the restart is pending
+                    @Override public void onAccountRestored(Runnable onShutdown) { reader.cancel(); }
                     private void onLogin() {
                         log.info("Logged in successfully");
                         reader.cancel(); // closing the reader will stop all read attempts and end the interactive login thread
@@ -216,22 +229,16 @@ public class HavenoDaemonMain extends HavenoHeadlessAppMain {
             try {
                 if (accountExists) {
                     try {
-                        // readPassword will not return until the user inputs something
-                        // which is not suitable if we are waiting for rpc call which
-                        // could login the account. Must be able to interrupt the read.
-                        //new String(console.readPassword("Password:"));
-                        System.out.printf("Password:\n");
-                        String password = reader.readLine();
+                        // Console.readPassword() is not used because it cannot be interrupted by a login over rpc.
+                        String password = reader.readPassword("Password:");
                         accountService.openAccount(password);
                     } catch (IncorrectPasswordException ipe) {
                         System.out.printf("Incorrect password\n");
                     }
                 } else {
                     System.out.printf("Creating a new account\n");
-                    System.out.printf("Password:\n");
-                    String password = reader.readLine();
-                    System.out.printf("Confirm:\n");
-                    String passwordConfirm = reader.readLine();
+                    String password = reader.readPassword("Password:");
+                    String passwordConfirm = reader.readPassword("Confirm:");
                     if (password.equals(passwordConfirm)) {
                         accountService.createAccount(password);
                         openedOrCreated = "Account created\n";
@@ -239,8 +246,12 @@ public class HavenoDaemonMain extends HavenoHeadlessAppMain {
                         System.out.printf("Passwords did not match\n");
                     }
                 }
-            } catch (Exception ex) {
+            } catch (InterruptedException | CancellationException ex) {
                 log.debug(ex.getMessage());
+                return false;
+            } catch (Exception ex) {
+                log.error("Account login failed: {}", ex.getMessage(), ex);
+                System.out.printf("Account login failed: %s%n", ex.getMessage());
                 return false;
             }
         }

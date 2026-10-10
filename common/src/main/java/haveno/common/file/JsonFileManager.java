@@ -27,6 +27,7 @@ import java.io.PrintWriter;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 
 @Slf4j
@@ -72,7 +73,13 @@ public class JsonFileManager {
     }
 
     public void writeToDiscThreaded(String json, String fileName) {
-        getExecutor().execute(() -> writeToDisc(json, fileName));
+        try {
+            getExecutor().execute(() -> writeToDisc(json, fileName));
+        } catch (RejectedExecutionException e) {
+            // Depending on shutdown ordering, a write scheduled before shutdown can arrive after
+            // the executor has been shut down. Losing that write is fine; propagating is not.
+            log.warn("Skipping JSON write of {} because the executor has been shut down", fileName);
+        }
     }
 
     public void writeToDisc(String json, String fileName) {
@@ -80,8 +87,9 @@ public class JsonFileManager {
         File tempFile = null;
         PrintWriter printWriter = null;
         try {
+            // No tempFile.deleteOnExit(): each write's unique temp path leaks into a JVM-global set that
+            // is never purged. Cleanup is handled by the rename on success and the finally block on failure.
             tempFile = File.createTempFile("temp", null, dir);
-            tempFile.deleteOnExit();
 
             printWriter = new PrintWriter(tempFile);
             printWriter.println(json);
@@ -98,14 +106,15 @@ public class JsonFileManager {
             log.error("storageFile " + jsonFile.toString());
             t.printStackTrace();
         } finally {
+            // Close first so the temp file is unlocked (on Windows) before we try to delete it.
+            if (printWriter != null)
+                printWriter.close();
+
             if (tempFile != null && tempFile.exists()) {
                 log.warn("Temp file still exists after failed save. We will delete it now. storageFile=" + fileName);
                 if (!tempFile.delete())
                     log.error("Cannot delete temp file.");
             }
-
-            if (printWriter != null)
-                printWriter.close();
         }
     }
 }

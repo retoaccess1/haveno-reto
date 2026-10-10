@@ -47,15 +47,15 @@ public class MakerSendInitTradeRequestToArbitrator extends TradeTask {
         try {
             runInterceptHook();
 
-            // get least used arbitrator
-            Arbitrator leastUsedArbitrator = DisputeAgentSelection.getLeastUsedArbitrator(processModel.getTradeStatisticsManager(), processModel.getArbitratorManager());
-            if (leastUsedArbitrator == null) {
-                failed("Could not get least used arbitrator to send " + InitTradeRequest.class.getSimpleName() + " for offer " + trade.getId());
+            // get random arbitrator
+            Arbitrator arbitrator = DisputeAgentSelection.getRandomArbitrator(processModel.getArbitratorManager());
+            if (arbitrator == null) {
+                failed("Could not get random arbitrator to send " + InitTradeRequest.class.getSimpleName() + " for offer " + trade.getId());
                 return;
             }
 
-            // send request to least used arbitrators until success
-            sendInitTradeRequests(leastUsedArbitrator.getNodeAddress(), new HashSet<NodeAddress>(), () -> {
+            // send request to available arbitrators until success
+            sendInitTradeRequests(arbitrator.getNodeAddress(), new HashSet<NodeAddress>(), () -> {
                 trade.addInitProgressStep();
                 complete();
             }, (errorMessage) -> {
@@ -68,40 +68,50 @@ public class MakerSendInitTradeRequestToArbitrator extends TradeTask {
     }
 
     private void sendInitTradeRequests(NodeAddress arbitratorNodeAddress, Set<NodeAddress> excludedArbitrators, ResultHandler resultHandler, ErrorMessageHandler errorMessageHandler) {
-        sendInitTradeRequest(arbitratorNodeAddress, new SendDirectMessageListener() {
-            @Override
-            public void onArrived() {
-                log.info("{} arrived at arbitrator: offerId={}", InitTradeRequest.class.getSimpleName(), trade.getId());
+        try {
+            sendInitTradeRequest(arbitratorNodeAddress, new SendDirectMessageListener() {
+                @Override
+                public void onArrived() {
+                    log.info("{} arrived at arbitrator: offerId={}", InitTradeRequest.class.getSimpleName(), trade.getId());
 
-                // check if trade still exists
-                if (!processModel.getTradeManager().hasOpenTrade(trade)) {
-                    errorMessageHandler.handleErrorMessage("Trade protocol no longer exists, tradeId=" + trade.getId());
-                    return;
-                }
-                resultHandler.handleResult();
-            }
-
-            // if unavailable, try alternative arbitrator
-            @Override
-            public void onFault(String errorMessage) {
-                log.warn("Arbitrator unavailable: address={}, error={}", arbitratorNodeAddress, errorMessage);
-                excludedArbitrators.add(arbitratorNodeAddress);
-
-                // check if trade still exists
-                if (!processModel.getTradeManager().hasOpenTrade(trade)) {
-                    errorMessageHandler.handleErrorMessage("Trade protocol no longer exists, tradeId=" + trade.getId());
-                    return;
+                    // check if trade still exists
+                    if (!processModel.getTradeManager().hasOpenTrade(trade)) {
+                        errorMessageHandler.handleErrorMessage("Trade protocol no longer exists, tradeId=" + trade.getId());
+                        return;
+                    }
+                    resultHandler.handleResult();
                 }
 
-                Arbitrator altArbitrator = DisputeAgentSelection.getLeastUsedArbitrator(processModel.getTradeStatisticsManager(), processModel.getArbitratorManager(), excludedArbitrators);
-                if (altArbitrator == null) {
-                    errorMessageHandler.handleErrorMessage("Cannot take offer because no arbitrators are available");
-                    return;
+                // if unavailable, try alternative arbitrator
+                @Override
+                public void onFault(String errorMessage) {
+                    log.warn("Arbitrator unavailable: address={}, error={}", arbitratorNodeAddress, errorMessage);
+                    tryAlternativeArbitrator(arbitratorNodeAddress, excludedArbitrators, resultHandler, errorMessageHandler);
                 }
-                log.info("Using alternative arbitrator {}", altArbitrator.getNodeAddress());
-                sendInitTradeRequests(altArbitrator.getNodeAddress(), excludedArbitrators, resultHandler, errorMessageHandler);
-            }
-        });
+            });
+        } catch (Exception e) {
+            // an arbitrator rejected before sending (e.g. sharing an identity with a trader) is excluded like an unavailable one
+            log.warn("Cannot send {} to arbitrator: address={}, error={}", InitTradeRequest.class.getSimpleName(), arbitratorNodeAddress, e.getMessage());
+            tryAlternativeArbitrator(arbitratorNodeAddress, excludedArbitrators, resultHandler, errorMessageHandler);
+        }
+    }
+
+    private void tryAlternativeArbitrator(NodeAddress excludedArbitrator, Set<NodeAddress> excludedArbitrators, ResultHandler resultHandler, ErrorMessageHandler errorMessageHandler) {
+        excludedArbitrators.add(excludedArbitrator);
+
+        // check if trade still exists
+        if (!processModel.getTradeManager().hasOpenTrade(trade)) {
+            errorMessageHandler.handleErrorMessage("Trade protocol no longer exists, tradeId=" + trade.getId());
+            return;
+        }
+
+        Arbitrator altArbitrator = DisputeAgentSelection.getRandomArbitrator(processModel.getArbitratorManager(), excludedArbitrators);
+        if (altArbitrator == null) {
+            errorMessageHandler.handleErrorMessage("Cannot take offer because no arbitrators are available");
+            return;
+        }
+        log.info("Using alternative arbitrator {}", altArbitrator.getNodeAddress());
+        sendInitTradeRequests(altArbitrator.getNodeAddress(), excludedArbitrators, resultHandler, errorMessageHandler);
     }
 
     private void sendInitTradeRequest(NodeAddress arbitratorNodeAddress, SendDirectMessageListener listener) {
@@ -114,6 +124,9 @@ public class MakerSendInitTradeRequestToArbitrator extends TradeTask {
         processModel.getArbitrator().setPubKeyRing(arbitrator.getPubKeyRing());
         trade.getArbitrator().setNodeAddress(arbitratorNodeAddress);
         trade.getArbitrator().setPubKeyRing(processModel.getArbitrator().getPubKeyRing());
+
+        // re-check identities now that the arbitrator is known, since it was unset when the maker processed the request
+        trade.verifyPeerIdentitiesDiffer();
 
         // create request to arbitrator
         InitTradeRequest takerRequest = (InitTradeRequest) processModel.getTradeMessage(); // taker's InitTradeRequest to maker

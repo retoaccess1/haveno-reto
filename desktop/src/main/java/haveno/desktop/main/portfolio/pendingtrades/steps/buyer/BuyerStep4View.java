@@ -17,26 +17,26 @@
 
 package haveno.desktop.main.portfolio.pendingtrades.steps.buyer;
 
+import haveno.desktop.main.portfolio.pendingtrades.TradeFormPane;
 import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.core.locale.Res;
 import haveno.core.user.DontShowAgainLookup;
 import haveno.core.xmr.model.XmrAddressEntry;
 import haveno.desktop.components.AutoTooltipButton;
-import haveno.desktop.components.TitledGroupBg;
 import haveno.desktop.main.MainView;
 import haveno.desktop.main.overlays.notifications.Notification;
-import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.main.overlays.windows.TradeFeedbackWindow;
 import haveno.desktop.main.portfolio.PortfolioView;
 import haveno.desktop.main.portfolio.closedtrades.ClosedTradesView;
 import haveno.desktop.main.portfolio.pendingtrades.PendingTradesViewModel;
 import haveno.desktop.main.portfolio.pendingtrades.steps.TradeStepView;
-import haveno.desktop.util.Layout;
+import haveno.desktop.util.GlyphsDude;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import javafx.geometry.Insets;
+import javafx.scene.control.Label;
 import javafx.scene.control.Button;
 import javafx.scene.layout.GridPane;
-import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 
 import java.util.concurrent.TimeUnit;
@@ -76,7 +76,7 @@ public class BuyerStep4View extends TradeStepView {
     protected void addContent() {
         gridPane.getColumnConstraints().get(1).setHgrow(Priority.SOMETIMES);
 
-        TitledGroupBg completedTradeLabel = new TitledGroupBg();
+        Label completedTradeLabel = new Label();
         if (trade.getDisputeState().isMediated()) {
             completedTradeLabel.setText(Res.get("portfolio.pending.step5_buyer.groupTitle.mediated"));
         } else if (trade.getDisputeState().isDisputed() && trade.getDisputeResult() != null) {
@@ -85,23 +85,28 @@ public class BuyerStep4View extends TradeStepView {
             completedTradeLabel.setText(Res.get("portfolio.pending.step5_buyer.groupTitle"));
         }
 
-        HBox hBox2 = new HBox(1, completedTradeLabel);
-        GridPane.setMargin(hBox2, new Insets(18, -10, -12, -10));
-        gridPane.getChildren().add(hBox2);
-        GridPane.setRowSpan(hBox2, 5);
-
+        completedTradeLabel.setWrapText(true);
+        completedTradeLabel.getStyleClass().add("trade-action-title");
+        completedTradeLabel.setGraphic(GlyphsDude.createIcon(FontAwesomeIcon.CHECK_CIRCLE, "22"));
+        completedTradeLabel.getGraphic().getStyleClass().add("trade-completed-icon");
+        completedTradeLabel.setGraphicTextGap(10);
+        gridPane.add(completedTradeLabel, 0, gridRow, 2, 1);
         if (trade.isPaymentReceived()) {
-            addCompactTopLabelTextField(gridPane, gridRow, getXmrTradeAmountLabel(), model.getTradeVolume(), Layout.TWICE_FIRST_ROW_DISTANCE);
-            addCompactTopLabelTextField(gridPane, ++gridRow, getTraditionalTradeAmountLabel(), model.getFiatVolume());
-            addCompactTopLabelTextField(gridPane, ++gridRow, Res.get("portfolio.pending.step5_buyer.refunded"), model.getSecurityDeposit());
-            addCompactTopLabelTextField(gridPane, ++gridRow, Res.get("portfolio.pending.step5_buyer.tradeFee"), model.getTradeFee());
+            TradeFormPane summary = new TradeFormPane();
+            addCompactTopLabelTextField(summary, 0, getXmrTradeAmountLabel(), model.getTradeVolume());
+            addCompactTopLabelTextField(summary, 1, getTraditionalTradeAmountLabel(), model.getFiatVolume());
+            addCompactTopLabelTextField(summary, 2, Res.get("portfolio.pending.step5_buyer.refunded"), model.getSecurityDeposit());
+            addCompactTopLabelTextField(summary, 3, Res.get("portfolio.pending.step5_buyer.tradeFee"), model.getTradeFee());
+            summary.finish(false);
+            summary.getStyleClass().add("trade-completed-summary");
+            gridPane.add(summary, 0, ++gridRow, 2, 1);
         }
 
         closeButton = new AutoTooltipButton(Res.get("shared.close"));
         closeButton.setDefaultButton(true);
         closeButton.getStyleClass().add("action-button");
         GridPane.setRowIndex(closeButton, ++gridRow);
-        GridPane.setMargin(closeButton, new Insets(Layout.GROUP_DISTANCE, 10, 0, 0));
+        GridPane.setMargin(closeButton, new Insets(4, 0, 0, 0));
         gridPane.getChildren().add(closeButton);
 
         closeButton.setOnAction(e -> {
@@ -120,6 +125,7 @@ public class BuyerStep4View extends TradeStepView {
     }
 
     private void handleTradeCompleted() {
+        if (closeCallback != null) closeCallback.run(); // move focus off the button before it's disabled and removed
         closeButton.setDisable(true);
         model.dataModel.xmrWalletService.swapAddressEntryToAvailable(trade.getId(), XmrAddressEntry.Context.TRADE_PAYOUT);
 
@@ -131,20 +137,8 @@ public class BuyerStep4View extends TradeStepView {
         if (!DevEnv.isDevMode() && preferences.showAgain(key)) {
             UserThread.runAfter(() -> new TradeFeedbackWindow()
                     .dontShowAgainId(key)
-                    .onAction(this::showNavigateToClosedTradesViewPopup)
-                    .show(), 500, TimeUnit.MILLISECONDS);
-        } else {
-            showNavigateToClosedTradesViewPopup();
-        }
-    }
-
-    private void showNavigateToClosedTradesViewPopup() {
-        if (!DevEnv.isDevMode()) {
-            UserThread.runAfter(() -> new Popup().headLine(Res.get("portfolio.pending.step5_buyer.tradeCompleted.headline"))
-                    .feedback(Res.get("portfolio.pending.step5_buyer.tradeCompleted.msg"))
                     .actionButtonTextWithGoTo("portfolio.tab.history")
                     .onAction(() -> model.dataModel.navigation.navigateTo(MainView.class, PortfolioView.class, ClosedTradesView.class))
-                    .dontShowAgainId("tradeCompleteWithdrawCompletedInfo")
                     .show(), 500, TimeUnit.MILLISECONDS);
         }
     }

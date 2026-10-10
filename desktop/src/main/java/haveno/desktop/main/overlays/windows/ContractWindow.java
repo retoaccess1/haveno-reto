@@ -36,9 +36,9 @@ import haveno.core.trade.Contract;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.util.FormattingUtils;
 import haveno.core.util.VolumeUtil;
-import haveno.desktop.components.HavenoTextArea;
 import haveno.desktop.main.MainView;
 import haveno.desktop.main.overlays.Overlay;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.DisplayUtils;
 import haveno.desktop.util.GUIUtil;
 import static haveno.desktop.util.DisplayUtils.getAccountWitnessDescription;
@@ -58,6 +58,7 @@ import javafx.geometry.Insets;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
+import javafx.scene.control.TextField;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.Tooltip;
 import javafx.scene.input.KeyCode;
@@ -140,8 +141,9 @@ public class ContractWindow extends Overlay<ContractWindow> {
             rows++;
 
         addTitledGroupBg(gridPane, ++rowIndex, rows, Res.get("contractWindow.title"));
-        addConfirmationLabelTextField(gridPane, rowIndex, Res.get("shared.offerId"), offer.getId(),
-                Layout.TWICE_FIRST_ROW_DISTANCE);
+        Tuple2<Label, TextField> offerIdTuple = addConfirmationLabelTextField(gridPane, rowIndex, Res.get("shared.offerId"),
+                offer.getId(), Layout.TWICE_FIRST_ROW_DISTANCE);
+        Accessibility.setHelp(offerIdTuple.second, Accessibility.spellOut(offer.getId()));
         addSeparator(gridPane, ++rowIndex);
         addConfirmationLabelTextField(gridPane, ++rowIndex, Res.get("contractWindow.dates"),
                 DisplayUtils.formatDateTime(offer.getDate()) + " / " + DisplayUtils.formatDateTime(dispute.getTradeDate()));
@@ -302,13 +304,14 @@ public class ContractWindow extends Overlay<ContractWindow> {
                 Res.get("shared.viewContractAsJson"), 0).second;
         viewContractButton.setDefaultButton(false);
         viewContractButton.setOnAction(e -> {
-            TextArea textArea = new HavenoTextArea();
+            TextArea textArea = new TextArea();
             String contractAsJson = dispute.getContractAsJson();
             textArea.setText(contractAsJson);
             textArea.setPrefHeight(50);
             textArea.setEditable(false);
             textArea.setWrapText(true);
             textArea.setPrefSize(800, 600);
+            textArea.getStyleClass().add("window-text-area");
 
             Scene viewContractScene = new Scene(textArea);
             Stage viewContractStage = new Stage();
@@ -317,6 +320,7 @@ public class ContractWindow extends Overlay<ContractWindow> {
             if (owner == null)
                 owner = MainView.getRootContainer();
             Scene rootScene = owner.getScene();
+            viewContractScene.getStylesheets().setAll(rootScene.getStylesheets());
             viewContractStage.initOwner(rootScene.getWindow());
             viewContractStage.initModality(Modality.NONE);
             viewContractStage.initStyle(StageStyle.UTILITY);

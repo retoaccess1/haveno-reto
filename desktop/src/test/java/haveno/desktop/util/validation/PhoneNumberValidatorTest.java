@@ -1,11 +1,31 @@
 package haveno.desktop.util.validation;
 
 import haveno.core.locale.Res;
+import haveno.core.payment.MbWayAccount;
+import haveno.core.payment.PagoMovilAccount;
+import haveno.core.payment.SwishAccount;
+import haveno.core.payment.TwintAccount;
+import haveno.core.payment.payload.SwishAccountPayload;
+import haveno.core.payment.payload.MbWayAccountPayload;
+import haveno.core.payment.payload.PagoMovilAccountPayload;
+import haveno.core.payment.payload.TwintAccountPayload;
 import haveno.core.payment.validation.PhoneNumberValidator;
+import haveno.core.payment.validation.MbWayValidator;
+import haveno.core.payment.validation.PagoMovilValidator;
+import haveno.core.payment.validation.SwishValidator;
+import haveno.core.payment.validation.TwintValidator;
+import haveno.core.util.validation.InputValidator;
 import haveno.core.util.validation.InputValidator.ValidationResult;
+import haveno.desktop.components.paymentmethods.SwishForm;
+import haveno.desktop.components.paymentmethods.MbWayForm;
+import haveno.desktop.components.paymentmethods.PagoMovilForm;
+import haveno.desktop.components.paymentmethods.TwintForm;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -18,6 +38,116 @@ public class PhoneNumberValidatorTest {
     @BeforeEach
     public void setup() {
         Res.setup();
+    }
+
+    @Test
+    public void testMbWayFormValidationPreservesStoredNumber() {
+        MbWayAccount account = new MbWayAccount();
+        account.init();
+        account.setAccountName("mb way account");
+        account.setHolderName("Alice");
+        ((MbWayAccountPayload) account.getPaymentAccountPayload()).setMobileNr("912 345 678");
+        byte[] witnessInput = account.getPaymentAccountPayload().getAgeWitnessInputData();
+        MbWayForm form = new MbWayForm(account, null, new MbWayValidator(), new InputValidator(), null, 0, null);
+        account.setAccountName("renamed account");
+        form.updateAllInputsValid();
+        assertTrue(form.allInputsValidProperty().get());
+        assertEquals("912 345 678", account.getMobileNr());
+        assertArrayEquals(witnessInput, account.getPaymentAccountPayload().getAgeWitnessInputData());
+    }
+
+    @Test
+    public void testPagoMovilFormValidationPreservesStoredNumber() {
+        PagoMovilAccount account = new PagoMovilAccount();
+        account.init();
+        account.setAccountName("pago movil account");
+        account.setHolderName("Alice");
+        account.setHolderTaxId("V12345678");
+        account.setBankName("Bank");
+        ((PagoMovilAccountPayload) account.getPaymentAccountPayload()).setMobileNr("0412 123 4567");
+        byte[] witnessInput = account.getPaymentAccountPayload().getAgeWitnessInputData();
+        PagoMovilForm form = new PagoMovilForm(account, null, new PagoMovilValidator(), new InputValidator(), null, 0, null);
+        account.setAccountName("renamed account");
+        form.updateAllInputsValid();
+        assertTrue(form.allInputsValidProperty().get());
+        assertEquals("0412 123 4567", account.getMobileNr());
+        assertArrayEquals(witnessInput, account.getPaymentAccountPayload().getAgeWitnessInputData());
+    }
+
+    @Test
+    public void testSwishNumbers() {
+        validator = new SwishValidator();
+        for (String input : List.of("070 123 45 67", "070-123-45-67", "+46 (0)70 123 45 67", "+46 70 123 45 67", "+46701234567", "46701234567")) {
+            assertTrue(validator.validate(input).isValid);
+            assertEquals("+46701234567", validator.getNormalizedPhoneNumber());
+        }
+        for (String input : List.of("+46701234567", "+4600701234567")) {
+            assertTrue(validator.validate(input).isValid);
+            assertEquals(input, validator.getNormalizedPhoneNumber());
+            assertTrue(validator.validate(validator.getNormalizedPhoneNumber()).isValid);
+            assertEquals(input, validator.getNormalizedPhoneNumber());
+        }
+        assertFalse(validator.validate("not a phone").isValid);
+        assertNull(validator.getNormalizedPhoneNumber());
+        assertFalse(validator.validate(null).isValid);
+        assertNull(validator.getNormalizedPhoneNumber());
+    }
+
+    @Test
+    public void testSwishFormValidationPreservesStoredNumber() {
+        for (String input : List.of("070 123 45 67", "+460701234567")) {
+            SwishAccount account = new SwishAccount();
+            account.init();
+            account.setAccountName("swish account");
+            account.setHolderName("Alice");
+            ((SwishAccountPayload) account.getPaymentAccountPayload()).setMobileNr(input);
+            byte[] witnessInput = account.getPaymentAccountPayload().getAgeWitnessInputData();
+            // Validation does not require rendered controls.
+            SwishForm form = new SwishForm(account, null, new SwishValidator(), new InputValidator(), null, 0, null);
+            account.setAccountName("renamed account");
+            form.updateAllInputsValid();
+            assertTrue(form.allInputsValidProperty().get());
+            assertEquals(input, account.getMobileNr());
+            assertArrayEquals(witnessInput, account.getPaymentAccountPayload().getAgeWitnessInputData());
+        }
+    }
+
+    @Test
+    public void testTwintNumbers() {
+        validator = new TwintValidator();
+        for (String input : List.of("079 123 45 67", "+41 (0)79 123 45 67", "+41791234567", "41791234567")) {
+            assertTrue(validator.validate(input).isValid);
+            assertEquals("+41791234567", validator.getNormalizedPhoneNumber());
+        }
+        for (String input : List.of("+41791234567", "+4100791234567")) {
+            assertTrue(validator.validate(input).isValid);
+            assertEquals(input, validator.getNormalizedPhoneNumber());
+            assertTrue(validator.validate(validator.getNormalizedPhoneNumber()).isValid);
+            assertEquals(input, validator.getNormalizedPhoneNumber());
+        }
+        assertFalse(validator.validate("not a phone").isValid);
+        assertNull(validator.getNormalizedPhoneNumber());
+        assertFalse(validator.validate(null).isValid);
+        assertNull(validator.getNormalizedPhoneNumber());
+    }
+
+    @Test
+    public void testTwintFormValidationPreservesStoredNumber() {
+        for (String input : List.of("079 123 45 67", "+410791234567")) {
+            TwintAccount account = new TwintAccount();
+            account.init();
+            account.setAccountName("twint account");
+            account.setHolderName("Alice");
+            ((TwintAccountPayload) account.getPaymentAccountPayload()).setMobileNr(input);
+            byte[] witnessInput = account.getPaymentAccountPayload().getAgeWitnessInputData();
+            // Validation does not require rendered controls.
+            TwintForm form = new TwintForm(account, null, new TwintValidator(), new InputValidator(), null, 0, null);
+            account.setAccountName("renamed account");
+            form.updateAllInputsValid();
+            assertTrue(form.allInputsValidProperty().get());
+            assertEquals(input, account.getMobileNr());
+            assertArrayEquals(witnessInput, account.getPaymentAccountPayload().getAgeWitnessInputData());
+        }
     }
 
     @Test

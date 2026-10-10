@@ -42,6 +42,8 @@ import haveno.common.crypto.IncorrectPasswordException;
 import haveno.common.handlers.ErrorMessageHandler;
 import haveno.common.handlers.FaultHandler;
 import haveno.common.handlers.ResultHandler;
+import haveno.core.alert.Alert;
+import haveno.core.alert.AlertManager;
 import haveno.core.api.model.AddressBalanceInfo;
 import haveno.core.api.model.BalancesInfo;
 import haveno.core.api.model.MarketDepthInfo;
@@ -59,7 +61,9 @@ import haveno.core.support.dispute.DisputeResult;
 import haveno.core.support.messages.ChatMessage;
 import haveno.core.trade.Trade;
 import haveno.core.trade.statistics.TradeStatisticsManager;
+import haveno.core.user.Preferences;
 import haveno.core.xmr.XmrNodeSettings;
+import haveno.proto.grpc.GetTradesRequest;
 import haveno.proto.grpc.NotificationMessage;
 import java.io.IOException;
 import java.io.InputStream;
@@ -70,6 +74,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
+import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import monero.common.MoneroRpcConnection;
@@ -101,6 +106,8 @@ public class CoreApi {
     private final CoreNotificationService notificationService;
     private final XmrConnectionService xmrConnectionService;
     private final XmrLocalNode xmrLocalNode;
+    private final AlertManager alertManager;
+    private final Preferences preferences;
 
     @Inject
     public CoreApi(Config config,
@@ -117,7 +124,9 @@ public class CoreApi {
                    TradeStatisticsManager tradeStatisticsManager,
                    CoreNotificationService notificationService,
                    XmrConnectionService xmrConnectionService,
-                   XmrLocalNode xmrLocalNode) {
+                   XmrLocalNode xmrLocalNode,
+                   AlertManager alertManager,
+                   Preferences preferences) {
         this.config = config;
         this.appStartupState = appStartupState;
         this.coreAccountService = coreAccountService;
@@ -133,6 +142,8 @@ public class CoreApi {
         this.notificationService = notificationService;
         this.xmrConnectionService = xmrConnectionService;
         this.xmrLocalNode = xmrLocalNode;
+        this.alertManager = alertManager;
+        this.preferences = preferences;
     }
 
     @SuppressWarnings("SameReturnValue")
@@ -172,8 +183,8 @@ public class CoreApi {
         return appStartupState.isApplicationFullyInitialized();
     }
 
-    public void changePassword(String oldPassword, String newPassword) {
-        coreAccountService.changePassword(oldPassword, newPassword);
+    public List<String> changePassword(String oldPassword, String newPassword) {
+        return coreAccountService.changePassword(oldPassword, newPassword);
     }
 
     public void closeAccount() {
@@ -346,6 +357,11 @@ public class CoreApi {
 
     public void sendNotification(NotificationMessage notification) {
         notificationService.sendNotification(notification);
+    }
+
+    public Alert getAlert() {
+        Alert alert = alertManager.alertMessageProperty().get();
+        return alert != null && alert.isApplicable(preferences) ? alert : null;
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -572,8 +588,8 @@ public class CoreApi {
         return coreTradesService.getTrade(tradeId);
     }
 
-    public List<Trade> getTrades() {
-        return coreTradesService.getTrades();
+    public List<Trade> getTrades(@Nullable GetTradesRequest.Category category) {
+        return coreTradesService.getTrades(category);
     }
 
     public List<ChatMessage> getChatMessages(String tradeId) {

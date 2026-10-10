@@ -19,29 +19,47 @@ package haveno.daemon.grpc;
 
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import haveno.common.ThreadUtils;
 import haveno.common.config.Config;
+import haveno.core.api.AccountServiceListener;
+import haveno.core.api.CoreAccountService;
 import haveno.core.api.CoreContext;
 import haveno.daemon.grpc.interceptor.PasswordAuthInterceptor;
+import haveno.network.p2p.network.NetworkNode;
+import haveno.network.p2p.network.SetupListener;
+import haveno.network.p2p.network.TorMode;
+import haveno.network.p2p.network.TorNetworkNodeNetlayer;
 import static io.grpc.ServerInterceptors.interceptForward;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
+import java.util.concurrent.TimeUnit;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Server;
-import io.grpc.ServerBuilder;
+import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import lombok.extern.slf4j.Slf4j;
 
 @Singleton
 @Slf4j
 public class GrpcServer {
 
+    private static final long PUBLISH_RETRY_SEC = 60;
+    private static final long SHUTDOWN_TIMEOUT_SEC = 2;
+
+    private final Config config;
+    private final CoreAccountService coreAccountService;
+    private final NetworkNode networkNode;
     private final Server server;
+    private volatile boolean isShutDownStarted;
 
     @Inject
     public GrpcServer(CoreContext coreContext,
                       Config config,
+                      CoreAccountService coreAccountService,
+                      NetworkNode networkNode,
                       PasswordAuthInterceptor passwordAuthInterceptor,
                       GrpcAccountService accountService,
                       GrpcDisputeAgentsService disputeAgentsService,
@@ -58,7 +76,14 @@ public class GrpcServer {
                       GrpcNotificationsService notificationsService,
                       GrpcXmrConnectionService moneroConnectionsService,
                       GrpcXmrNodeService moneroNodeService) {
-        this.server = ServerBuilder.forPort(config.apiPort)
+
+        if (config.apiPassword == null || config.apiPassword.isBlank())
+            throw new IllegalStateException("Cannot start the gRPC API with an empty apiPassword; set --apiPassword to a strong secret");
+
+        this.config = config;
+        this.coreAccountService = coreAccountService;
+        this.networkNode = networkNode;
+        this.server = NettyServerBuilder.forAddress(new InetSocketAddress(config.apiBindAddress, config.apiPort))
                 .addService(shutdownService)
                 .intercept(passwordAuthInterceptor)
                 .addService(interceptForward(accountService, config.disableRateLimits ? interceptors() : accountService.interceptors()))
@@ -95,17 +120,70 @@ public class GrpcServer {
     }
 
     public void start() {
+
+        // stop serving once the account is deleted or restored, so the reply to that call is the last from this instance
+        coreAccountService.addListener(new AccountServiceListener() {
+            @Override public void onAccountDeleted(Runnable onShutdown) { shutdown(); }
+            @Override public void onAccountRestored(Runnable onShutdown) { shutdown(); }
+        });
         try {
             server.start();
             log.info("listening on port {}", server.getPort());
         } catch (IOException ex) {
             throw new UncheckedIOException(ex);
         }
+        if (config.apiHiddenService) publishHiddenService();
+    }
+
+    // honor persisted bridge settings unless the operator explicitly allows pre-login tor startup
+    private void publishHiddenService() {
+        if (!(networkNode instanceof TorNetworkNodeNetlayer)) {
+            log.error("Cannot publish api hidden service without Haveno's tor");
+            return;
+        }
+        if (!coreAccountService.isAccountOpen() &&
+                (config.torControlPort != Config.UNSPECIFIED_PORT || config.apiHiddenServiceBeforeLogin)) {
+            if (config.torControlPort == Config.UNSPECIFIED_PORT)
+                log.warn("Publishing the API before login with {}; encrypted bridge preferences cannot be applied to this Tor session",
+                        config.torrcFile != null || !config.torrcOptions.isEmpty() ? "startup torrc configuration" : "default Tor settings");
+            publishHiddenServiceWithRetry();
+        } else {
+            log.info("Waiting for Tor startup with persisted settings before publishing the API hidden service");
+            networkNode.addSetupListener(new SetupListener() {
+                @Override public void onTorNodeReady() { publishHiddenServiceWithRetry(); }
+                @Override public void onSetupFailed(Throwable throwable) { publishHiddenServiceWithRetry(); } // retry until tor is available
+                @Override public void onHiddenServicePublished() { }
+            });
+        }
+    }
+
+    private void publishHiddenServiceWithRetry() {
+        if (isShutDownStarted || networkNode.isShutDownStarted()) return;
+        int port = config.apiHiddenServicePort;
+        ((TorNetworkNodeNetlayer) networkNode).publishHiddenService(TorMode.API_HIDDEN_SERVICE_NAME, port).whenComplete((hostname, e) -> {
+            if (e == null) {
+                log.info("API hidden service created at {}:{}", hostname, port);
+            } else {
+                log.error("Failed to publish api hidden service, retrying in {} seconds", PUBLISH_RETRY_SEC, e);
+                ThreadUtils.runAfter(this::publishHiddenServiceWithRetry, PUBLISH_RETRY_SEC); // not the user thread, which blocks until login
+            }
+        });
     }
 
     public void shutdown() {
+        if (isShutDownStarted) return;
+        isShutDownStarted = true;
         log.info("Server shutdown started");
         server.shutdown();
         log.info("Server shutdown complete");
+    }
+
+    // waits for calls in flight to reply, then ends any still open (e.g. notification streams), so nothing is served past this point
+    public void awaitTermination() {
+        try {
+            if (!server.awaitTermination(SHUTDOWN_TIMEOUT_SEC, TimeUnit.SECONDS)) server.shutdownNow();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

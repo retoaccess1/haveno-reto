@@ -77,16 +77,11 @@ public abstract class CountryBasedPaymentAccount extends PaymentAccount {
         ((CountryBasedPaymentAccountPayload) paymentAccountPayload).setAcceptedCountryCodes(CountryUtil.getCountryCodes(acceptedCountries));
     }
 
-    @Nullable
-    public List<Country> getSupportedCountries() {
-        return null; // support all countries by default
-    }
-
     @Override
     public void validateFormField(PaymentAccountForm form, PaymentAccountFormField.FieldId fieldId, String value) {
         switch (fieldId) {
         case ACCOUNT_NR:
-            if (country == null && paymentAccountPayload == null) {
+            if (paymentAccountPayload == null || getCountry() == null) {
                 throw new IllegalStateException("Country must be set before validating account number");
             }
             processValidationResult(new AccountNrValidator(getCountry().code).validate(value));

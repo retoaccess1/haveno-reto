@@ -55,7 +55,6 @@ import haveno.core.trade.messages.SignContractResponse;
 import haveno.network.p2p.AckMessage;
 import haveno.network.p2p.BundleOfEnvelopes;
 import haveno.network.p2p.CloseConnectionMessage;
-import haveno.network.p2p.FileTransferPart;
 import haveno.network.p2p.PrefixedSealedAndSignedMessage;
 import haveno.network.p2p.peers.getdata.messages.GetDataResponse;
 import haveno.network.p2p.peers.getdata.messages.GetUpdatedDataRequest;
@@ -179,12 +178,9 @@ public class CoreNetworkProtoResolver extends CoreProtoResolver implements Netwo
                 case GET_INVENTORY_RESPONSE:
                     return GetInventoryResponse.fromProto(proto.getGetInventoryResponse(), messageVersion);
 
-                case FILE_TRANSFER_PART:
-                    return FileTransferPart.fromProto(proto.getFileTransferPart(), messageVersion);
-
                 default:
                     throw new ProtobufferException("Unknown proto message case (PB.NetworkEnvelope). messageCase=" +
-                            proto.getMessageCase() + "; proto raw data=" + proto.toString());
+                            proto.getMessageCase() + "; size=" + proto.getSerializedSize());
             }
         } else {
             log.error("PersistableEnvelope.fromProto: PB.NetworkEnvelope is null");
@@ -202,7 +198,7 @@ public class CoreNetworkProtoResolver extends CoreProtoResolver implements Netwo
                     return ProtectedStorageEntry.fromProto(proto.getProtectedStorageEntry(), this);
                 default:
                     throw new ProtobufferRuntimeException("Unknown proto message case(PB.StorageEntryWrapper). " +
-                            "messageCase=" + proto.getMessageCase() + "; proto raw data=" + proto.toString());
+                            "messageCase=" + proto.getMessageCase() + "; size=" + proto.getSerializedSize());
             }
         } else {
             log.error("PersistableEnvelope.fromProto: PB.StorageEntryWrapper is null");
@@ -230,7 +226,7 @@ public class CoreNetworkProtoResolver extends CoreProtoResolver implements Netwo
                     return OfferPayload.fromProto(proto.getOfferPayload());
                 default:
                     throw new ProtobufferRuntimeException("Unknown proto message case (PB.StoragePayload). messageCase="
-                            + proto.getMessageCase() + "; proto raw data=" + proto.toString());
+                            + proto.getMessageCase() + "; size=" + proto.getSerializedSize());
             }
         } else {
             log.error("PersistableEnvelope.fromProto: PB.StoragePayload is null");

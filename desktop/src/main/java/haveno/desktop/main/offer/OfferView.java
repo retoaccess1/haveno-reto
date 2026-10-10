@@ -28,9 +28,11 @@ import haveno.core.payment.payload.PaymentMethod;
 import haveno.core.user.Preferences;
 import haveno.core.user.User;
 import haveno.desktop.Navigation;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.common.view.ActivatableView;
 import haveno.desktop.common.view.View;
 import haveno.desktop.common.view.ViewLoader;
+import haveno.desktop.common.view.ViewPath;
 import haveno.desktop.main.MainView;
 import haveno.desktop.main.offer.createoffer.CreateOfferView;
 import haveno.desktop.main.offer.offerbook.FiatOfferBookView;
@@ -38,6 +40,7 @@ import haveno.desktop.main.offer.offerbook.OfferBookView;
 import haveno.desktop.main.offer.offerbook.CryptoOfferBookView;
 import haveno.desktop.main.offer.offerbook.OtherOfferBookView;
 import haveno.desktop.main.offer.takeoffer.TakeOfferView;
+import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.util.GUIUtil;
 import haveno.network.p2p.P2PService;
 import javafx.beans.value.ChangeListener;
@@ -85,6 +88,7 @@ public abstract class OfferView extends ActivatableView<TabPane, Void> {
 
     @Override
     protected void initialize() {
+        Accessibility.fixTabs(root);
         navigationListener = (viewPath, data) -> {
             UserThread.execute(() -> {
                 if (viewPath.size() == 3 && viewPath.indexOf(this.getClass()) == 1) {
@@ -96,6 +100,11 @@ public abstract class OfferView extends ActivatableView<TabPane, Void> {
         };
         tabChangeListener = (observableValue, oldValue, newValue) -> {
             UserThread.execute(() -> {
+
+                // ignore stale/transient selections (e.g. the disabled label tab briefly selecting fiat during tab creation)
+                if (newValue != root.getSelectionModel().getSelectedItem()) {
+                    return;
+                }
                 if (newValue != null) {
                     if (newValue.equals(fiatOfferBookTab)) {
                         if (fiatOfferBookView != null) {
@@ -103,18 +112,21 @@ public abstract class OfferView extends ActivatableView<TabPane, Void> {
                         } else {
                             loadView(FiatOfferBookView.class, null, null);
                         }
+                        onOfferBookSubTabSelected(FiatOfferBookView.class);
                     } else if (newValue.equals(cryptoOfferBookTab)) {
                         if (cryptoOfferBookView != null) {
                             cryptoOfferBookView.onTabSelected(true);
                         } else {
                             loadView(CryptoOfferBookView.class, null, null);
                         }
+                        onOfferBookSubTabSelected(CryptoOfferBookView.class);
                     } else if (newValue.equals(otherOfferBookTab)) {
                         if (otherOfferBookView != null) {
                             otherOfferBookView.onTabSelected(true);
                         } else {
                             loadView(OtherOfferBookView.class, null, null);
                         }
+                        onOfferBookSubTabSelected(OtherOfferBookView.class);
                     }
                 }
                 if (oldValue != null) {
@@ -150,15 +162,45 @@ public abstract class OfferView extends ActivatableView<TabPane, Void> {
     @Override
     protected void activate() {
         Optional<TradeCurrency> tradeCurrencyOptional = (this.direction == OfferDirection.SELL) ?
-                CurrencyUtil.getTradeCurrency(preferences.getSellScreenCurrencyCode()) :
-                CurrencyUtil.getTradeCurrency(preferences.getBuyScreenCurrencyCode());
+                CurrencyUtil.getTradeCurrency(preferences.getSellScreenFiatCurrencyCode()) :
+                CurrencyUtil.getTradeCurrency(preferences.getBuyScreenFiatCurrencyCode());
         tradeCurrency = tradeCurrencyOptional.orElseGet(GlobalSettings::getDefaultTradeCurrency);
 
         root.getSelectionModel().selectedItemProperty().addListener(tabChangeListener);
         navigation.addListener(navigationListener);
-        if (fiatOfferBookView == null) {
-            navigation.navigateTo(MainView.class, this.getClass(), FiatOfferBookView.class);
+        if (fiatOfferBookView == null && cryptoOfferBookView == null && otherOfferBookView == null) {
+            navigation.navigateTo(MainView.class, this.getClass(), getPersistedOfferBookSubTabViewClass());
         }
+    }
+
+    private void onOfferBookSubTabSelected(Class<? extends View> viewClass) {
+        int index = getOfferBookSubTabIndex(viewClass);
+        if (direction == OfferDirection.SELL) {
+            preferences.setSellScreenOfferBookSubTabIndex(index);
+        } else {
+            preferences.setBuyScreenOfferBookSubTabIndex(index);
+        }
+        navigation.setCurrentPathSilently(ViewPath.to(MainView.class, this.getClass(), viewClass));
+    }
+
+    private Class<? extends View> getPersistedOfferBookSubTabViewClass() {
+        int index = direction == OfferDirection.SELL ?
+                preferences.getSellScreenOfferBookSubTabIndex() :
+                preferences.getBuyScreenOfferBookSubTabIndex();
+        switch (index) {
+            case 1:
+                return CryptoOfferBookView.class;
+            case 2:
+                return OtherOfferBookView.class;
+            default:
+                return FiatOfferBookView.class;
+        }
+    }
+
+    private static int getOfferBookSubTabIndex(Class<? extends View> viewClass) {
+        if (viewClass == CryptoOfferBookView.class) return 1;
+        if (viewClass == OtherOfferBookView.class) return 2;
+        return 0; // FiatOfferBookView
     }
 
     @Override
@@ -303,6 +345,12 @@ public abstract class OfferView extends ActivatableView<TabPane, Void> {
                                    Tab marketOfferBookTab) {
 
         if (offer == null) {
+            return;
+        }
+
+        if (offer.getPrice() == null) {
+            navigation.navigateTo(MainView.class, this.getClass(), viewClass);
+            new Popup().warning(Res.get("takeOffer.noPriceFeedAvailable")).show();
             return;
         }
 

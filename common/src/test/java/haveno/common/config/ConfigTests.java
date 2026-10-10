@@ -11,14 +11,22 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static haveno.common.config.Config.API_BIND_ADDRESS;
+import static haveno.common.config.Config.API_HIDDEN_SERVICE;
+import static haveno.common.config.Config.API_HIDDEN_SERVICE_BEFORE_LOGIN;
+import static haveno.common.config.Config.API_HIDDEN_SERVICE_PORT;
+import static haveno.common.config.Config.API_PASSWORD;
+import static haveno.common.config.Config.API_PORT;
 import static haveno.common.config.Config.APP_DATA_DIR;
 import static haveno.common.config.Config.APP_NAME;
+import static haveno.common.config.Config.BASE_CURRENCY_NETWORK;
 import static haveno.common.config.Config.BANNED_XMR_NODES;
 import static haveno.common.config.Config.CONFIG_FILE;
 import static haveno.common.config.Config.DEFAULT_CONFIG_FILE_NAME;
 import static haveno.common.config.Config.HELP;
 import static haveno.common.config.Config.TORRC_FILE;
 import static haveno.common.config.Config.USER_DATA_DIR;
+import static haveno.common.config.Config.USE_LOCALHOST_FOR_P2P;
 import static java.io.File.createTempFile;
 import static java.lang.String.format;
 import static java.lang.System.getProperty;
@@ -29,6 +37,7 @@ import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.emptyString;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -270,6 +279,42 @@ public class ConfigTests {
         configWithOpts(opt(APP_DATA_DIR, symlink));
     }
 
+
+    @Test
+    public void whenApiHiddenServicePortOptionIsNotSet_thenItDefaultsToApiPort() {
+        Config config = configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"), opt(API_PORT, 3201));
+        assertEquals(3201, config.apiHiddenServicePort);
+        config = configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"), opt(API_PORT, 3201), opt(API_HIDDEN_SERVICE_PORT, 2134));
+        assertEquals(2134, config.apiHiddenServicePort);
+    }
+
+    @Test
+    public void whenApiHiddenServiceBeforeLoginIsSet_thenHiddenServiceMustBeEnabled() {
+        assertFalse(configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678")).apiHiddenServiceBeforeLogin);
+        assertTrue(configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"),
+                opt(API_HIDDEN_SERVICE_BEFORE_LOGIN, true)).apiHiddenServiceBeforeLogin);
+        assertThrows(ConfigException.class, () -> configWithOpts(opt(API_HIDDEN_SERVICE_BEFORE_LOGIN, true)));
+        assertThrows(ConfigException.class, () -> configWithOpts(opt(API_HIDDEN_SERVICE, false),
+                opt(API_HIDDEN_SERVICE_BEFORE_LOGIN, true)));
+    }
+
+    @Test
+    public void whenApiHiddenServiceIsSet_thenApiBindAddressMustAcceptForwardedConnections() {
+        assertEquals("0.0.0.0", configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"),
+                opt(API_BIND_ADDRESS, "0.0.0.0")).apiBindAddress);
+        for (String address : new String[]{"192.0.2.1", "::1", "127.0.0.2"}) {
+            assertThrows(ConfigException.class, () -> configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"),
+                    opt(API_BIND_ADDRESS, address)));
+        }
+    }
+
+    @Test
+    public void whenApiHiddenServiceOptionIsSet_thenShortPasswordAndLocalhostP2PAreRejected() {
+        assertThrows(ConfigException.class, () -> configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "1234567")));
+        assertThrows(ConfigException.class, () -> configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"), opt(API_HIDDEN_SERVICE_PORT, 65536)));
+        assertThrows(ConfigException.class, () -> configWithOpts(opt(API_HIDDEN_SERVICE, true), opt(API_PASSWORD, "12345678"),
+                opt(BASE_CURRENCY_NETWORK, "XMR_STAGENET"), opt(USE_LOCALHOST_FOR_P2P, true)));
+    }
 
     // == TEST SUPPORT FACILITIES ========================================================
 

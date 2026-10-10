@@ -42,6 +42,7 @@ import haveno.core.offer.Offer;
 import haveno.core.offer.OfferDirection;
 import haveno.core.offer.OfferUtil;
 import haveno.core.offer.takeoffer.TakeOfferModel;
+import haveno.core.payment.PaymentAccountUtil;
 import haveno.core.payment.payload.PaymentMethod;
 import haveno.core.support.messages.ChatMessage;
 import haveno.core.support.traderchat.TradeChatSession;
@@ -55,12 +56,14 @@ import haveno.core.trade.protocol.SellerProtocol;
 import haveno.core.user.User;
 import haveno.core.util.coin.CoinUtil;
 import haveno.core.xmr.wallet.BtcWalletService;
+import haveno.proto.grpc.GetTradesRequest;
 import static java.lang.String.format;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Consumer;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.commons.lang3.exception.ExceptionUtils;
@@ -116,6 +119,9 @@ class CoreTradesService {
             var paymentAccount = user.getPaymentAccount(paymentAccountId);
             if (paymentAccount == null)
                 throw new IllegalArgumentException(format("payment account with id '%s' not found", paymentAccountId));
+            if (!PaymentAccountUtil.isPaymentAccountValidForOffer(offer, paymentAccount))
+                throw new IllegalArgumentException(format("cannot take %s offer with payment account %s",
+                        offer.getCounterCurrencyCode(), paymentAccountId));
 
             var useSavingsWallet = true;
 
@@ -219,12 +225,22 @@ class CoreTradesService {
         return closedTradableManager.getTradeById(tradeId);
     }
 
-    List<Trade> getTrades() {
+    List<Trade> getTrades(@Nullable GetTradesRequest.Category category) {
         coreWalletsService.verifyWalletsAreAvailable();
         coreWalletsService.verifyEncryptedWalletIsUnlocked();
-        List<Trade> trades = new ArrayList<Trade>(tradeManager.getOpenTrades());
-        trades.addAll(closedTradableManager.getClosedTrades());
-        return trades;
+
+        if (category == null) {
+            List<Trade> trades = new ArrayList<>(tradeManager.getOpenTrades());
+            trades.addAll(tradeManager.getClosedTrades());
+            return trades;
+        }
+
+        return switch (category) {
+            case OPEN -> tradeManager.getOpenTrades();
+            case CLOSED -> tradeManager.getClosedTrades();
+            case FAILED -> tradeManager.getFailedTrades();
+            default -> throw new IllegalArgumentException(format("invalid category '%s'", category));
+        };
     }
 
     List<ChatMessage> getChatMessages(String tradeId) {

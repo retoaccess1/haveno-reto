@@ -75,6 +75,46 @@ public final class AccountNrValidator extends BankValidator {
                     return super.validate(input);
                 else
                     return new ValidationResult(false, Res.get("validation.accountNrFormat", "005-231289-112"));
+            case "ID":
+                input2 = input != null ? input.replaceAll("-", "") : null;
+                if (isNumberInRange(input2, 6, 16))
+                    return super.validate(input);
+                else
+                    return new ValidationResult(false, Res.get("validation.accountNr", "6 - 16"));
+            case "TR":
+                input2 = input != null ? input.replaceAll("[\\s-]", "") : null;
+                // accept a 10-digit Papara number, an 11-digit mobile number (FAST Kolay Adres) or a Turkish IBAN
+                if (isNumberInRange(input2, 10, 11) || new IBANValidator("TR").validate(input2).isValid)
+                    return super.validate(input);
+                else
+                    return new ValidationResult(false, Res.get("validation.accountNrFormat", "1234567890 or TR12 3456 7890 1234 5678 9012 34"));
+            case "PK":
+                input2 = input != null ? input.replaceAll("[\\s-]", "") : null;
+                // accept an 11-digit mobile number (Raast alias / Easypaisa / JazzCash) or a Pakistani IBAN
+                if (isNumberWithFixedLength(input2, 11) || new IBANValidator("PK").validate(input2).isValid)
+                    return super.validate(input);
+                else
+                    return new ValidationResult(false, Res.get("validation.accountNrFormat", "03001234567 or PK12 ABCD 1234 5678 9012 3456"));
+            case "SG":
+                input2 = input != null ? input.replaceAll("[\\s-]", "") : null;
+                // accept a PayNow mobile number (optional +65 prefix) or NRIC/FIN
+                if (input2 != null && (input2.matches("(\\+?65)?[89][0-9]{7}") || input2.matches("(?i)[STFGM][0-9]{7}[A-Z]")))
+                    return super.validate(input);
+                else
+                    return new ValidationResult(false, Res.get("validation.accountNrFormat", "91234567 or S1234567A"));
+            case "MY":
+                input2 = input != null ? input.replaceAll("[\\s-]", "") : null;
+                // accept a DuitNow proxy: Malaysian mobile number (01x or +60 prefix) or 12-digit NRIC
+                if (input2 != null && (input2.matches("01[0-9]{8,9}") || input2.matches("\\+?601[0-9]{8,9}") || input2.matches("[0-9]{12}")))
+                    return super.validate(input);
+                else
+                    return new ValidationResult(false, Res.get("validation.accountNrFormat", "0123456789, +60 12 345 6789 or 901231-14-5678"));
+            case "NG":
+                length = 10;
+                if (isNumberWithFixedLength(input, length))
+                    return super.validate(input);
+                else
+                    return new ValidationResult(false, Res.get("validation.accountNr", length));
             case "NO":
                 if (input != null) {
                     length = 11;

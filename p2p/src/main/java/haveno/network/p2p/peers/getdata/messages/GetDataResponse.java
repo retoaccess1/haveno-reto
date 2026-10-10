@@ -26,22 +26,30 @@ import haveno.network.p2p.ExtendedDataSizePermission;
 import haveno.network.p2p.InitialDataRequest;
 import haveno.network.p2p.InitialDataResponse;
 import haveno.network.p2p.SupportedCapabilitiesMessage;
+import haveno.network.p2p.storage.payload.InvalidPersistableNetworkPayloadException;
 import haveno.network.p2p.storage.payload.PersistableNetworkPayload;
 import haveno.network.p2p.storage.payload.ProtectedMailboxStorageEntry;
 import haveno.network.p2p.storage.payload.ProtectedStorageEntry;
+import haveno.network.utils.EventThrottler;
 import lombok.EqualsAndHashCode;
+import lombok.ToString;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.NotNull;
 
+import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Slf4j
 @EqualsAndHashCode(callSuper = true)
+@ToString(exclude = {"dataSet", "persistableNetworkPayloadSet"})
 @Value
 public final class GetDataResponse extends NetworkEnvelope implements SupportedCapabilitiesMessage,
         ExtendedDataSizePermission, InitialDataResponse {
+    private static final EventThrottler invalidPayloadLogThrottler = new EventThrottler(10, TimeUnit.SECONDS);
+
     // Set of ProtectedStorageEntry objects
     private final Set<ProtectedStorageEntry> dataSet;
 
@@ -125,11 +133,18 @@ public final class GetDataResponse extends NetworkEnvelope implements SupportedC
         boolean wasTruncated = proto.getWasTruncated();
         log.info("Received a GetDataResponse with {} {}",
                 Utilities.readableFileSize(proto.getSerializedSize()),
-                wasTruncated ? " (was truncated)" : "");
+                wasTruncated ? "(was truncated)" : "");
         Set<ProtectedStorageEntry> dataSet = proto.getDataSetList().stream()
                 .map(entry -> (ProtectedStorageEntry) resolver.fromProto(entry)).collect(Collectors.toSet());
-        Set<PersistableNetworkPayload> persistableNetworkPayloadSet = proto.getPersistableNetworkPayloadItemsList().stream()
-                .map(e -> (PersistableNetworkPayload) resolver.fromProto(e)).collect(Collectors.toSet());
+        Set<PersistableNetworkPayload> persistableNetworkPayloadSet = new HashSet<>();
+        int numInvalid = 0;
+        for (protobuf.PersistableNetworkPayload e : proto.getPersistableNetworkPayloadItemsList()) {
+            PersistableNetworkPayload payload = getPersistableNetworkPayloadOrNull(e, resolver);
+            if (payload == null) numInvalid++;
+            else persistableNetworkPayloadSet.add(payload);
+        }
+        if (numInvalid > 0 && !invalidPayloadLogThrottler.onEvent().throttled)
+            log.warn("Ignored {} invalid persistable network payloads from GetDataResponse", numInvalid);
         return new GetDataResponse(dataSet,
                 persistableNetworkPayloadSet,
                 proto.getRequestNonce(),
@@ -137,6 +152,16 @@ public final class GetDataResponse extends NetworkEnvelope implements SupportedC
                 wasTruncated,
                 Capabilities.fromIntList(proto.getSupportedCapabilitiesList()),
                 messageVersion);
+    }
+
+    private static PersistableNetworkPayload getPersistableNetworkPayloadOrNull(protobuf.PersistableNetworkPayload proto,
+                                                                                NetworkProtoResolver resolver) {
+        try {
+            return (PersistableNetworkPayload) resolver.fromProto(proto);
+        } catch (InvalidPersistableNetworkPayloadException e) {
+            log.debug("Ignoring invalid PersistableNetworkPayload from GetDataResponse. {}", e.getMessage());
+            return null;
+        }
     }
 
     @Override

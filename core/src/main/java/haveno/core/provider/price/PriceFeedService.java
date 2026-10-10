@@ -49,8 +49,6 @@ import org.jetbrains.annotations.NotNull;
 
 import javax.annotation.Nullable;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -60,6 +58,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -73,7 +72,8 @@ public class PriceFeedService {
     private static final long PERIOD_SEC = 60;
 
     private final Map<String, MarketPrice> cache = new HashMap<>();
-    private PriceProvider priceProvider;
+    private final Map<String, Date> latestHavenoMarketPriceDateByCurrencyCode = new HashMap<>();
+    private volatile PriceProvider priceProvider;
     @Nullable
     private Consumer<Double> priceConsumer;
     @Nullable
@@ -84,13 +84,18 @@ public class PriceFeedService {
     private long epochInMillisAtLastRequest;
     private long retryDelay = 0;
     private long requestTs;
-    private long lastLoopTs = System.currentTimeMillis();
     @Nullable
-    private String baseUrlOfRespondingProvider;
+    private volatile String baseUrlOfRespondingProvider; // cleared per request to detect a missing response
     @Nullable
-    private Timer requestTimer;
+    private volatile String baseUrlOfLastRespondingProvider; // the provider actually serving prices
+    @Nullable
+    private volatile Timer requestTimer;
+    @Nullable
+    private Timer retryTimer;
     @Nullable
     private PriceRequest priceRequest;
+    private final AtomicBoolean requestInProgress = new AtomicBoolean();
+    private volatile boolean shutDownRequested;
     private String requestAllPricesError = null;
     private static final String THREAD_ID = PriceFeedService.class.getSimpleName();
 
@@ -118,12 +123,21 @@ public class PriceFeedService {
 
     public void shutDown() {
         log.info("Shutting down {}", getClass().getSimpleName());
-        if (requestTimer != null) {
-            requestTimer.stop();
-            requestTimer = null;
-        }
-        if (priceRequest != null) {
-            priceRequest.shutDown();
+        shutDownRequested = true;
+        try {
+            ThreadUtils.await(() -> {
+                if (requestTimer != null) {
+                    requestTimer.stop();
+                    requestTimer = null;
+                }
+                if (retryTimer != null) {
+                    retryTimer.stop();
+                    retryTimer = null;
+                }
+                cancelRequest();
+            }, THREAD_ID);
+        } catch (Exception e) {
+            log.warn("Error shutting down {}: {}", getClass().getSimpleName(), e.getMessage());
         }
     }
 
@@ -174,11 +188,26 @@ public class PriceFeedService {
         startRequestingPrices();
     }
 
+    // the provider serving prices, falling back to the selected one until a request succeeds
     public String getProviderNodeAddress() {
-        return httpClient.getBaseUrl();
+        String respondingBaseUrl = baseUrlOfLastRespondingProvider;
+        return respondingBaseUrl != null ? respondingBaseUrl : httpClient.getBaseUrl();
     }
 
+    // serialize request handling and provider rotation on THREAD_ID
     private void request(boolean repeatRequests) {
+        ThreadUtils.execute(() -> doRequest(repeatRequests), THREAD_ID);
+    }
+
+    private void doRequest(boolean repeatRequests) {
+        if (shutDownRequested) return;
+
+        // a repeating request supersedes any pending retry; a one-off must not cancel the feed's only scheduler
+        if (repeatRequests && retryTimer != null) {
+            retryTimer.stop();
+            retryTimer = null;
+        }
+
         if (requestTs == 0)
             log.debug("request from provider {}",
                     providersRepository.getBaseUrl());
@@ -189,15 +218,13 @@ public class PriceFeedService {
 
         requestTs = System.currentTimeMillis();
 
-        baseUrlOfRespondingProvider = null;
-
-        requestAllPrices(priceProvider, () -> {
-            baseUrlOfRespondingProvider = priceProvider.getBaseUrl();
-
+        PriceProvider provider = priceProvider;
+        requestAllPrices(provider, () -> {
             // At applyPriceToConsumer we also check if price is not exceeding max. age for price data.
             boolean success = applyPriceToConsumer();
             if (success) {
-                MarketPrice marketPrice = cache.get(currencyCode);
+                ThreadUtils.execute(() -> retryDelay = 0, THREAD_ID); // reset backoff; retryDelay is accessed on THREAD_ID
+                MarketPrice marketPrice = getMarketPrice(currencyCode);
                 if (marketPrice != null)
                     log.debug("Received new {} from provider {} after {} sec.",
                             marketPrice,
@@ -212,16 +239,16 @@ public class PriceFeedService {
                             currencyCode);
             } else {
                 log.warn("applyPriceToConsumer was not successful. We retry with a new provider.");
-                retryWithNewProvider();
+                retryWithNewProvider("price could not be applied");
             }
         }, (errorMessage, throwable) -> {
             if (throwable instanceof PriceRequestException) {
                 String baseUrlOfFaultyRequest = ((PriceRequestException) throwable).priceProviderBaseUrl;
                 String baseUrlOfCurrentRequest = priceProvider.getBaseUrl();
                 if (baseUrlOfCurrentRequest.equals(baseUrlOfFaultyRequest)) {
-                    log.info("We received an error requesting prices: baseUrlOfFaultyRequest={}, error={}",
+                    log.debug("We received an error requesting prices: baseUrlOfFaultyRequest={}, error={}",
                             baseUrlOfFaultyRequest, throwable.toString());
-                    retryWithNewProvider();
+                    retryWithNewProvider(throwable.toString());
                 } else {
                     log.debug("We received an error from an earlier request. We have started a new request already so we ignore that error. " +
                                     "baseUrlOfCurrentRequest={}, baseUrlOfFaultyRequest={}",
@@ -229,7 +256,7 @@ public class PriceFeedService {
                 }
             } else {
                 log.warn("We received an error with throwable={}", throwable.toString());
-                retryWithNewProvider();
+                retryWithNewProvider(throwable.toString());
             }
 
             if (faultHandler != null)
@@ -241,56 +268,76 @@ public class PriceFeedService {
                 requestTimer.stop();
 
             long delay = PERIOD_SEC + new Random().nextInt(5);
+            PriceRequest pendingRequest = priceRequest;
             requestTimer = UserThread.runAfter(() -> {
                 ThreadUtils.execute(() -> {
-                    // If we have not received a result from the last request. We try a new provider.
-                    if (baseUrlOfRespondingProvider == null) {
-                        final String oldBaseUrl = priceProvider.getBaseUrl();
-                        setNewPriceProvider();
-                        log.warn("We did not receive a response from provider {}. " +
-                                "We select the new provider {} and use that for a new request.", oldBaseUrl, priceProvider.getBaseUrl());
+                    if (shutDownRequested) return;
+                    if (retryTimer != null) return; // a pending retry owns the next request
+                    // rotate only if this request is still the outstanding one and went unanswered
+                    if (priceRequest == pendingRequest && baseUrlOfRespondingProvider == null) {
+                        log.warn("We did not receive a response from provider {}", priceProvider.getBaseUrl());
+                        doRetryWithNewProvider("no response from provider"); // rotate and back off, as for a failed request
+                    } else {
+                        doRequest(true);
                     }
-                    request(true);
                 }, THREAD_ID);
             }, delay);
         }
     }
 
-    private void retryWithNewProvider() {
+    private void retryWithNewProvider(String error) {
+        ThreadUtils.execute(() -> doRetryWithNewProvider(error), THREAD_ID);
+    }
+
+    private void doRetryWithNewProvider(String error) {
+        if (shutDownRequested) return;
+
+        // only keep one pending retry
+        if (retryTimer != null) {
+            retryTimer.stop();
+            retryTimer = null;
+        }
+
         long thisRetryDelay = 0;
         String oldBaseUrl = priceProvider.getBaseUrl();
         boolean looped = setNewPriceProvider();
         if (looped) {
-            log.warn("Exhausted price provider list, looping to beginning");
-            if (System.currentTimeMillis() - lastLoopTs < PERIOD_SEC * 1000) {
-                retryDelay = Math.min(retryDelay + 5, PERIOD_SEC);
-            } else {
-                retryDelay = 0;
-            }
-            lastLoopTs = System.currentTimeMillis();
+            retryDelay = Math.min(retryDelay + 5, PERIOD_SEC); // escalate until a request succeeds
             thisRetryDelay = retryDelay;
+            log.warn("Exhausted price provider list, retrying in {} sec. Last error: {}", thisRetryDelay, error);
         }
-        log.info("We received an error at the request from provider {}. " +
+        log.debug("We received an error at the request from provider {}. " +
                 "We select the new provider {} and use that for a new request in {} sec.", oldBaseUrl, priceProvider.getBaseUrl(), thisRetryDelay);
         if (thisRetryDelay > 0) {
-            UserThread.runAfter(() -> {
+            retryTimer = UserThread.runAfter(() -> {
                 request(true);
             }, thisRetryDelay);
         } else {
-            request(true);
+            doRequest(true);
         }
     }
 
-    // returns true if provider selection loops back to beginning
+    // returns true if the provider list is exhausted
     private boolean setNewPriceProvider() {
-        httpClient.cancelPendingRequest();
+        cancelRequest();
         boolean looped = providersRepository.selectNextProviderBaseUrl();
         if (!providersRepository.getBaseUrl().isEmpty()) {
             priceProvider = new PriceProvider(httpClient, providersRepository.getBaseUrl());
         } else {
             log.warn("We cannot create a new priceProvider because new base url is empty.");
+            looped = true; // no provider to rotate to, so back off
         }
         return looped;
+    }
+
+    // cancels the request in flight, if any; runs on THREAD_ID
+    private void cancelRequest() {
+        if (priceRequest != null) {
+            priceRequest.shutDown();
+            priceRequest = null;
+        }
+        httpClient.cancelPendingRequest();
+        requestInProgress.set(false);
     }
 
     @Nullable
@@ -351,27 +398,26 @@ public class PriceFeedService {
     }
 
     public void applyLatestHavenoMarketPrice(List<TradeStatistics3> tradeStatisticsList) {
-        // takes about 10 ms for 5000 items
-        Map<String, List<TradeStatistics3>> mapByCurrencyCode = new HashMap<>();
-        tradeStatisticsList.forEach(e -> {
-            List<TradeStatistics3> list;
-            String currencyCode = e.getCurrency();
-            if (mapByCurrencyCode.containsKey(currencyCode)) {
-                list = mapByCurrencyCode.get(currencyCode);
-            } else {
-                list = new ArrayList<>();
-                mapByCurrencyCode.put(currencyCode, list);
-            }
-            list.add(e);
-        });
+        Map<String, TradeStatistics3> latestByCurrencyCode = new HashMap<>();
+        tradeStatisticsList.forEach(e -> latestByCurrencyCode.merge(e.getCurrency(), e,
+                (oldValue, newValue) -> newValue.getDate().before(oldValue.getDate()) ? oldValue : newValue));
+        latestByCurrencyCode.values().forEach(this::applyHavenoMarketPrice);
+    }
 
-        mapByCurrencyCode.values().stream()
-                .filter(list -> !list.isEmpty())
-                .forEach(list -> {
-                    list.sort(Comparator.comparing(TradeStatistics3::getDate));
-                    TradeStatistics3 tradeStatistics = list.get(list.size() - 1);
-                    setHavenoMarketPrice(tradeStatistics.getCurrency(), tradeStatistics.getTradePrice());
-                });
+    // Applies a single trade statistic without scanning the full list. Ignored if we already applied a
+    // more recent trade for that currency.
+    public void applyHavenoMarketPrice(TradeStatistics3 tradeStatistics) {
+        String currencyCode = tradeStatistics.getCurrency();
+        synchronized (latestHavenoMarketPriceDateByCurrencyCode) {
+            Date latestDate = latestHavenoMarketPriceDateByCurrencyCode.get(currencyCode);
+            if (latestDate != null && tradeStatistics.getDate().before(latestDate)) {
+                return;
+            }
+            latestHavenoMarketPriceDateByCurrencyCode.put(currencyCode, tradeStatistics.getDate());
+
+            // Keep the price update inside the lock so concurrent applies enqueue their cache updates in date order.
+            setHavenoMarketPrice(currencyCode, tradeStatistics.getTradePrice());
+        }
     }
 
     /**
@@ -409,10 +455,9 @@ public class PriceFeedService {
         String errorMessage = null;
         if (currencyCode != null) {
             String baseUrl = priceProvider.getBaseUrl();
-            httpClient.setBaseUrl(baseUrl);
-            if (cache.containsKey(currencyCode)) {
+            MarketPrice marketPrice = getMarketPrice(currencyCode);
+            if (marketPrice != null) {
                 try {
-                    MarketPrice marketPrice = cache.get(currencyCode);
                     if (marketPrice.isExternallyProvidedPrice()) {
                         if (marketPrice.isRecentPriceAvailable()) {
                             if (priceConsumer != null)
@@ -458,37 +503,55 @@ public class PriceFeedService {
         return result;
     }
 
+    // issues a single request at a time; runs on THREAD_ID
     private void requestAllPrices(PriceProvider provider, Runnable resultHandler, FaultHandler faultHandler) {
-        if (httpClient.hasPendingRequest()) {
-            log.warn("We have a pending request open. We ignore that request. httpClient {}", httpClient);
+        if (!requestInProgress.compareAndSet(false, true)) {
+            log.debug("We have a request in progress. We ignore the new request to provider {}", provider.getBaseUrl());
             return;
         }
 
-        priceRequest = new PriceRequest();
-        SettableFuture<Map<String, MarketPrice>> future = priceRequest.requestAllPrices(provider);
+        // release the previous request's executor before starting a new request
+        if (priceRequest != null) priceRequest.shutDown();
+
+        baseUrlOfRespondingProvider = null;
+
+        PriceRequest thisRequest = new PriceRequest();
+        priceRequest = thisRequest;
+        SettableFuture<Map<String, MarketPrice>> future = thisRequest.requestAllPrices(provider);
         Futures.addCallback(future, new FutureCallback<>() {
             @Override
             public void onSuccess(@Nullable Map<String, MarketPrice> result) {
-                UserThread.execute(() -> {
-                    checkNotNull(result, "Result must not be null at requestAllPrices");
-                    // Each currency rate has a different timestamp, depending on when
-                    // the priceNode aggregate rate was calculated
-                    // However, the request timestamp is when the pricenode was queried
-                    epochInMillisAtLastRequest = System.currentTimeMillis();
-
-                    Map<String, MarketPrice> priceMap = result;
-
-                    synchronized (cache) {
-                        cache.putAll(priceMap);
+                ThreadUtils.execute(() -> {
+                    if (priceRequest != thisRequest) return; // request was canceled and replaced
+                    requestInProgress.set(false);
+                    baseUrlOfRespondingProvider = provider.getBaseUrl();
+                    if (!baseUrlOfRespondingProvider.equals(baseUrlOfLastRespondingProvider)) {
+                        baseUrlOfLastRespondingProvider = baseUrlOfRespondingProvider;
+                        log.info("Receiving prices from provider {}", baseUrlOfRespondingProvider);
                     }
+                    UserThread.execute(() -> {
+                        checkNotNull(result, "Result must not be null at requestAllPrices");
+                        // Each currency rate has a different timestamp, depending on when
+                        // the priceNode aggregate rate was calculated
+                        // However, the request timestamp is when the pricenode was queried
+                        epochInMillisAtLastRequest = System.currentTimeMillis();
 
-                    resultHandler.run();
-                });
+                        synchronized (cache) {
+                            cache.putAll(result);
+                        }
+
+                        resultHandler.run();
+                    });
+                }, THREAD_ID);
             }
 
             @Override
             public void onFailure(@NotNull Throwable throwable) {
-                UserThread.execute(() -> faultHandler.handleFault("Could not load marketPrices", throwable));
+                ThreadUtils.execute(() -> {
+                    if (priceRequest != thisRequest) return; // request was canceled and replaced
+                    requestInProgress.set(false);
+                    UserThread.execute(() -> faultHandler.handleFault("Could not load marketPrices", throwable));
+                }, THREAD_ID);
             }
         }, MoreExecutors.directExecutor());
     }

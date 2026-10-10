@@ -43,6 +43,7 @@ import haveno.network.p2p.network.Connection;
 import haveno.network.p2p.network.ConnectionListener;
 import haveno.network.p2p.network.MessageListener;
 import haveno.network.p2p.network.NetworkNode;
+import haveno.network.p2p.network.OutboundConnection;
 import haveno.network.p2p.peers.BroadcastHandler;
 import haveno.network.p2p.peers.Broadcaster;
 import haveno.network.p2p.peers.getdata.messages.GetDataRequest;
@@ -120,6 +121,7 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
     public static final int CHECK_TTL_INTERVAL_SEC = 60;
 
     private boolean initialRequestApplied = false;
+    private boolean bootstrapped = false;
 
     private final Broadcaster broadcaster;
     @VisibleForTesting
@@ -324,10 +326,12 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
         log.info("{} PersistableNetworkPayload entries remained after filtered by excluded keys. " +
                 "Original map had {} entries.",
                 filteredPersistableNetworkPayloads.size(), mapForDataResponse.size());
-        log.trace("## buildGetDataResponse filteredPersistableNetworkPayloadHashes={}",
-                filteredPersistableNetworkPayloads.stream()
-                        .map(e -> Utilities.encodeToHex(e.getHash()))
-                        .toArray());
+        if (log.isTraceEnabled()) {
+            log.trace("## buildGetDataResponse filteredPersistableNetworkPayloadHashes={}",
+                    filteredPersistableNetworkPayloads.stream()
+                            .map(e -> Utilities.encodeToHex(e.getHash()))
+                            .toArray());
+        }
 
         // We give 75% space to ProtectedStorageEntries as they contain MailBoxMessages and those can be larger.
         limit = Math.round(maxSize * 0.75);
@@ -343,10 +347,12 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
         log.info("{} ProtectedStorageEntry entries remained after filtered by excluded keys. " +
                         "Original map had {} entries.",
                 filteredProtectedStorageEntries.size(), map.size());
-        log.trace("## buildGetDataResponse filteredProtectedStorageEntryHashes={}",
-                filteredProtectedStorageEntries.stream()
-                        .map(e -> get32ByteHashAsByteArray((e.getProtectedStoragePayload())))
-                        .toArray());
+        if (log.isTraceEnabled()) {
+            log.trace("## buildGetDataResponse filteredProtectedStorageEntryHashes={}",
+                    filteredProtectedStorageEntries.stream()
+                            .map(e -> get32ByteHashAsByteArray((e.getProtectedStoragePayload())))
+                            .toArray());
+        }
 
         boolean wasTruncated = wasPersistableNetworkPayloadsTruncated.get() || wasProtectedStorageEntriesTruncated.get();
         return new GetDataResponse(
@@ -400,8 +406,8 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
     }
 
     /**
-     * Generic function that can be used to filter a Map<ByteArray, ProtectedStorageEntry || PersistableNetworkPayload>
-     * by a given set of keys and peer capabilities.
+     * Generic function that can be used to filter a map of {@code ProtectedStorageEntry}
+     * or {@code PersistableNetworkPayload} values by a given set of keys and peer capabilities.
      */
     static private <T extends NetworkPayload> Set<T> filterKnownHashes(
             Map<ByteArray, T> toFilter,
@@ -568,9 +574,11 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
      * Processes a GetDataResponse message and updates internal state. Does not broadcast updates to the P2P network
      * or domain listeners.
      */
-    public void processGetDataResponse(GetDataResponse getDataResponse, NodeAddress sender) {
+    // Returns the number of newly added items, used as progress signal to page through truncated responses.
+    public int processGetDataResponse(GetDataResponse getDataResponse, NodeAddress sender) {
         Set<ProtectedStorageEntry> protectedStorageEntries = getDataResponse.getDataSet();
         Set<PersistableNetworkPayload> persistableNetworkPayloadSet = getDataResponse.getPersistableNetworkPayloadSet();
+        AtomicInteger numAdded = new AtomicInteger();
         long ts = System.currentTimeMillis();
         protectedStorageEntries.forEach(protectedStorageEntry -> {
             // We rebroadcast high priority data after a delay for better resilience
@@ -582,36 +590,32 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
             }
 
             // We don't broadcast here (last param) as we are only connected to the seed node and would be pointless
-            addProtectedStorageEntry(protectedStorageEntry, sender, null, false);
-
+            if (addProtectedStorageEntry(protectedStorageEntry, sender, null, false)) numAdded.incrementAndGet();
         });
         log.info("Processing {} protectedStorageEntries took {} ms.", protectedStorageEntries.size(), this.clock.millis() - ts);
 
         ts = this.clock.millis();
         persistableNetworkPayloadSet.forEach(e -> {
             if (e instanceof ProcessOncePersistableNetworkPayload) {
-                // We use an optimized method as many checks are not required in that case to avoid
-                // performance issues.
-                // Processing 82645 items took now 61 ms compared to earlier version where it took ages (> 2min).
-                // Usually we only get about a few hundred or max. a few 1000 items. 82645 is all
-                // trade stats and all account age witness data.
-
-                // We only apply it once from first response
-                if (!initialRequestApplied || getDataResponse.isWasTruncated()) {
-                    addPersistableNetworkPayloadFromInitialRequest(e);
+                if (bootstrapped) {
+                    // re-request after reconnect: apply missed items and notify listeners
+                    if (addPersistableNetworkPayload(e, sender, false, false, false)) numAdded.incrementAndGet();
+                } else {
+                    // startup: apply new items via optimized path, paging through truncated responses until complete.
+                    // The first response is the bulk load applied quietly; later deltas notify listeners so gaps
+                    // heal live without a restart. Duplicates are cheap no-ops so redundant responses are ok.
+                    if (addPersistableNetworkPayloadFromInitialRequest(e, initialRequestApplied)) numAdded.incrementAndGet();
                 }
             } else {
                 // We don't broadcast here as we are only connected to the seed node and would be pointless
-                addPersistableNetworkPayload(e, sender, false, false, false);
+                if (addPersistableNetworkPayload(e, sender, false, false, false)) numAdded.incrementAndGet();
             }
         });
         log.info("Processing {} persistableNetworkPayloads took {} ms.",
                 persistableNetworkPayloadSet.size(), this.clock.millis() - ts);
 
-        // We only process PersistableNetworkPayloads implementing ProcessOncePersistableNetworkPayload once. It can cause performance
-        // issues and since the data is rarely out of sync it is not worth it to apply them from multiple peers during
-        // startup.
         initialRequestApplied = true;
+        return numAdded.get();
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -655,6 +659,7 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
     }
 
     public void onBootstrapped() {
+        bootstrapped = true;
         removeExpiredEntriesTimer = UserThread.runPeriodically(this::removeExpiredEntries, CHECK_TTL_INTERVAL_SEC);
     }
 
@@ -693,6 +698,10 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
     @Override
     public void onDisconnect(CloseConnectionReason closeConnectionReason, Connection connection) {
         if (closeConnectionReason.isIntended)
+            return;
+
+        // only the address of an outbound connection is known to be the peer's; an inbound peer only claims one
+        if (!(connection instanceof OutboundConnection))
             return;
 
         if (!connection.getPeersNodeAddressOptional().isPresent())
@@ -739,7 +748,18 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
                                                 @Nullable NodeAddress sender,
                                                 boolean allowReBroadcast) {
         return addPersistableNetworkPayload(
-                payload, sender, true, allowReBroadcast, false);
+                payload, sender, true, allowReBroadcast);
+    }
+
+    /**
+     * Same as above, but allowBroadcast=false stores the payload locally without broadcasting it.
+     */
+    public boolean addPersistableNetworkPayload(PersistableNetworkPayload payload,
+                                                @Nullable NodeAddress sender,
+                                                boolean allowBroadcast,
+                                                boolean allowReBroadcast) {
+        return addPersistableNetworkPayload(
+                payload, sender, allowBroadcast, allowReBroadcast, false);
     }
 
     private boolean addPersistableNetworkPayload(PersistableNetworkPayload payload,
@@ -756,7 +776,7 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
         }
 
         ByteArray hashAsByteArray = new ByteArray(payload.getHash());
-        boolean payloadHashAlreadyInStore = appendOnlyDataStoreService.getMap(payload).containsKey(hashAsByteArray);
+        boolean payloadHashAlreadyInStore = appendOnlyDataStoreService.containsKey(payload, hashAsByteArray);
 
         // Store already knows about this payload. Ignore it unless the caller specifically requests a republish.
         if (payloadHashAlreadyInStore && !reBroadcast) {
@@ -781,8 +801,9 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
             }
         }
 
-        // Broadcast the payload if requested by caller
-        if (allowBroadcast && wasAdded)
+        // Broadcast if requested. reBroadcast also re-sends payloads already in our store (how republishing
+        // own data heals gaps); the receive path uses reBroadcast=false, so duplicates never re-broadcast.
+        if (allowBroadcast && (wasAdded || reBroadcast))
             broadcaster.broadcast(new AddPersistableNetworkPayloadMessage(payload), sender);
 
         return true;
@@ -790,16 +811,19 @@ public class P2PDataStorage implements MessageListener, ConnectionListener, Pers
 
     // When we receive initial data we skip several checks to improve performance. We requested only missing entries so we
     // do not need to check again if the item is contained in the map, which is a bit slow as the map can be very large.
-    // Overwriting an entry would be also no issue. We also skip notifying listeners as we get called before the domain
-    // is ready so no listeners are set anyway. We might get called twice from a redundant call later, so listeners
-    // might be added then but as we have the data already added calling them would be irrelevant as well.
-    private void addPersistableNetworkPayloadFromInitialRequest(PersistableNetworkPayload payload) {
+    // Overwriting an entry would be also no issue. The first bulk response is applied before the domain is ready so it
+    // skips notifying listeners; later paging deltas signal listeners so gaps heal live without a restart.
+    // Returns true if the payload was newly added.
+    private boolean addPersistableNetworkPayloadFromInitialRequest(PersistableNetworkPayload payload, boolean signalListeners) {
         byte[] hash = payload.getHash();
         if (payload.verifyHashSize()) {
             ByteArray hashAsByteArray = new ByteArray(hash);
-            appendOnlyDataStoreService.put(hashAsByteArray, payload);
+            boolean wasAdded = appendOnlyDataStoreService.put(hashAsByteArray, payload);
+            if (wasAdded && signalListeners) appendOnlyDataStoreListeners.forEach(e -> e.onAdded(payload));
+            return wasAdded;
         } else {
             log.warn("We got a hash exceeding our permitted size");
+            return false;
         }
     }
 

@@ -36,6 +36,7 @@ package haveno.core.api;
 
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import haveno.common.app.Version;
 import haveno.common.crypto.KeyRing;
 import haveno.common.handlers.ErrorMessageHandler;
 import haveno.common.handlers.ResultHandler;
@@ -61,7 +62,7 @@ import haveno.core.proto.persistable.CorePersistenceProtoResolver;
 import haveno.core.provider.price.PriceFeedService;
 import haveno.core.trade.HavenoUtils;
 
-import static haveno.core.payment.PaymentAccountUtil.isPaymentAccountValidForOffer;
+import static haveno.core.payment.PaymentAccountUtil.isPaymentAccountValidForNewOffer;
 import haveno.core.user.User;
 import haveno.core.util.PriceUtil;
 import static java.lang.String.format;
@@ -436,7 +437,7 @@ public class CoreOffersService {
                 newOfferPayload.getAcceptedCountryCodes(),
                 newOfferPayload.getBankId(),
                 newOfferPayload.getAcceptedBankIds(),
-                offerPayload.getVersionNr(),
+                Version.VERSION, // refresh version so outdated offers are re-signed
                 offerPayload.getBlockHeightAtOfferCreation(),
                 offerPayload.getMaxTradeLimit(),
                 offerPayload.getMaxTradePeriod(),
@@ -475,7 +476,7 @@ public class CoreOffersService {
     // -------------------------- PRIVATE HELPERS -----------------------------
 
     private void verifyPaymentAccountIsValidForNewOffer(Offer offer, PaymentAccount paymentAccount) {
-        if (!isPaymentAccountValidForOffer(offer, paymentAccount)) {
+        if (!isPaymentAccountValidForNewOffer(offer, paymentAccount)) {
             String error = format("cannot create %s offer with payment account %s",
                     offer.getOfferPayload().getCounterCurrencyCode(),
                     paymentAccount.getId());

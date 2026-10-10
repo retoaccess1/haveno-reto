@@ -43,7 +43,6 @@ import haveno.common.handlers.ErrorMessageHandler;
 import haveno.common.proto.network.NetworkEnvelope;
 import haveno.common.taskrunner.Task;
 import haveno.core.offer.Offer;
-import haveno.core.offer.OpenOffer;
 import haveno.core.support.messages.ChatMessage;
 import haveno.core.trade.ArbitratorTrade;
 import haveno.core.trade.BuyerTrade;
@@ -700,7 +699,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                                         },
                                         (errorMessage) -> {
                                             log.warn("Error processing payment sent message: " + errorMessage);
-                                            processModel.getTradeManager().requestPersistence();
+                                            trade.requestPersistence();
                                             if (trade.isShutDownStarted()) {
                                                 log.warn("Skipping error handling for PaymentSentMessage for {} {} because trade is shutting down", trade.getClass().getSimpleName(), trade.getId());
                                                 unlatchTrade();
@@ -817,7 +816,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                                     },
                                     errorMessage -> {
                                         log.warn("Error processing payment received message: " + errorMessage);
-                                        processModel.getTradeManager().requestPersistence();
+                                        trade.requestPersistence();
                                         if (trade.isShutDownStarted()) {
                                             log.warn("Skipping error handling for PaymentReceivedMessage for {} {} because trade is shutting down", trade.getClass().getSimpleName(), trade.getId());
                                             unlatchTrade();
@@ -966,6 +965,15 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
             }
         }
 
+        // handle nack of InitTradeRequest from maker to taker, e.g. offer is already taken
+        if (!ackMessage.isSuccess() && trade.isTaker() && verifiedPeer == trade.getMaker() && ackMessage.getSourceMsgClassName().equals(InitTradeRequest.class.getSimpleName())) {
+            if (trade.getPhase() == Trade.Phase.INIT) {
+                handleError(ackMessage.getErrorMessage());
+                return;
+            }
+            log.warn("Ignoring InitTradeRequest NACK from maker for {} {} because trade is past init, phase={}, errorMessage={}", trade.getClass().getSimpleName(), trade.getId(), trade.getPhase(), ackMessage.getErrorMessage());
+        }
+
         // handle nack of DepositRequest from arbitrator to buyer or seller
         if (ackMessage.getSourceMsgClassName().equals(DepositRequest.class.getSimpleName())) {
             if (!ackMessage.isSuccess()) {
@@ -974,14 +982,14 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                     return;
                 }
                 trade.setStateIfValidTransitionTo(Trade.State.PUBLISH_DEPOSIT_TX_REQUEST_FAILED);
-                processModel.getTradeManager().requestPersistence();
+                trade.requestPersistence();
             }
         }
 
         // handle ack message for DepositsConfirmedMessage, which automatically re-sends if not ACKed in a certain time
         if (ackMessage.getSourceMsgClassName().equals(DepositsConfirmedMessage.class.getSimpleName())) {
             verifiedPeer.setDepositsConfirmedAckMessage(ackMessage);
-            processModel.getTradeManager().requestPersistence();
+            trade.requestPersistence();
         }
 
         // handle ack message for PaymentSentMessage, which automatically re-sends if not ACKed in a certain time
@@ -994,10 +1002,10 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                 trade.getSeller().setPaymentSentAckMessage(ackMessage);
                 if (ackMessage.isSuccess()) trade.setStateIfValidTransitionTo(Trade.State.SELLER_RECEIVED_PAYMENT_SENT_MSG);
                 else trade.setState(Trade.State.BUYER_SEND_FAILED_PAYMENT_SENT_MSG);
-                processModel.getTradeManager().requestPersistence();
+                trade.requestPersistence();
             } else if (verifiedPeer == trade.getArbitrator()) {
                 trade.getArbitrator().setPaymentSentAckMessage(ackMessage);
-                processModel.getTradeManager().requestPersistence();
+                trade.requestPersistence();
             } else {
                 log.warn("Received AckMessage from unexpected peer. Sender={}, trade={} {}, state={}, success={}, error={}, messageUid={}", sender, trade.getClass().getSimpleName(), trade.getId(), trade.getState(), ackMessage.isSuccess(), ackMessage.getErrorMessage(), ackMessage.getSourceUid());
                 return;
@@ -1012,7 +1020,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
             // ack message from buyer
             if (verifiedPeer == trade.getBuyer()) {
                 trade.getBuyer().setPaymentReceivedAckMessage(ackMessage);
-                processModel.getTradeManager().persistNow(null);
+                trade.persistNow(null);
 
                 // handle successful ack
                 if (ackMessage.isSuccess()) {
@@ -1024,7 +1032,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                     }
 
                     trade.setStateIfValidTransitionTo(Trade.State.BUYER_RECEIVED_PAYMENT_RECEIVED_MSG);
-                    processModel.getTradeManager().persistNow(null);
+                    trade.persistNow(null);
                 }
                 
                 // handle nack
@@ -1034,7 +1042,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                     // nack includes updated multisig hex since v1.1.1
                     if (ackMessage.getUpdatedMultisigHex() != null) {
                         trade.getBuyer().setUpdatedMultisigHex(ackMessage.getUpdatedMultisigHex());
-                        processModel.getTradeManager().persistNow(null);
+                        trade.persistNow(null);
                         onPaymentReceivedNack(true, verifiedPeer, ackMessage);
                         return; // skip remaining processing
                     }
@@ -1044,7 +1052,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
             // ack message from arbitrator
             else if (verifiedPeer == trade.getArbitrator()) {
                 trade.getArbitrator().setPaymentReceivedAckMessage(ackMessage);
-                processModel.getTradeManager().persistNow(null);
+                trade.persistNow(null);
 
                 // handle nack
                 if (!ackMessage.isSuccess()) {
@@ -1053,7 +1061,7 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
                     // nack includes updated multisig hex since v1.1.1
                     if (ackMessage.getUpdatedMultisigHex() != null) {
                         trade.getArbitrator().setUpdatedMultisigHex(ackMessage.getUpdatedMultisigHex());
-                        processModel.getTradeManager().persistNow(null);
+                        trade.persistNow(null);
                         onPaymentReceivedNack(true, verifiedPeer, ackMessage);
                         return; // skip remaining processing
                     }
@@ -1135,6 +1143,11 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
     private void handleSecondMakerInitTradeRequestNack(AckMessage ackMessage) {
         log.warn("Maker received 2nd NACK to InitTradeRequest from arbitrator for {} {}, messageUid={}, errorMessage={}", trade.getClass().getSimpleName(), trade.getId(), ackMessage.getSourceUid(), ackMessage.getErrorMessage());
 
+        // nack taker's InitTradeRequest so taker fails fast instead of timing out
+        if (processModel.getTradeMessage() instanceof InitTradeRequest && trade.getTaker().getNodeAddress() != null) {
+            sendAckMessage(trade.getTaker().getNodeAddress(), (InitTradeRequest) processModel.getTradeMessage(), false, ackMessage.getErrorMessage());
+        }
+
         // skip removing offer if nack is acceptable
         if (isAcceptableInitTradeRequestNack(ackMessage)) {
             log.warn("Not removing offer {} on 2nd InitTradeRequest NACK from arbitrator because the NACK is for an acceptable reason, errorMessage={}", trade.getOffer().getShortId(), ackMessage.getErrorMessage());
@@ -1143,12 +1156,10 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
 
         // remove offer on unacceptable 2nd nack
         String warningMessage = "Your offer (" + trade.getOffer().getShortId() + ") has been removed because there was a problem taking the trade.\n\nError message: " + ackMessage.getErrorMessage();
-        OpenOffer openOffer = HavenoUtils.openOfferManager.getOpenOffer(trade.getId()).orElse(null);
-        if (openOffer != null) {
-            HavenoUtils.openOfferManager.removeOpenOffer(openOffer, null, null);
+        if (HavenoUtils.openOfferManager.removeOpenOfferOnTradeError(trade)) {
             HavenoUtils.setTopError(warningMessage);
+            log.warn(warningMessage);
         }
-        log.warn(warningMessage);
     }
 
     private static boolean isAcceptableInitTradeRequestNack(AckMessage ackMessage) {
@@ -1187,6 +1198,18 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
         synchronized (timeoutTimerLock) {
             stopTimeout();
             timeoutTimer = UserThread.runAfter(() -> {
+
+                // do not flag trade with error if deposits are published (e.g. deposit txs seen but DepositResponse not received within timeout)
+                if (trade.isDepositsPublished()) {
+                    log.warn("Trade step timeout reached after {} sec for {} {} but deposits are published, so not flagging trade with error, state={}", timeoutSec, trade.getClass().getSimpleName(), trade.getId(), trade.stateProperty().get());
+                    stopTimeout();
+                    unlatchTrade();
+                    if (tradeResultHandler != null) tradeResultHandler.handleResult(trade); // trade is initialized
+                    tradeResultHandler = null;
+                    errorMessageHandler = null;
+                    return;
+                }
+
                 handleError(TIMEOUT_REACHED + " Protocol did not complete in " + timeoutSec + " sec. TradeID=" + trade.getId() + ", state=" + trade.stateProperty().get());
             }, timeoutSec);
         }
@@ -1308,10 +1331,11 @@ public abstract class TradeProtocol implements DecryptedDirectMessageListener, D
         stopTimeout();
         log.error(errorMessage);
         if (setTradeError) trade.setErrorMessage(errorMessage);
-        processModel.getTradeManager().requestPersistence();
-        unlatchTrade();
-        if (errorMessageHandler != null) errorMessageHandler.handleErrorMessage(errorMessage);
+        trade.requestPersistence();
+        ErrorMessageHandler handler = errorMessageHandler; // capture before unlatching, since queued trade tasks can replace it
         errorMessageHandler = null;
+        unlatchTrade();
+        if (handler != null) handler.handleErrorMessage(errorMessage);
     }
 
     protected void latchTrade() {

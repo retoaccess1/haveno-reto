@@ -22,6 +22,10 @@ public class Layout {
     public static final double INITIAL_WINDOW_HEIGHT = 710; //740
     public static final double MIN_WINDOW_WIDTH = 1020;
     public static final double MIN_WINDOW_HEIGHT = 620;
+    public static final double CHAT_WINDOW_WIDTH = 960;
+    public static final double CHAT_WINDOW_HEIGHT = 640;
+    public static final double CHAT_WINDOW_MIN_WIDTH = 500;
+    public static final double CHAT_WINDOW_MIN_HEIGHT = 400;
     public static final double MAX_POPUP_HEIGHT = 850;
     public static final double FIRST_ROW_DISTANCE = 20d;
     public static final double COMPACT_FIRST_ROW_DISTANCE = 10d;
@@ -30,12 +34,18 @@ public class Layout {
     public static final double GROUP_DISTANCE = 40d;
     public static final double COMPACT_GROUP_DISTANCE = 30d;
     public static final double GROUP_DISTANCE_WITHOUT_SEPARATOR = 20d;
+    // groups under a separator row sit closer to it, as Bisq's group borders do
+    public static final double SEPARATED_GROUP_DISTANCE = COMPACT_GROUP_DISTANCE - 5;
+    public static final double SEPARATED_FIRST_ROW_AND_GROUP_DISTANCE = SEPARATED_GROUP_DISTANCE + FIRST_ROW_DISTANCE;
     public static final double FIRST_ROW_AND_GROUP_DISTANCE = GROUP_DISTANCE + FIRST_ROW_DISTANCE;
     public static final double COMPACT_FIRST_ROW_AND_GROUP_DISTANCE = COMPACT_GROUP_DISTANCE + FIRST_ROW_DISTANCE;
     public static final double COMPACT_FIRST_ROW_AND_COMPACT_GROUP_DISTANCE = COMPACT_GROUP_DISTANCE + COMPACT_FIRST_ROW_DISTANCE;
     public static final double COMPACT_FIRST_ROW_AND_GROUP_DISTANCE_WITHOUT_SEPARATOR = GROUP_DISTANCE_WITHOUT_SEPARATOR + COMPACT_FIRST_ROW_DISTANCE;
     public static final double TWICE_FIRST_ROW_AND_COMPACT_GROUP_DISTANCE = COMPACT_GROUP_DISTANCE + TWICE_FIRST_ROW_DISTANCE;
     public static final double TWICE_FIRST_ROW_AND_GROUP_DISTANCE = GROUP_DISTANCE + TWICE_FIRST_ROW_DISTANCE;
+    // details windows use a tighter gap above section headers
+    public static final double DETAILS_WINDOW_GROUP_DISTANCE = 20d;
+    public static final double TWICE_FIRST_ROW_AND_DETAILS_WINDOW_GROUP_DISTANCE = DETAILS_WINDOW_GROUP_DISTANCE + TWICE_FIRST_ROW_DISTANCE;
     public static final double PADDING_WINDOW = 20d;
     public static double PADDING = 10d;
     public static double SPACING_H_BOX = 10d;

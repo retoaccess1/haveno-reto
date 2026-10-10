@@ -3,6 +3,7 @@ package haveno.core.xmr.model;
 import com.google.inject.Inject;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
+import haveno.common.UserThread;
 import haveno.common.crypto.CryptoException;
 import haveno.common.crypto.Encryption;
 import haveno.common.crypto.ScryptUtil;
@@ -13,16 +14,19 @@ import haveno.core.api.CoreAccountService;
 import haveno.core.api.model.EncryptedConnection;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import javax.crypto.SecretKey;
 import lombok.NonNull;
 import monero.common.MoneroRpcConnection;
@@ -86,37 +90,37 @@ public class EncryptedConnectionList implements PersistableEnvelope, PersistedDa
 
     @Override
     public void readPersisted(Runnable completeHandler) {
-        persistenceManager.readPersisted(persistedEncryptedConnectionList -> {
-            writeLock.lock();
-            try {
-                initializeEncryption(persistedEncryptedConnectionList.keyCrypterScrypt);
-                items.clear();
-                items.putAll(persistedEncryptedConnectionList.items);
-                currentConnectionUrl = persistedEncryptedConnectionList.currentConnectionUrl;
-                refreshPeriod = persistedEncryptedConnectionList.refreshPeriod;
-                autoSwitch = persistedEncryptedConnectionList.autoSwitch;
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                writeLock.unlock();
-            }
-            completeHandler.run();
-        }, () -> {
-            writeLock.lock();
-            try {
-                initializeEncryption(ScryptUtil.getKeyCrypterScrypt());
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                writeLock.unlock();
-            }
-            completeHandler.run();
-        });
+        persistenceManager.readPersisted(persisted -> initializeEncryption(persisted, completeHandler),
+                () -> initializeEncryption(null, completeHandler));
     }
 
-    private void initializeEncryption(KeyCrypterScrypt keyCrypterScrypt) {
-        this.keyCrypterScrypt = keyCrypterScrypt;
-        encryptionKey = toSecretKey(accountService.getPassword());
+    private void initializeEncryption(@Nullable EncryptedConnectionList persisted, Runnable completeHandler) {
+        KeyCrypterScrypt crypter = persisted == null ? ScryptUtil.getKeyCrypterScrypt() : persisted.keyCrypterScrypt;
+        String password = accountService.getPassword();
+        // derive outside the user thread and the store lock, then publish before startup continues
+        CompletableFuture.supplyAsync(() -> toSecretKey(crypter, password),
+                task -> new Thread(task, "EncryptedConnectionList-init").start())
+                .whenComplete((key, error) -> UserThread.execute(() -> {
+                    writeLock.lock();
+                    try {
+                        keyCrypterScrypt = crypter;
+                        if (error == null) {
+                            encryptionKey = key;
+                            if (persisted != null) {
+                                items.clear();
+                                items.putAll(persisted.items);
+                                currentConnectionUrl = persisted.currentConnectionUrl;
+                                refreshPeriod = persisted.refreshPeriod;
+                                autoSwitch = persisted.autoSwitch;
+                            }
+                        }
+                    } finally {
+                        writeLock.unlock();
+                    }
+                    if (error == null) accountService.addPasswordChangeHandler(CoreAccountService.PasswordChangeTarget.CONNECTIONS, this::changePassword);
+                    else error.printStackTrace();
+                    completeHandler.run();
+                }));
     }
 
     public List<MoneroRpcConnection> getConnections() {
@@ -274,36 +278,51 @@ public class EncryptedConnectionList implements PersistableEnvelope, PersistedDa
     // ----------------------------- HELPERS ----------------------------------
 
     public void changePassword(String oldPassword, String newPassword) {
+        reconcilePasswords(Arrays.asList(oldPassword), newPassword);
+        persistenceManager.persistNowAndWait();
+    }
+
+    // shared with the offline recovery tool; stage all entries before replacing any credentials
+    public void reconcilePasswords(List<String> passwords, String newPassword) {
         writeLock.lock();
         try {
-            SecretKey oldSecret = encryptionKey;
-            assert Objects.equals(oldSecret, toSecretKey(oldPassword)) : "Old secret does not match old password";
-            encryptionKey = toSecretKey(newPassword);
-            items.replaceAll((key, connection) -> reEncrypt(connection, oldSecret, encryptionKey));
+            if (keyCrypterScrypt == null) throw new IllegalStateException("Connection list is not initialized");
+            SecretKey target = toSecretKey(keyCrypterScrypt, newPassword);
+            List<SecretKey> candidates = new ArrayList<>();
+            candidates.add(target);
+            for (String password : passwords) candidates.add(toSecretKey(keyCrypterScrypt, password));
+            candidates.add(encryptionKey);
+            Map<String, EncryptedConnection> replacement = new HashMap<>();
+            for (Map.Entry<String, EncryptedConnection> entry : items.entrySet()) {
+                EncryptedConnection connection = entry.getValue();
+                byte[] plain = decryptPasswordForChange(connection.getEncryptedPassword(), connection.getEncryptionSalt(), candidates);
+                replacement.put(entry.getKey(), connection.toBuilder().encryptedPassword(encrypt(plain, target)).build());
+            }
+            items.clear();
+            items.putAll(replacement);
+            encryptionKey = target;
         } finally {
             writeLock.unlock();
         }
-        requestPersistence();
     }
 
-    private SecretKey toSecretKey(String password) {
+    private static byte[] decryptPasswordForChange(byte[] encrypted, byte[] salt, List<SecretKey> candidates) {
+        if (salt.length != SALT_LENGTH) throw new IllegalStateException("Invalid stored connection salt");
+        for (SecretKey candidate : candidates) {
+            try {
+                byte[] plain = decrypt(encrypted, candidate);
+                if (arrayStartsWith(plain, salt) || (plain.length >= salt.length
+                        && Arrays.equals(plain, plain.length - salt.length, plain.length, salt, 0, salt.length))) return plain;
+            } catch (IllegalArgumentException e) {
+                // try the other credential from the interrupted password change
+            }
+        }
+        throw new IllegalStateException("Could not decrypt stored connection credentials with the supplied passwords. Close Haveno and run the recovery tool with the passwords used during the failed change; see docs/password-recovery.md");
+    }
+
+    private static SecretKey toSecretKey(KeyCrypterScrypt keyCrypterScrypt, String password) {
         if (password == null) return null;
         return Encryption.getSecretKeyFromBytes(keyCrypterScrypt.deriveKey(password).getKey());
-    }
-
-    private static EncryptedConnection reEncrypt(EncryptedConnection connection,
-                                                    SecretKey oldSecret, SecretKey newSecret) {
-        return connection.toBuilder()
-                .encryptedPassword(reEncrypt(connection.getEncryptedPassword(), oldSecret, newSecret))
-                .build();
-    }
-
-    private static byte[] reEncrypt(byte[] value,
-                                    SecretKey oldSecret, SecretKey newSecret) {
-        // was previously not encrypted if null
-        byte[] decrypted = oldSecret == null ? value : decrypt(value, oldSecret);
-        // should not be encrypted if null
-        return newSecret == null ? decrypted : encrypt(decrypted, newSecret);
     }
 
     private static byte[] decrypt(byte[] encrypted, SecretKey secret) {
@@ -369,7 +388,7 @@ public class EncryptedConnectionList implements PersistableEnvelope, PersistedDa
     }
 
     private byte[] decryptPassword(byte[] encryptedSaltedPassword, byte[] salt) {
-        byte[] decryptedSaltedPassword = decrypt(encryptedSaltedPassword, encryptionKey);
+        byte[] decryptedSaltedPassword = decryptPasswordForChange(encryptedSaltedPassword, salt, Arrays.asList(encryptionKey));
         if (arrayStartsWith(decryptedSaltedPassword, salt)) {
             // salt is prefix, so no actual password set
             return null;

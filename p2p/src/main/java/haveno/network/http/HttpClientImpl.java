@@ -30,6 +30,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
@@ -42,40 +43,51 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import monero.common.NetworkUtils;
-import org.apache.http.HttpEntity;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.client.methods.HttpUriRequest;
-import org.apache.http.client.protocol.HttpClientContext;
-import org.apache.http.config.Registry;
-import org.apache.http.config.RegistryBuilder;
-import org.apache.http.conn.socket.ConnectionSocketFactory;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
-import org.apache.http.ssl.SSLContexts;
+import org.apache.hc.client5.http.DnsResolver;
+import org.apache.hc.client5.http.SystemDefaultDnsResolver;
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.classic.methods.HttpGet;
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.classic.methods.HttpUriRequest;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.protocol.HttpClientContext;
+import org.apache.hc.client5.http.socket.ConnectionSocketFactory;
+import org.apache.hc.core5.http.config.RegistryBuilder;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.io.SocketConfig;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+import org.apache.hc.core5.pool.PoolConcurrencyPolicy;
+import org.apache.hc.core5.pool.PoolReusePolicy;
+import org.apache.hc.core5.ssl.SSLContexts;
+import org.apache.hc.core5.util.TimeValue;
+import org.apache.hc.core5.util.Timeout;
 
-// TODO close connection if failing
 @Slf4j
 public class HttpClientImpl implements HttpClient {
     @Nullable
     private Socks5ProxyProvider socks5ProxyProvider;
     @Nullable
-    private HttpURLConnection connection;
+    private volatile HttpURLConnection connection;
     @Nullable
-    private CloseableHttpClient closeableHttpClient;
+    private volatile CloseableHttpClient closeableHttpClient;
     private static final long SHUTDOWN_TIMEOUT_MS = 5000l;
 
     @Getter
     @Setter
-    private String baseUrl;
+    private volatile String baseUrl;
     @Setter
     private boolean ignoreSocks5Proxy;
     @Getter
     private final String uid;
     private boolean hasPendingRequest;
+    private long requestGen;
+    private final Object requestLock = new Object(); // guards request ownership and its cancellable resources
+    protected volatile int connectTimeoutMs = (int) TimeUnit.SECONDS.toMillis(120);
+    protected volatile int readTimeoutMs = (int) TimeUnit.SECONDS.toMillis(120);
 
     @Inject
     public HttpClientImpl(@Nullable Socks5ProxyProvider socks5ProxyProvider) {
@@ -90,12 +102,19 @@ public class HttpClientImpl implements HttpClient {
 
     @Override
     public void shutDown() {
+        HttpURLConnection connectionToClose;
+        CloseableHttpClient closeableHttpClientToClose;
+        synchronized (requestLock) {
+            if (!hasPendingRequest) return;
+            requestGen++;
+            hasPendingRequest = false;
+            connectionToClose = connection;
+            closeableHttpClientToClose = closeableHttpClient;
+            connection = null;
+            closeableHttpClient = null;
+        }
         try {
-            ThreadUtils.awaitTask(() -> {
-                doShutDown(connection, closeableHttpClient);
-                connection = null;
-                closeableHttpClient = null;
-            }, SHUTDOWN_TIMEOUT_MS);
+            ThreadUtils.awaitTask(() -> doShutDown(connectionToClose, closeableHttpClientToClose), SHUTDOWN_TIMEOUT_MS);
         } catch (Exception e) {
             // ignore
         }
@@ -103,20 +122,22 @@ public class HttpClientImpl implements HttpClient {
 
     private void doShutDown(HttpURLConnection connection, CloseableHttpClient closeableHttpClient) {
         try {
-            if (connection != null) {
-                connection.getInputStream().close();
-                connection.disconnect();
-            }
+            if (connection != null) connection.disconnect();
+        } catch (Exception ignore) {
+        }
+        try {
             if (closeableHttpClient != null) {
                 closeableHttpClient.close();
             }
-        } catch (IOException ignore) {
+        } catch (Exception ignore) {
         }
     }
 
     @Override
     public boolean hasPendingRequest() {
-        return hasPendingRequest;
+        synchronized (requestLock) {
+            return hasPendingRequest;
+        }
     }
 
     @Override
@@ -137,51 +158,76 @@ public class HttpClientImpl implements HttpClient {
                              HttpMethod httpMethod,
                              @Nullable String headerKey,
                              @Nullable String headerValue) throws IOException {
-        checkNotNull(baseUrl, "baseUrl must be set before calling doRequest");
-        checkArgument(!hasPendingRequest, "We got called on the same HttpClient again while a request is still open.");
+        String requestBaseUrl = checkNotNull(baseUrl, "baseUrl must be set before calling doRequest");
+        long gen;
+        synchronized (requestLock) {
+            checkArgument(!hasPendingRequest,
+                    "We got called on the same HttpClient again while a request is still open.");
+            hasPendingRequest = true;
+            gen = ++requestGen;
+        }
 
-        hasPendingRequest = true;
-        Socks5Proxy socks5Proxy = getSocks5Proxy(socks5ProxyProvider);
-        if (ignoreSocks5Proxy || socks5Proxy == null || NetworkUtils.isLoopbackUrl(baseUrl)) {
-            return requestWithoutProxy(baseUrl, param, httpMethod, headerKey, headerValue);
-        } else {
-            return doRequestWithProxy(baseUrl, param, httpMethod, socks5Proxy, headerKey, headerValue);
+        try {
+            Socks5Proxy socks5Proxy = getSocks5Proxy(socks5ProxyProvider);
+            if (ignoreSocks5Proxy || socks5Proxy == null || NetworkUtils.isLoopbackUrl(requestBaseUrl)) {
+                return requestWithoutProxy(requestBaseUrl, param, httpMethod, headerKey, headerValue, gen);
+            } else {
+                return doRequestWithProxy(requestBaseUrl, param, httpMethod, socks5Proxy, headerKey, headerValue, gen);
+            }
+        } finally {
+            synchronized (requestLock) {
+                if (requestGen == gen) {
+                    connection = null;
+                    closeableHttpClient = null;
+                    hasPendingRequest = false;
+                }
+            }
         }
     }
 
     public void cancelPendingRequest() {
-        if (!hasPendingRequest) return;
         shutDown();
-        hasPendingRequest = false;
     }
 
     private String requestWithoutProxy(String baseUrl,
                                        String param,
                                        HttpMethod httpMethod,
                                        @Nullable String headerKey,
-                                       @Nullable String headerValue) throws IOException {
+                                       @Nullable String headerValue,
+                                       long gen) throws IOException {
         long ts = System.currentTimeMillis();
         log.debug("requestWithoutProxy: URL={}, param={}, httpMethod={}", baseUrl, param, httpMethod);
+        HttpURLConnection connection = null;
         try {
             String spec = httpMethod == HttpMethod.GET ? baseUrl + param : baseUrl;
             URL url = new URL(spec);
             connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod(httpMethod.name());
-            connection.setConnectTimeout((int) TimeUnit.SECONDS.toMillis(120));
-            connection.setReadTimeout((int) TimeUnit.SECONDS.toMillis(120));
+            connection.setConnectTimeout(connectTimeoutMs);
+            connection.setReadTimeout(readTimeoutMs);
             connection.setRequestProperty("User-Agent", "haveno/" + Version.VERSION);
             if (headerKey != null && headerValue != null) {
                 connection.setRequestProperty(headerKey, headerValue);
             }
 
+            if (httpMethod == HttpMethod.POST) connection.setDoOutput(true);
+            synchronized (requestLock) {
+                if (requestGen != gen) throw new IOException("Request was canceled");
+                this.connection = connection;
+            }
+
             if (httpMethod == HttpMethod.POST) {
-                connection.setDoOutput(true);
-                connection.getOutputStream().write(param.getBytes(StandardCharsets.UTF_8));
+                try (OutputStream outputStream = connection.getOutputStream()) {
+                    outputStream.write(param.getBytes(StandardCharsets.UTF_8));
+                }
             }
 
             int responseCode = connection.getResponseCode();
             if (responseCode == 200) {
-                String response = convertInputStreamToString(connection.getInputStream());
+                String response;
+                try (InputStream inputStream = connection.getInputStream()) {
+                    response = convertInputStreamToString(inputStream);
+                }
                 log.debug("Response from {} with param {} took {} ms. Data size:{}, response: {}",
                         baseUrl,
                         param,
@@ -190,24 +236,24 @@ public class HttpClientImpl implements HttpClient {
                         Utilities.toTruncatedString(response));
                 return response;
             } else {
-                InputStream errorStream = connection.getErrorStream();
-                if (errorStream != null) {
-                    String error = convertInputStreamToString(errorStream);
-                    errorStream.close();
-                    log.info("Received errorMsg '{}' with responseCode {} from {}. Response took: {} ms. param: {}",
-                            error,
-                            responseCode,
-                            baseUrl,
-                            System.currentTimeMillis() - ts,
-                            param);
-                    throw new HttpException(error, responseCode);
-                } else {
-                    log.info("Response with responseCode {} from {}. Response took: {} ms. param: {}",
-                            responseCode,
-                            baseUrl,
-                            System.currentTimeMillis() - ts,
-                            param);
-                    throw new HttpException("Request failed", responseCode);
+                try (InputStream errorStream = connection.getErrorStream()) {
+                    if (errorStream != null) {
+                        String error = convertInputStreamToString(errorStream);
+                        log.info("Received errorMsg '{}' with responseCode {} from {}. Response took: {} ms. param: {}",
+                                error,
+                                responseCode,
+                                baseUrl,
+                                System.currentTimeMillis() - ts,
+                                param);
+                        throw new HttpException(error, responseCode);
+                    } else {
+                        log.info("Response with responseCode {} from {}. Response took: {} ms. param: {}",
+                                responseCode,
+                                baseUrl,
+                                System.currentTimeMillis() - ts,
+                                param);
+                        throw new HttpException("Request failed", responseCode);
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -215,15 +261,7 @@ public class HttpClientImpl implements HttpClient {
                     ". Throwable=" + t.getMessage();
             throw new IOException(message, t);
         } finally {
-            try {
-                if (connection != null) {
-                    connection.getInputStream().close();
-                    connection.disconnect();
-                    connection = null;
-                }
-            } catch (Throwable ignore) {
-            }
-            hasPendingRequest = false;
+            doShutDown(connection, null);
         }
     }
 
@@ -232,41 +270,70 @@ public class HttpClientImpl implements HttpClient {
                                       HttpMethod httpMethod,
                                       Socks5Proxy socks5Proxy,
                                       @Nullable String headerKey,
-                                      @Nullable String headerValue) throws IOException {
+                                      @Nullable String headerValue,
+                                      long gen) throws IOException {
         long ts = System.currentTimeMillis();
         log.debug("doRequestWithProxy: baseUrl={}, param={}, httpMethod={}", baseUrl, param, httpMethod);
         // This code is adapted from:
         //  http://stackoverflow.com/a/25203021/5616248
 
-        // Register our own SocketFactories to override createSocket() and connectSocket().
-        // connectSocket does NOT resolve hostname before passing it to proxy.
-        Registry<ConnectionSocketFactory> reg = RegistryBuilder.<ConnectionSocketFactory>create()
-                .register("http", new SocksConnectionSocketFactory())
-                .register("https", new SocksSSLConnectionSocketFactory(SSLContexts.createSystemDefault())).build();
+        // HC 5.6 routes plain HTTP via DefaultHttpClientConnectionOperator + SocketConfig socks
+        // proxy (not ConnectionSocketFactory.connectSocket). Keep custom socket factories for
+        // HTTPS TLS upgrade; pair with FakeDnsResolver so .onion hostnames stay unresolved.
+        var reg = RegistryBuilder.<ConnectionSocketFactory>create()
+                .register("http", SocksConnectionSocketFactory.INSTANCE)
+                .register("https", new SocksSSLConnectionSocketFactory(SSLContexts.createSystemDefault()))
+                .build();
 
-        // Use FakeDNSResolver if not resolving DNS locally.
-        // This prevents a local DNS lookup (which would be ignored anyway)
-        PoolingHttpClientConnectionManager cm = socks5Proxy.resolveAddrLocally() ?
-                new PoolingHttpClientConnectionManager(reg) :
-                new PoolingHttpClientConnectionManager(reg, new FakeDnsResolver());
+        DnsResolver dnsResolver = socks5Proxy.resolveAddrLocally()
+                ? SystemDefaultDnsResolver.INSTANCE
+                : new FakeDnsResolver();
+        PoolingHttpClientConnectionManager cm = new PoolingHttpClientConnectionManager(
+                reg,
+                PoolConcurrencyPolicy.STRICT,
+                PoolReusePolicy.LIFO,
+                TimeValue.ofMinutes(5),
+                null,
+                dnsResolver,
+                null);
+        InetSocketAddress socksAddress = new InetSocketAddress(socks5Proxy.getInetAddress(), socks5Proxy.getPort());
+        cm.setDefaultSocketConfig(SocketConfig.custom()
+                .setSocksProxyAddress(socksAddress)
+                .setSoTimeout(Timeout.ofMilliseconds(readTimeoutMs))
+                .build());
+        cm.setDefaultConnectionConfig(ConnectionConfig.custom()
+                .setConnectTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
+                .setSocketTimeout(Timeout.ofMilliseconds(readTimeoutMs))
+                .build());
+        CloseableHttpClient httpclient = null;
         try {
-            closeableHttpClient = checkNotNull(HttpClients.custom().setConnectionManager(cm).build());
-            InetSocketAddress socksAddress = new InetSocketAddress(socks5Proxy.getInetAddress(), socks5Proxy.getPort());
-
-            // remove me: Use this to test with system-wide Tor proxy, or change port for another proxy.
-            // InetSocketAddress socksAddress = new InetSocketAddress("127.0.0.1", 9050);
+            httpclient = checkNotNull(HttpClients.custom()
+                    .setConnectionManager(cm)
+                    .setDefaultRequestConfig(RequestConfig.custom()
+                            .setConnectionRequestTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
+                            .setResponseTimeout(Timeout.ofMilliseconds(readTimeoutMs))
+                            .build())
+                    .build());
+            synchronized (requestLock) {
+                if (requestGen != gen) throw new IOException("Request was canceled");
+                this.closeableHttpClient = httpclient;
+            }
 
             HttpClientContext context = HttpClientContext.create();
             context.setAttribute("socks.address", socksAddress);
 
             HttpUriRequest request = getHttpUriRequest(httpMethod, baseUrl, param);
+            request.setHeader("User-Agent", "haveno/" + Version.VERSION);
             if (headerKey != null && headerValue != null) {
                 request.setHeader(headerKey, headerValue);
             }
 
-            try (CloseableHttpResponse httpResponse = closeableHttpClient.execute(request, context)) {
-                String response = convertInputStreamToString(httpResponse.getEntity().getContent());
-                int statusCode = httpResponse.getStatusLine().getStatusCode();
+            try (CloseableHttpResponse httpResponse = httpclient.execute(request, context)) {
+                int statusCode = httpResponse.getCode();
+                String response = "";
+                if (httpResponse.getEntity() != null) {
+                    response = convertInputStreamToString(httpResponse.getEntity().getContent());
+                }
                 if (statusCode == 200) {
                     log.debug("Response from {} took {} ms. Data size:{}, response: {}, param: {}",
                             baseUrl,
@@ -290,11 +357,7 @@ public class HttpClientImpl implements HttpClient {
                     ". Throwable=" + t.getMessage();
             throw new IOException(message, t);
         } finally {
-            if (closeableHttpClient != null) {
-                closeableHttpClient.close();
-                closeableHttpClient = null;
-            }
-            hasPendingRequest = false;
+            doShutDown(null, httpclient);
         }
     }
 
@@ -305,8 +368,7 @@ public class HttpClientImpl implements HttpClient {
                 return new HttpGet(baseUrl + param);
             case POST:
                 HttpPost httpPost = new HttpPost(baseUrl);
-                HttpEntity httpEntity = new StringEntity(param);
-                httpPost.setEntity(httpEntity);
+                httpPost.setEntity(new StringEntity(param, ContentType.TEXT_PLAIN.withCharset(StandardCharsets.UTF_8)));
                 return httpPost;
 
             default:

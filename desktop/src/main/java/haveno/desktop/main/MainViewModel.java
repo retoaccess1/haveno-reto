@@ -32,6 +32,7 @@ import haveno.core.account.sign.SignedWitnessService;
 import haveno.core.account.witness.AccountAgeWitnessService;
 import haveno.core.alert.PrivateNotificationManager;
 import haveno.core.api.XmrConnectionService;
+import haveno.core.api.model.XmrBalanceInfo;
 import haveno.core.app.HavenoSetup;
 import haveno.core.locale.CryptoCurrency;
 import haveno.core.locale.CurrencyUtil;
@@ -44,7 +45,7 @@ import haveno.core.payment.CryptoCurrencyAccount;
 import haveno.core.payment.RevolutAccount;
 import haveno.core.presentation.BalancePresentation;
 import haveno.core.presentation.SupportTicketsPresentation;
-import haveno.core.presentation.TradePresentation;
+import haveno.core.provider.price.MarketPrice;
 import haveno.core.provider.price.PriceFeedService;
 import haveno.core.trade.ArbitratorTrade;
 import haveno.core.trade.HavenoUtils;
@@ -70,6 +71,7 @@ import haveno.desktop.main.overlays.windows.TorNetworkSettingsWindow;
 import haveno.desktop.main.overlays.windows.UpdateAmazonGiftCardAccountWindow;
 import haveno.desktop.main.overlays.windows.UpdateRevolutAccountWindow;
 import haveno.desktop.main.overlays.windows.WalletPasswordWindow;
+import haveno.desktop.main.overlays.windows.WelcomeWindow;
 import haveno.desktop.main.overlays.windows.downloadupdate.DisplayUpdateDownloadWindow;
 import haveno.desktop.main.presentation.AccountPresentation;
 import haveno.desktop.main.presentation.MarketPricePresentation;
@@ -84,6 +86,8 @@ import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.DoubleProperty;
 import javafx.beans.property.IntegerProperty;
 import javafx.beans.property.ObjectProperty;
+import javafx.beans.property.ReadOnlyBooleanProperty;
+import javafx.beans.property.ReadOnlyObjectProperty;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleDoubleProperty;
 import javafx.beans.property.SimpleStringProperty;
@@ -111,7 +115,6 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
     private final XmrConnectionService xmrConnectionService;
     private final User user;
     private final BalancePresentation balancePresentation;
-    private final TradePresentation tradePresentation;
     private final SupportTicketsPresentation supportTicketsPresentation;
     private final MarketPricePresentation marketPricePresentation;
     private final AccountPresentation accountPresentation;
@@ -136,6 +139,8 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
 
     @Getter
     private final BooleanProperty showAppScreen = new SimpleBooleanProperty();
+    @Getter
+    private final ReadOnlyBooleanProperty passwordRecoveryRequired;
     private final DoubleProperty combinedSyncProgress = new SimpleDoubleProperty(-1);
     private final BooleanProperty isSplashScreenRemoved = new SimpleBooleanProperty();
     private final StringProperty footerVersionInfo = new SimpleStringProperty();
@@ -157,7 +162,6 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
                          XmrWalletService xmrWalletService,
                          User user,
                          BalancePresentation balancePresentation,
-                         TradePresentation tradePresentation,
                          SupportTicketsPresentation supportTicketsPresentation,
                          MarketPricePresentation marketPricePresentation,
                          AccountPresentation accountPresentation,
@@ -178,9 +182,9 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
                          Navigation navigation) {
         this.havenoSetup = havenoSetup;
         this.xmrConnectionService = xmrConnectionService;
+        passwordRecoveryRequired = xmrWalletService.passwordRecoveryRequiredProperty();
         this.user = user;
         this.balancePresentation = balancePresentation;
-        this.tradePresentation = tradePresentation;
         this.supportTicketsPresentation = supportTicketsPresentation;
         this.marketPricePresentation = marketPricePresentation;
         this.accountPresentation = accountPresentation;
@@ -223,8 +227,6 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
         tradesAndUIReady.subscribe((observable, oldValue, newValue) -> {
             if (newValue) {
                 ThreadUtils.submitToPool(() -> {
-                    tradeManager.applyTradePeriodState();
-
                     tradeManager.getOpenTrades().forEach(trade -> {
 
                         // check initialization error
@@ -281,30 +283,6 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
         }
 
         UserThread.execute(() -> getShowAppScreen().set(true));
-
-        // show welcome message 
-        if (Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_STAGENET) {
-            String key = "welcome.stagenet";
-            if (DontShowAgainLookup.showAgain(key)) {
-                UserThread.runAfter(() -> {
-                    new Popup().attention(Res.get("popup.attention.welcome.stagenet")).
-                            dontShowAgainId(key)
-                            .closeButtonText(Res.get("shared.iUnderstand"))
-                            .show();
-                }, 1);
-            }
-        } else if (Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_MAINNET) {
-            String key = "welcome.mainnet";
-            boolean isReleaseLimited = HavenoUtils.isReleasedWithinDays(HavenoUtils.RELEASE_LIMIT_DAYS);
-            if (DontShowAgainLookup.showAgain(key)) {
-                UserThread.runAfter(() -> {
-                    new Popup().attention(Res.get(isReleaseLimited ? "popup.attention.welcome.mainnet.test" : "popup.attention.welcome.mainnet")).
-                            dontShowAgainId(key)
-                            .closeButtonText(Res.get("shared.iUnderstand"))
-                            .show();
-                }, 1);
-            }
-        }
     }
 
 
@@ -321,6 +299,17 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
         notificationCenter.onAllServicesAndViewsInitialized();
 
         maybeShowPopupsFromQueue();
+    }
+
+    void maybeShowWelcomeWindow() {
+        if (Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_STAGENET || Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_MAINNET) {
+            String key = Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_STAGENET ? "welcome.stagenet" : "welcome.mainnet";
+            if (DontShowAgainLookup.showAgain(key)) {
+                new WelcomeWindow()
+                        .dontShowAgainId(key)
+                        .show();
+            }
+        }
     }
 
     void onOpenDownloadWindow() {
@@ -455,14 +444,6 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
                         .useIUnderstandButton()
                         .show());
         havenoSetup.setDisplaySecurityRecommendationHandler(key -> {});
-        havenoSetup.setDisplayLocalhostHandler(key -> {
-            if (!DevEnv.isDevMode()) {
-                Popup popup = new Popup().backgroundInfo(Res.get("popup.xmrLocalNode.msg"))
-                        .dontShowAgainId(key);
-                popup.setDisplayOrderPriority(5);
-                popupQueue.add(popup);
-            }
-        });
         havenoSetup.setDisplaySignedByArbitratorHandler(key -> accountPresentation.showOneTimeAccountSigningPopup(
                 key, "popup.accountSigning.signedByArbitrator"));
         havenoSetup.setDisplaySignedByPeerHandler(key -> accountPresentation.showOneTimeAccountSigningPopup(
@@ -505,7 +486,7 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
         });
 
         havenoSetup.setTorAddressUpgradeHandler(() -> new Popup().information(Res.get("popup.info.torMigration.msg"))
-                .actionButtonTextWithGoTo("navigation.account.backup")
+                .actionButtonTextWithGoTo("account.menu.backup")
                 .onAction(() -> {
                     navigation.setReturnPath(navigation.getCurrentPath());
                     navigation.navigateTo(MainView.class, AccountView.class, BackupView.class);
@@ -590,6 +571,12 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
                 getP2pNetworkLabelId().set("footer-pane");
             }
         });
+
+        // clear stale startup warning if peers connected before this watcher was registered
+        if (p2PService.getNumConnectedPeers().get() > 0) {
+            getP2pNetworkWarnMsg().set(null);
+            getP2pNetworkLabelId().set("footer-pane");
+        }
     }
 
     private void showPopupIfInvalidXmrConfig() {
@@ -681,24 +668,24 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
         return havenoSetup.getNewVersionAvailableProperty();
     }
 
-    StringProperty getNumOpenSupportTickets() {
-        return supportTicketsPresentation.getNumOpenSupportTickets();
-    }
-
     BooleanProperty getShowOpenSupportTicketsNotification() {
         return supportTicketsPresentation.getShowOpenSupportTicketsNotification();
     }
 
-    BooleanProperty getShowPendingTradesNotification() {
-        return tradePresentation.getShowPendingTradesNotification();
-    }
-
-    StringProperty getNumPendingTrades() {
-        return tradePresentation.getNumPendingTrades();
+    ReadOnlyBooleanProperty getUnreadPortfolio() {
+        return notificationCenter.unreadPortfolioProperty();
     }
 
     StringProperty getAvailableBalance() {
         return balancePresentation.getAvailableBalance();
+    }
+
+    ReadOnlyObjectProperty<XmrBalanceInfo> balanceInfoProperty() {
+        return balancePresentation.balanceInfoProperty();
+    }
+
+    ReadOnlyObjectProperty<MarketPrice> balancePriceProperty() {
+        return marketPricePresentation.balancePriceProperty();
     }
 
     StringProperty getReservedBalance() {
@@ -707,6 +694,10 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
 
     StringProperty getPendingBalance() {
         return balancePresentation.getPendingBalance();
+    }
+
+    boolean hasOpenOffers() {
+        return !openOfferManager.getObservableList().isEmpty();
     }
 
 
@@ -797,12 +788,8 @@ public class MainViewModel implements ViewModel, HavenoSetup.HavenoSetupListener
         return marketPricePresentation.getMarketPrice();
     }
 
-    StringProperty getMarketPrice(String currencyCode) {
-        return marketPricePresentation.getMarketPrice(currencyCode);
-    }
-
     public ObservableList<PriceFeedComboBoxItem> getPriceFeedComboBoxItems() {
-        return marketPricePresentation.getPriceFeedComboBoxItems();
+        return marketPricePresentation.getAvailablePriceFeedComboBoxItems();
     }
 
     // We keep accountPresentation support even it is not used atm. But if we add a new feature and

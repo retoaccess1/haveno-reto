@@ -28,6 +28,7 @@ import haveno.core.payment.payload.AliPayAccountPayload;
 import haveno.core.payment.payload.AmazonGiftCardAccountPayload;
 import haveno.core.payment.payload.AustraliaPayidAccountPayload;
 import haveno.core.payment.payload.BizumAccountPayload;
+import haveno.core.payment.payload.BlikAccountPayload;
 import haveno.core.payment.payload.CapitualAccountPayload;
 import haveno.core.payment.payload.CashAppAccountPayload;
 import haveno.core.payment.payload.CashAtAtmAccountPayload;
@@ -48,9 +49,29 @@ import haveno.core.payment.payload.JapanBankAccountPayload;
 import haveno.core.payment.payload.MoneseAccountPayload;
 import haveno.core.payment.payload.MoneyBeamAccountPayload;
 import haveno.core.payment.payload.MoneyGramAccountPayload;
+import haveno.core.payment.payload.GcashAccountPayload;
+import haveno.core.payment.payload.MercadoPagoAccountPayload;
+import haveno.core.payment.payload.MomoAccountPayload;
+import haveno.core.payment.payload.SpeiAccountPayload;
+import haveno.core.payment.payload.MpesaAccountPayload;
 import haveno.core.payment.payload.NationalBankAccountPayload;
 import haveno.core.payment.payload.NeftAccountPayload;
 import haveno.core.payment.payload.NequiAccountPayload;
+import haveno.core.payment.payload.NipAccountPayload;
+import haveno.core.payment.payload.PagoMovilAccountPayload;
+import haveno.core.payment.payload.PaparaAccountPayload;
+import haveno.core.payment.payload.RaastAccountPayload;
+import haveno.core.payment.payload.PayNowAccountPayload;
+import haveno.core.payment.payload.WeroAccountPayload;
+import haveno.core.payment.payload.FpsAccountPayload;
+import haveno.core.payment.payload.DuitNowAccountPayload;
+import haveno.core.payment.payload.MbWayAccountPayload;
+import haveno.core.payment.payload.PayPayAccountPayload;
+import haveno.core.payment.payload.SbpAccountPayload;
+import haveno.core.payment.payload.MirAccountPayload;
+import haveno.core.payment.payload.YooMoneyAccountPayload;
+import haveno.core.payment.payload.UkraineCardAccountPayload;
+import haveno.core.payment.payload.KaspiAccountPayload;
 import haveno.core.payment.payload.OKPayAccountPayload;
 import haveno.core.payment.payload.PaxumAccountPayload;
 import haveno.core.payment.payload.PaymentAccountPayload;
@@ -62,6 +83,7 @@ import haveno.core.payment.payload.PerfectMoneyAccountPayload;
 import haveno.core.payment.payload.PixAccountPayload;
 import haveno.core.payment.payload.PopmoneyAccountPayload;
 import haveno.core.payment.payload.PromptPayAccountPayload;
+import haveno.core.payment.payload.QrisAccountPayload;
 import haveno.core.payment.payload.RevolutAccountPayload;
 import haveno.core.payment.payload.RtgsAccountPayload;
 import haveno.core.payment.payload.SameBankAccountPayload;
@@ -75,11 +97,13 @@ import haveno.core.payment.payload.SwishAccountPayload;
 import haveno.core.payment.payload.TikkieAccountPayload;
 import haveno.core.payment.payload.TransferwiseAccountPayload;
 import haveno.core.payment.payload.TransferwiseUsdAccountPayload;
+import haveno.core.payment.payload.TwintAccountPayload;
 import haveno.core.payment.payload.USPostalMoneyOrderAccountPayload;
 import haveno.core.payment.payload.UpholdAccountPayload;
 import haveno.core.payment.payload.UpiAccountPayload;
 import haveno.core.payment.payload.VenmoAccountPayload;
 import haveno.core.payment.payload.VerseAccountPayload;
+import haveno.core.payment.payload.VippsMobilePayAccountPayload;
 import haveno.core.payment.payload.WeChatPayAccountPayload;
 import haveno.core.payment.payload.WesternUnionAccountPayload;
 import haveno.core.trade.statistics.TradeStatistics3;
@@ -143,6 +167,16 @@ public class CoreProtoResolver implements ProtoResolver {
                             return PaytmAccountPayload.fromProto(proto);
                         case NEQUI_ACCOUNT_PAYLOAD:
                             return NequiAccountPayload.fromProto(proto);
+                        case MPESA_ACCOUNT_PAYLOAD:
+                            return MpesaAccountPayload.fromProto(proto);
+                        case MERCADO_PAGO_ACCOUNT_PAYLOAD:
+                            return MercadoPagoAccountPayload.fromProto(proto);
+                        case GCASH_ACCOUNT_PAYLOAD:
+                            return GcashAccountPayload.fromProto(proto);
+                        case MOMO_ACCOUNT_PAYLOAD:
+                            return MomoAccountPayload.fromProto(proto);
+                        case SPEI_ACCOUNT_PAYLOAD:
+                            return SpeiAccountPayload.fromProto(proto);
                         case BIZUM_ACCOUNT_PAYLOAD:
                             return BizumAccountPayload.fromProto(proto);
                         case PIX_ACCOUNT_PAYLOAD:
@@ -169,6 +203,20 @@ public class CoreProtoResolver implements ProtoResolver {
                                             "(PB.PaymentAccountPayload.CountryBasedPaymentAccountPayload.IfscBasedPaymentAccount). " +
                                             "messageCase=" + messageCaseIfsc);
                             }
+                        case BLIK_ACCOUNT_PAYLOAD:
+                            return BlikAccountPayload.fromProto(proto);
+                        case VIPPS_MOBILE_PAY_ACCOUNT_PAYLOAD:
+                            return VippsMobilePayAccountPayload.fromProto(proto);
+                        case SBP_ACCOUNT_PAYLOAD:
+                            return SbpAccountPayload.fromProto(proto);
+                        case MIR_ACCOUNT_PAYLOAD:
+                            return MirAccountPayload.fromProto(proto);
+                        case YOOMONEY_ACCOUNT_PAYLOAD:
+                            return YooMoneyAccountPayload.fromProto(proto);
+                        case UKRAINE_CARD_ACCOUNT_PAYLOAD:
+                            return UkraineCardAccountPayload.fromProto(proto);
+                        case KASPI_ACCOUNT_PAYLOAD:
+                            return KaspiAccountPayload.fromProto(proto);
                         default:
                             throw new ProtobufferRuntimeException("Unknown proto message case" +
                                     "(PB.PaymentAccountPayload.CountryBasedPaymentAccountPayload)." +
@@ -242,6 +290,30 @@ public class CoreProtoResolver implements ProtoResolver {
                     return PayPalAccountPayload.fromProto(proto);
                 case PAYSAFE_ACCOUNT_PAYLOAD:
                     return PaysafeAccountPayload.fromProto(proto);
+                case TWINT_ACCOUNT_PAYLOAD:
+                    return TwintAccountPayload.fromProto(proto);
+                case NIP_ACCOUNT_PAYLOAD:
+                    return NipAccountPayload.fromProto(proto);
+                case PAGO_MOVIL_ACCOUNT_PAYLOAD:
+                    return PagoMovilAccountPayload.fromProto(proto);
+                case QRIS_ACCOUNT_PAYLOAD:
+                    return QrisAccountPayload.fromProto(proto);
+                case PAPARA_ACCOUNT_PAYLOAD:
+                    return PaparaAccountPayload.fromProto(proto);
+                case RAAST_ACCOUNT_PAYLOAD:
+                    return RaastAccountPayload.fromProto(proto);
+                case PAYNOW_ACCOUNT_PAYLOAD:
+                    return PayNowAccountPayload.fromProto(proto);
+                case WERO_ACCOUNT_PAYLOAD:
+                    return WeroAccountPayload.fromProto(proto);
+                case FPS_ACCOUNT_PAYLOAD:
+                    return FpsAccountPayload.fromProto(proto);
+                case DUITNOW_ACCOUNT_PAYLOAD:
+                    return DuitNowAccountPayload.fromProto(proto);
+                case MB_WAY_ACCOUNT_PAYLOAD:
+                    return MbWayAccountPayload.fromProto(proto);
+                case PAYPAY_ACCOUNT_PAYLOAD:
+                    return PayPayAccountPayload.fromProto(proto);
 
                 default:
                     throw new ProtobufferRuntimeException("Unknown proto message case(PB.PaymentAccountPayload). messageCase=" + messageCase);

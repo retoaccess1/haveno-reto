@@ -55,6 +55,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
+import java.util.ArrayList;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang3.StringUtils;
@@ -143,6 +144,11 @@ public abstract class SellerSendPaymentReceivedMessage extends SendMailboxMessag
                     trade.getPayoutTxId()
             );
 
+            // if we signed the peer, attach our signer chain so it can validate the signature locally (#2182)
+            if (signedWitness != null) {
+                message.setSignerChain(new ArrayList<>(processModel.getAccountAgeWitnessService().getSignerChain(signedWitness.getSignerPubKey(), signedWitness.getDate())));
+            }
+
             // verify message
             if (trade.isPayoutPublished()) {
                 checkArgument(message.getUpdatedMultisigHex() != null || message.getPayoutTxId() != null, "PaymentReceivedMessage does not include updated multisig hex or payout tx id after payout published");
@@ -196,7 +202,7 @@ public abstract class SellerSendPaymentReceivedMessage extends SendMailboxMessag
             timer.stop();
         }
         if (listener != null) {
-            trade.getBuyer().getPaymentReceivedMessageStateProperty().removeListener(listener);
+            getReceiver().getPaymentReceivedMessageStateProperty().removeListener(listener);
         }
     }
 
@@ -221,9 +227,7 @@ public abstract class SellerSendPaymentReceivedMessage extends SendMailboxMessag
 
         // set resend delay
         if (resendCounter == 0) {
-            delayInMin = SendMailboxMessageTask.INITIAL_RESEND_DELAY_MINS_FIRST;
-        } else if (resendCounter == 1) {
-            delayInMin = SendMailboxMessageTask.INITIAL_RESEND_DELAY_MINS_SECOND;
+            delayInMin = SendMailboxMessageTask.INITIAL_RESEND_DELAY_MINS;
         } else {
             delayInMin = Math.min(TimeUnit.MILLISECONDS.toMinutes(TradeMailboxMessage.TTL), delayInMin * SendMailboxMessageTask.RESEND_DELAY_MULTIPLIER);
         }

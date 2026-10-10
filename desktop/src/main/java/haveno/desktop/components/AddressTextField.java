@@ -18,12 +18,13 @@
 package haveno.desktop.components;
 
 import com.jfoenix.controls.JFXTextField;
-import de.jensd.fx.fontawesome.AwesomeDude;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import haveno.desktop.util.GlyphsDude;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import haveno.common.UserThread;
 import haveno.common.util.Utilities;
 import haveno.core.locale.Res;
 import haveno.desktop.main.overlays.popups.Popup;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.Layout;
 import javafx.beans.property.ObjectProperty;
@@ -46,6 +47,7 @@ public class AddressTextField extends AnchorPane {
     private final StringProperty address = new SimpleStringProperty();
     private final StringProperty paymentLabel = new SimpleStringProperty();
     private final ObjectProperty<BigInteger> amount = new SimpleObjectProperty<>(BigInteger.ZERO);
+    private final JFXTextField textField;
     private boolean wasPrimaryButtonDown;
 
 
@@ -54,7 +56,7 @@ public class AddressTextField extends AnchorPane {
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     public AddressTextField(String label) {
-        JFXTextField textField = new HavenoTextField();
+        textField = new HavenoTextField();
         textField.setId("address-text-field");
         textField.setEditable(false);
         textField.setLabelFloat(true);
@@ -77,8 +79,9 @@ public class AddressTextField extends AnchorPane {
         extWalletIcon.setLayoutY(Layout.FLOATING_ICON_Y);
         extWalletIcon.getStyleClass().addAll("icon", "highlight");
         extWalletIcon.setTooltip(new Tooltip(tooltipText));
-        AwesomeDude.setIcon(extWalletIcon, AwesomeIcon.SIGNIN);
+        GlyphsDude.setIcon(extWalletIcon, FontAwesomeIcon.SIGN_IN);
         extWalletIcon.setOnMouseClicked(e -> openWallet());
+        Accessibility.asButton(extWalletIcon, tooltipText);
 
         Label copyLabel = new Label();
         copyLabel.setLayoutY(Layout.FLOATING_ICON_Y);
@@ -93,6 +96,7 @@ public class AddressTextField extends AnchorPane {
                 UserThread.runAfter(() -> tp.hide(), 1);
                 tp.show(node, e.getScreenX() + Layout.PADDING, e.getScreenY() + Layout.PADDING);
         });
+        Accessibility.asButton(copyLabel, Res.get("addressTextField.copyToClipboard"));
 
         AnchorPane.setRightAnchor(copyLabel, 30.0);
         AnchorPane.setRightAnchor(extWalletIcon, 5.0);
@@ -118,6 +122,10 @@ public class AddressTextField extends AnchorPane {
 
     public void setAddress(String address) {
         this.address.set(address);
+    }
+
+    public void setLabel(String label) {
+        textField.setPromptText(label);
     }
 
     public String getAddress() {

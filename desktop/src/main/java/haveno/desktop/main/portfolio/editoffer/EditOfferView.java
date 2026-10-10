@@ -39,6 +39,7 @@ import haveno.desktop.main.offer.MutableOfferView;
 import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.main.overlays.windows.OfferDetailsWindow;
 import static haveno.desktop.util.FormBuilder.addButtonBusyAnimationLabelAfterGroup;
+import javafx.beans.property.ReadOnlyBooleanProperty;
 import javafx.collections.ObservableList;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
@@ -121,10 +122,6 @@ public class EditOfferView extends MutableOfferView<EditOfferViewModel> {
 
     @Override
     public void onClose() {
-        if (model.getDataModel().getOpenOffer() == null || !HavenoUtils.openOfferManager.getOpenOffer(model.getDataModel().getOpenOffer().getId()).isPresent()) {
-            log.warn("Open offer has been removed, closing view. offerId={}", model.getDataModel().getOpenOffer() != null ? model.getDataModel().getOpenOffer().getId() : "null");
-            return;
-        }
         model.onCancelEditOffer(errorMessage -> {
             log.error(errorMessage);
             new Popup().warning(Res.get("editOffer.failed", errorMessage)).show();
@@ -138,9 +135,18 @@ public class EditOfferView extends MutableOfferView<EditOfferViewModel> {
         removeBindings();
     }
 
+    @Override
+    protected Button getCancelButton() {
+        return cancelButton;
+    }
+
     ///////////////////////////////////////////////////////////////////////////////////////////
     // API
     ///////////////////////////////////////////////////////////////////////////////////////////
+
+    public ReadOnlyBooleanProperty cancelingProperty() {
+        return model.getDataModel().getCanceling();
+    }
 
     public void applyOpenOffer(OpenOffer openOffer) {
         model.applyOpenOffer(openOffer);
@@ -241,8 +247,9 @@ public class EditOfferView extends MutableOfferView<EditOfferViewModel> {
                         new Popup().warning(Res.get("editOffer.failed", message)).show();
 
                         // close view if offer is removed while editing
-                        if (model.getDataModel().getOpenOffer() == null || !HavenoUtils.openOfferManager.getOpenOffer(model.getDataModel().getOpenOffer().getId()).isPresent()) {
-                            log.warn("Open offer has been removed, closing view. offerId={}", model.getDataModel().getOpenOffer().getId());
+                        OpenOffer openOffer = model.getDataModel().getOpenOffer();
+                        if (openOffer == null || !HavenoUtils.openOfferManager.getOpenOffer(openOffer.getId()).isPresent()) {
+                            log.warn("Open offer has been removed, closing view. offerId={}", openOffer == null ? "null" : openOffer.getId());
                             close();
                         }
                     });

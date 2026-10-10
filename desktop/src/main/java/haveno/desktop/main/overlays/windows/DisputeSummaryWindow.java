@@ -48,9 +48,11 @@ import haveno.desktop.components.HavenoTextArea;
 import haveno.desktop.components.InputTextField;
 import haveno.desktop.main.overlays.Overlay;
 import haveno.desktop.main.overlays.popups.Popup;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.DisplayUtils;
 import haveno.desktop.util.Layout;
 import javafx.beans.binding.Bindings;
+import javafx.beans.binding.BooleanBinding;
 import javafx.beans.value.ChangeListener;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
@@ -194,10 +196,11 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
 
     private void addContent() {
         Contract contract = dispute.getContract();
+        // edit a copy, so the stored signed ruling stays consistent for resends until the revision is signed and installed on close
         if (dispute.getDisputeResultProperty().get() == null)
             disputeResult = new DisputeResult(dispute.getTradeId(), dispute.getTraderId());
         else
-            disputeResult = dispute.getDisputeResultProperty().get();
+            disputeResult = dispute.getDisputeResultProperty().get().copy();
 
         peersDisputeOptional = checkNotNull(getDisputeManager(dispute)).getDisputesAsObservableList().stream()
                 .filter(d -> dispute.getTradeId().equals(d.getTradeId()) && dispute.getTraderId() != d.getTraderId())
@@ -231,6 +234,9 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
         }
 
         setReasonRadioButtonState();
+
+        // listen after loading the stored ruling so selecting its payout option does not recalculate it
+        tradeAmountToggleGroup.selectedToggleProperty().addListener(tradeAmountToggleGroupListener);
 
         addSummaryNotes();
         addButtons(contract);
@@ -270,8 +276,9 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
     private void addInfoPane() {
         Contract contract = dispute.getContract();
         addTitledGroupBg(gridPane, ++rowIndex, 17, Res.get("disputeSummaryWindow.title")).getStyleClass().add("last");
-        addConfirmationLabelLabel(gridPane, rowIndex, Res.get("shared.tradeId"), dispute.getShortTradeId(),
-                Layout.TWICE_FIRST_ROW_DISTANCE);
+        Tuple2<Label, Label> tradeIdTuple = addConfirmationLabelLabel(gridPane, rowIndex, Res.get("shared.tradeId"),
+                dispute.getShortTradeId(), Layout.TWICE_FIRST_ROW_DISTANCE);
+        Accessibility.setName(tradeIdTuple.second, Accessibility.spellOut(dispute.getShortTradeId()));
         addConfirmationLabelLabel(gridPane, ++rowIndex, Res.get("disputeSummaryWindow.openDate"), DisplayUtils.formatDateTime(dispute.getOpeningDate()));
         if (dispute.isDisputeOpenerIsMaker()) {
             if (dispute.isDisputeOpenerIsBuyer())
@@ -336,7 +343,6 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
         customRadioButton.setToggleGroup(tradeAmountToggleGroup);
 
         tradeAmountToggleGroupListener = (observable, oldValue, newValue) -> applyPayoutAmounts(newValue);
-        tradeAmountToggleGroup.selectedToggleProperty().addListener(tradeAmountToggleGroupListener);
 
         buyerPayoutAmountListener = (observable, oldValue, newValue) -> applyCustomAmounts(buyerPayoutAmountInputTextField, oldValue, newValue);
         sellerPayoutAmountListener = (observable, oldValue, newValue) -> applyCustomAmounts(sellerPayoutAmountInputTextField, oldValue, newValue);
@@ -364,8 +370,10 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
     }
 
     private boolean isPayoutAmountValid() {
-        BigInteger buyerAmount = HavenoUtils.parseXmr(buyerPayoutAmountInputTextField.getText());
-        BigInteger sellerAmount = HavenoUtils.parseXmr(sellerPayoutAmountInputTextField.getText());
+        BigInteger buyerAmount = HavenoUtils.parseXmrOrElse(buyerPayoutAmountInputTextField.getText(), null);
+        BigInteger sellerAmount = HavenoUtils.parseXmrOrElse(sellerPayoutAmountInputTextField.getText(), null);
+        if (buyerAmount == null || sellerAmount == null || buyerAmount.signum() < 0 || sellerAmount.signum() < 0) return false;
+        if (trade.isPayoutPublished()) return true; // the stored ruling can spend less than the expected deposits
         Contract contract = dispute.getContract();
         BigInteger tradeAmount = contract.getTradeAmount();
         BigInteger expected = tradeAmount
@@ -378,12 +386,13 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
     private void applyCustomAmounts(InputTextField inputTextField, boolean oldFocusValue, boolean newFocusValue) {
         // We only apply adjustments at focus out, otherwise we cannot enter certain values if we update at each
         // keystroke.
-        if (!oldFocusValue || newFocusValue) {
+        if (!oldFocusValue || newFocusValue || trade.isPayoutPublished()) {
             return;
         }
 
         BigInteger available = trade.getWalletBalance();
-        BigInteger enteredAmount = HavenoUtils.parseXmr(inputTextField.getText());
+        BigInteger enteredAmount = HavenoUtils.parseXmrOrElse(inputTextField.getText(), null);
+        if (enteredAmount == null || enteredAmount.signum() < 0) return;
         if (enteredAmount.compareTo(available) > 0) {
             enteredAmount = available;
             BigInteger finalEnteredAmount = enteredAmount;
@@ -576,7 +585,7 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
                 Res.get("disputeSummaryWindow.close.button"),
                 Res.get("shared.cancel"), 15, true);
         Button closeTicketButton = tuple.first;
-        closeTicketButton.disableProperty().bind(Bindings.createBooleanBinding(
+        BooleanBinding closeButtonDisabled = Bindings.createBooleanBinding(
                 () -> tradeAmountToggleGroup.getSelectedToggle() == null
                         || summaryNotesTextArea.getText() == null
                         || summaryNotesTextArea.getText().length() == 0
@@ -585,13 +594,19 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
             tradeAmountToggleGroup.selectedToggleProperty(),
             summaryNotesTextArea.textProperty(),
             buyerPayoutAmountInputTextField.textProperty(),
-            sellerPayoutAmountInputTextField.textProperty()));
+            sellerPayoutAmountInputTextField.textProperty());
+        closeTicketButton.disableProperty().bind(closeButtonDisabled);
 
         Button cancelButton = tuple.second;
 
         closeTicketButton.setOnAction(e -> {
             closeTicketButton.disableProperty().unbind();
             closeTicketButton.setDisable(true);
+            ResultHandler cancelHandler = () -> {
+                closeButtonDisabled.invalidate();
+                closeTicketButton.disableProperty().bind(closeButtonDisabled);
+                cancelButton.setDisable(false);
+            };
             if (dispute.getSupportType() == SupportType.ARBITRATION &&
                     peersDisputeOptional.isPresent() &&
                     !peersDisputeOptional.get().isClosed() &&
@@ -605,18 +620,14 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
                     showPayoutTxConfirmation(contract,
                             payoutTx,
                             () -> doClose(closeTicketButton, cancelButton),
-                            () -> {
-                                closeTicketButton.setDisable(false);
-                                cancelButton.setDisable(false);
-                            });
+                            cancelHandler);
                 } catch (Exception ex) {
                     if (trade.isPayoutPublished()) {
                         doClose(closeTicketButton, cancelButton);
                     } else {
                         log.error("Error creating dispute payout tx for dispute: " + ex.getMessage(), ex);
                         new Popup().error(ex.getMessage()).show();
-                        closeTicketButton.setDisable(false);
-                        cancelButton.setDisable(false);
+                        cancelHandler.handleResult();
                     }
                 }
             } else {
@@ -691,7 +702,12 @@ public class DisputeSummaryWindow extends Overlay<DisputeSummaryWindow> {
 
         summaryNotesTextArea.textProperty().unbindBidirectional(disputeResult.summaryNotesProperty());
 
-        disputeResult.setCloseDate(new Date());
+        // the signed closeDate orders rulings, so a re-close must be strictly newer than the prior ruling even if the clock stepped back
+        Date priorCloseDate = disputeResult.getCloseDate();
+        Date closeDate = new Date();
+        if (priorCloseDate != null && !closeDate.after(priorCloseDate)) closeDate = new Date(priorCloseDate.getTime() + 1);
+        disputeResult.setCloseDate(closeDate);
+        if (priorCloseDate != null) disputeResult.setChatMessage(null); // a revised ruling gets a freshly signed summary message
         disputesService.closeDisputeTicket(disputeManager, dispute, disputeResult, () -> {
             if (peersDisputeOptional.isPresent() && !peersDisputeOptional.get().isClosed() && !DevEnv.isDevMode()) {
                 new Popup().attention(Res.get("disputeSummaryWindow.close.closePeer")).show();

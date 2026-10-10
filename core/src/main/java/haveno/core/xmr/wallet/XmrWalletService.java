@@ -33,13 +33,16 @@ import haveno.core.api.AccountServiceListener;
 import haveno.core.api.CoreAccountService;
 import haveno.core.api.XmrConnectionService;
 import haveno.core.offer.OpenOffer;
+import haveno.core.offer.OpenOfferManager;
 import haveno.core.trade.BuyerTrade;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.trade.MakerTrade;
+import haveno.core.trade.Tradable;
 import haveno.core.trade.Trade;
 import haveno.core.trade.protocol.TradeProtocol;
 import haveno.core.user.Preferences;
 import haveno.core.user.User;
+import haveno.core.xmr.exceptions.WalletUnavailableException;
 import haveno.core.xmr.listeners.XmrBalanceListener;
 import haveno.core.xmr.model.XmrAddressEntry;
 import haveno.core.xmr.model.XmrAddressEntryList;
@@ -47,6 +50,10 @@ import haveno.core.xmr.setup.MoneroWalletRpcManager;
 import haveno.core.xmr.setup.WalletsSetup;
 import haveno.network.utils.EventThrottler;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.math.BigInteger;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -57,15 +64,26 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javafx.beans.property.LongProperty;
+import javafx.beans.property.ReadOnlyBooleanProperty;
+import javafx.beans.property.ReadOnlyBooleanWrapper;
 import javafx.beans.value.ChangeListener;
 import monero.common.MoneroError;
 import monero.common.MoneroRpcConnection;
@@ -105,9 +123,8 @@ public class XmrWalletService extends XmrWalletBase {
 
     // monero configuration
     public static final int NUM_BLOCKS_UNLOCK = 10;
-    public static final String MONERO_BINS_DIR = Config.appDataDir().getAbsolutePath();
+    private static volatile String moneroBinsDir;
     public static final String MONERO_WALLET_RPC_NAME = Utilities.isWindows() ? "monero-wallet-rpc.exe" : "monero-wallet-rpc";
-    public static final String MONERO_WALLET_RPC_PATH = MONERO_BINS_DIR + File.separator + MONERO_WALLET_RPC_NAME;
     public static final MoneroTxPriority PROTOCOL_FEE_PRIORITY = MoneroTxPriority.DEFAULT;
     public static final int MONERO_LOG_LEVEL = -1; // monero library log level, -1 to disable
     private static final MoneroNetworkType MONERO_NETWORK_TYPE = getMoneroNetworkType();
@@ -118,13 +135,32 @@ public class XmrWalletService extends XmrWalletBase {
     private static final String KEYS_FILE_POSTFIX = ".keys";
     private static final String ADDRESS_FILE_POSTFIX = ".address.txt";
     private static final int NUM_WALLET_BACKUPS = 3;
+    private final ReentrantReadWriteLock walletLifecycleLock = new ReentrantReadWriteLock(true);
+    private volatile PasswordChange passwordChange;
+
+    private record PasswordChange(String oldPassword, String newPassword, Set<String> remaining, Set<String> skipped, File backupDir) {}
     private static final boolean PRINT_RPC_STACK_TRACE = false;
     private static final long SHUTDOWN_TIMEOUT_MS = 60000;
+    private static final long FORCE_CLOSE_TIMEOUT_MS = 15000; // bounded wait since native close can block draining a stalled network request
+    private static final long PENDING_CLOSE_TIMEOUT_MS = 240000; // max wait to reopen, covering wallet2's 3.5 minute rpc timeout
     private static final long NUM_BLOCKS_BEHIND_TOLERANCE = 5;
     private static final long POLL_TXS_TOLERANCE_MS = 1000 * 60 * 3; // request connection switch if txs not updated within 3 minutes
     private static final boolean TEST_STARTUP_SYNC_ERROR = false;
     private static final long INIT_WALLET_DELAY_MS = 5000;
+    private static final int NUM_CHECK_TX_KEY_ATTEMPTS = 3;
+    private static final long CHECK_TX_KEY_ATTEMPT_DELAY_MS = 1000;
     private static final String THREAD_ID = XmrWalletService.class.getSimpleName();
+
+    public static String getMoneroBinsDir() {
+        if (moneroBinsDir == null) {
+            moneroBinsDir = Config.appDataDir().getAbsolutePath();
+        }
+        return moneroBinsDir;
+    }
+
+    public static String getMoneroWalletRpcPath() {
+        return getMoneroBinsDir() + File.separator + MONERO_WALLET_RPC_NAME;
+    }
 
     private final User user;
     private final Preferences preferences;
@@ -134,13 +170,14 @@ public class XmrWalletService extends XmrWalletBase {
 
     private final File walletDir;
     private final int rpcBindPort;
-    private final boolean useNativeXmrWallet;
     protected final CopyOnWriteArraySet<XmrBalanceListener> balanceListeners = new CopyOnWriteArraySet<>();
     protected final CopyOnWriteArraySet<MoneroWalletListenerI> walletListeners = new CopyOnWriteArraySet<>();
 
     private ChangeListener<? super Number> walletInitListener;
 
     private final Object lock = new Object();
+    private final Object addressEntryLock = new Object(); // never acquire walletLock while holding this lock
+    private final Object seedValidationLock = new Object();
     private TaskLooper pollLooper;
     private boolean pollInProgress;
     private Long pollPeriodMs;
@@ -148,13 +185,41 @@ public class XmrWalletService extends XmrWalletBase {
     private EventThrottler logPollErrorRateThrottler = new EventThrottler(HavenoUtils.LOG_POLL_ERROR_PERIOD_MS, TimeUnit.MILLISECONDS);
     private long lastPollTxsTimestamp; 
     private final Object pollLock = new Object();
+    // retain native handles across service restarts until closing succeeds, including pathless wallets
+    private static final Map<MoneroWallet, PendingWalletClose> PENDING_WALLET_CLOSES = new ConcurrentHashMap<>();
+
+    private static class PendingWalletClose {
+        private final String path;
+        private final FutureTask<Void> task;
+        private boolean started;
+
+        private PendingWalletClose(MoneroWallet wallet, boolean save, String path) {
+            this.path = path;
+            task = new FutureTask<>(() -> {
+                wallet.close(save);
+                PENDING_WALLET_CLOSES.remove(wallet, this);
+                return null;
+            });
+        }
+
+        private synchronized void start() {
+            if (started || task.isDone()) return;
+            Thread thread = new Thread(task, "force-close-wallet");
+            thread.setDaemon(true);
+            thread.start();
+            started = true;
+        }
+    }
+
     private Long cachedHeight;
     private BigInteger cachedBalance;
     private BigInteger cachedAvailableBalance = null;
-    private List<MoneroSubaddress> cachedSubaddresses;
+    private volatile List<MoneroSubaddress> cachedSubaddresses; // read without the wallet lock
     private List<MoneroOutputWallet> cachedOutputs;
-    private List<MoneroTxWallet> cachedTxs;
+    private volatile List<MoneroTxWallet> cachedTxs; // replaced rather than mutated so readers can iterate without the wallet lock
     private boolean isInitializingWallet;
+    private final ReadOnlyBooleanWrapper passwordRecoveryRequired = new ReadOnlyBooleanWrapper();
+    private Long walletRestoreHeight; // tracked in-process because wallet rpc cannot report it
 
     private static final Object WALLET_HEIGHT_MONITOR_LOCK = new Object();
     private static final long WALLET_HEIGHT_MONITOR_PERIOD_SEC = 1200; // request connection change if wallet height is not updated within this period
@@ -172,8 +237,7 @@ public class XmrWalletService extends XmrWalletBase {
                      WalletsSetup walletsSetup,
                      XmrAddressEntryList xmrAddressEntryList,
                      @Named(Config.WALLET_DIR) File walletDir,
-                     @Named(Config.WALLET_RPC_BIND_PORT) int rpcBindPort,
-                     @Named(Config.USE_NATIVE_XMR_WALLET) boolean useNativeXmrWallet) {
+                     @Named(Config.WALLET_RPC_BIND_PORT) int rpcBindPort) {
         this.user = user;
         this.preferences = preferences;
         this.accountService = accountService;
@@ -181,12 +245,56 @@ public class XmrWalletService extends XmrWalletBase {
         this.xmrAddressEntryList = xmrAddressEntryList;
         this.walletDir = walletDir;
         this.rpcBindPort = rpcBindPort;
-        this.useNativeXmrWallet = useNativeXmrWallet;
         this.xmrConnectionService = xmrConnectionService; // TODO: super's is null unless set here from injection
         HavenoUtils.xmrWalletService = this;
+        MONERO_WALLET_RPC_MANAGER.onStartUp(); // clear the shared manager's shutdown state, which persists across in-process restarts
 
         // set monero logging
         if (MONERO_LOG_LEVEL >= 0) MoneroUtils.setLogLevel(MONERO_LOG_LEVEL);
+
+        accountService.addPasswordChangeHandler(CoreAccountService.PasswordChangeTarget.WALLETS, this::changeWalletPasswords);
+        accountService.addListener(new AccountServiceListener() {
+            @Override
+            public void onPasswordChanged(String oldPassword, String newPassword) {
+                synchronized (walletLock) {
+                    walletLifecycleLock.writeLock().lock();
+                    try {
+                        File currentBackup = passwordChange == null ? null : passwordChange.backupDir();
+                        Set<String> skipped = passwordChange == null ? Set.of() : Set.copyOf(passwordChange.skipped());
+                        passwordChange = null;
+                        try {
+                            try (WalletPasswordRecovery recovery = new WalletPasswordRecovery(walletDir.toPath(), getMoneroNetworkType(),
+                                    Arrays.asList(newPassword, oldPassword, null), newPassword, null)) {
+                                Set<String> protectedBackups = Set.of();
+                                if (currentBackup != null && new File(currentBackup, MONERO_WALLET_NAME + KEYS_FILE_POSTFIX).isFile()) {
+                                    protectedBackups = recovery.rekeyMainWalletBackups(new File(currentBackup, MONERO_WALLET_NAME + KEYS_FILE_POSTFIX).toPath());
+                                }
+                                // retain the flushed copies under the new password, including wallets created during the change
+                                List<String> retained = WalletPasswordChange.cleanupBackups(walletDir, currentBackup, null, protectedBackups, skipped);
+                                accountService.onWalletBackupsRetained(retained);
+                                if (!retained.isEmpty()) log.warn("Retained wallet files and backups: {}. Keep their previous passwords", retained);
+                            }
+                            FileUtil.deleteDirectory(new File(walletDir, ".password-recovery"), null, false);
+                        } catch (IOException e) {
+                            throw new IllegalStateException("Could not update wallet backups", e);
+                        }
+                    } finally {
+                        walletLifecycleLock.writeLock().unlock();
+                    }
+                }
+            }
+
+            @Override
+            public void onPasswordChangeFailed() {
+                walletLifecycleLock.writeLock().lock();
+                try {
+                    passwordChange = null;
+                } finally {
+                    walletLifecycleLock.writeLock().unlock();
+                }
+                UserThread.execute(() -> passwordRecoveryRequired.set(true));
+            }
+        });
 
         // initialize after account open and basic setup
         walletsSetup.addSetupTaskHandler(() -> { // TODO: use something better than legacy WalletSetup for notification to initialize
@@ -216,14 +324,6 @@ public class XmrWalletService extends XmrWalletBase {
                     closeMainWallet(true);
                     clearSyncProgress();
                     // TODO: reset more properties?
-                }
-
-                @Override
-                public void onPasswordChanged(String oldPassword, String newPassword) {
-                    log.info(getClass() + "accountservice.onPasswordChanged()");
-                    if (oldPassword == null || oldPassword.isEmpty()) oldPassword = MONERO_WALLET_RPC_DEFAULT_PASSWORD;
-                    if (newPassword == null || newPassword.isEmpty()) newPassword = MONERO_WALLET_RPC_DEFAULT_PASSWORD;
-                    changeWalletPasswords(oldPassword, newPassword);
                 }
             });
         });
@@ -287,7 +387,15 @@ public class XmrWalletService extends XmrWalletBase {
     }
 
     public String getWalletPassword() {
-        return accountService.getPassword() == null ? MONERO_WALLET_RPC_DEFAULT_PASSWORD : accountService.getPassword();
+        return getWalletPassword(MONERO_WALLET_NAME);
+    }
+
+    // the caller holds the wallet lock through the password-dependent operation
+    public String getWalletPassword(String walletName) {
+        accountService.checkPasswordRecovery();
+        PasswordChange change = passwordChange;
+        if (change == null) return normalizeWalletPassword(accountService.getPassword());
+        return change.remaining().contains(walletName) ? change.oldPassword() : change.newPassword();
     }
 
     public boolean walletExists(String walletName) {
@@ -295,30 +403,241 @@ public class XmrWalletService extends XmrWalletBase {
         return new File(path + KEYS_FILE_POSTFIX).exists();
     }
 
-    public MoneroWallet createWallet(String walletName, boolean applyProxyUri) {
-        return createWallet(walletName, null, applyProxyUri);
+    public MoneroWallet createWallet(String walletName, boolean applyProxyUri, boolean trustDaemon) {
+        return createWallet(walletName, null, applyProxyUri, trustDaemon);
     }
 
-    private MoneroWallet createWallet(String walletName, Integer walletRpcPort, boolean applyProxyUri) {
-        log.info("{}.createWallet({})", getClass().getSimpleName(), walletName);
-        if (isShutDownStarted) throw new IllegalStateException("Cannot create wallet because shutting down");
-        MoneroWalletConfig config = getWalletConfig(walletName);
-        return isNativeLibraryApplied() ? createWalletFull(config, applyProxyUri) : createWalletRpc(config, walletRpcPort, applyProxyUri);
+    private MoneroWallet createWallet(String walletName, Integer walletRpcPort, boolean applyProxyUri, boolean trustDaemon) {
+        walletLifecycleLock.readLock().lock();
+        try {
+            log.info("{}.createWallet({})", getClass().getSimpleName(), walletName);
+            if (isShutDownStarted) throw new IllegalStateException("Cannot create wallet because shutting down");
+            MoneroWalletConfig config = getWalletConfig(walletName);
+            PasswordChange change = passwordChange;
+            if (change != null) config.setPassword(change.newPassword());
+            MoneroWallet created = isNativeLibraryApplied() ? createWalletFull(config, applyProxyUri) : createWalletRpc(config, walletRpcPort, applyProxyUri, trustDaemon);
+            if (change != null) {
+                try {
+                    backupWalletForPasswordChange(created, walletName, config.getPassword(), change.backupDir(), trustDaemon, false);
+                    change.remaining().remove(walletName);
+                } catch (Throwable e) {
+                    forceCloseWallet(created, created.getPath());
+                    throw e;
+                }
+            }
+            return created;
+        } finally {
+            walletLifecycleLock.readLock().unlock();
+        }
     }
 
-    public MoneroWallet openWallet(String walletName, boolean applyProxyUri) {
-        return openWallet(walletName, null, applyProxyUri);
+    private MoneroWallet createWalletFromSeed(String walletName, Integer walletRpcPort, boolean applyProxyUri, boolean trustDaemon, String seed, long restoreHeight) {
+        walletLifecycleLock.readLock().lock();
+        try {
+            log.info("{}.createWalletFromSeed({}, {})", getClass().getSimpleName(), walletName, restoreHeight);
+            if (isShutDownStarted) throw new IllegalStateException("Cannot create wallet because shutting down");
+            if (!isSeedValid(seed)) throw new IllegalArgumentException("Invalid wallet seed");
+            MoneroWalletConfig config = getWalletConfig(walletName).setSeed(seed).setRestoreHeight(restoreHeight);
+            PasswordChange change = passwordChange;
+            if (change != null) config.setPassword(change.newPassword());
+            MoneroWallet created = isNativeLibraryApplied() ? createWalletFull(config, applyProxyUri) : createWalletRpc(config, walletRpcPort, applyProxyUri, trustDaemon);
+            if (change != null) {
+                try {
+                    backupWalletForPasswordChange(created, walletName, config.getPassword(), change.backupDir(), trustDaemon, false);
+                    change.remaining().remove(walletName);
+                } catch (Throwable e) {
+                    forceCloseWallet(created, created.getPath());
+                    throw e;
+                }
+            }
+            return created;
+        } finally {
+            walletLifecycleLock.readLock().unlock();
+        }
     }
 
-    public MoneroWallet openWallet(String walletName, Integer walletRpcPort, boolean applyProxyUri) {
+    // mainnet genesis timestamp and v2 fork height, to translate between block heights and dates
+    // (1-minute target blocks before the v2 fork, 2-minute after)
+    private static final long GENESIS_TIMESTAMP = 1397818193;
+    private static final long V2_FORK_HEIGHT = 1009827;
+
+    // estimate the timestamp of a mainnet block, capped at yesterday
+    private static long estimateHeightTimestamp(long height) {
+        long timestamp = GENESIS_TIMESTAMP + Math.min(height, V2_FORK_HEIGHT) * 60 + Math.max(0, height - V2_FORK_HEIGHT) * 120;
+        return Math.min(timestamp, LocalDate.now().atStartOfDay().minusDays(1).toEpochSecond(ZoneOffset.UTC));
+    }
+
+    /** Estimate the mainnet height at the given UTC date offline, padded low since target block times drift from the chain. */
+    public static long estimateHeightForDate(LocalDate date) {
+        long height = estimateTimestampHeight(date.atStartOfDay().toEpochSecond(ZoneOffset.UTC));
+        return Math.max(0, height - Math.max(30 * 720, height / 100)); // pad by a month or 1%, whichever is more
+    }
+
+    // estimate the mainnet height at the given UTC timestamp, the unpadded inverse of estimateHeightTimestamp
+    private static long estimateTimestampHeight(long timestamp) {
+        long v2ForkTimestamp = GENESIS_TIMESTAMP + V2_FORK_HEIGHT * 60;
+        return Math.max(0, timestamp <= v2ForkTimestamp
+                ? (timestamp - GENESIS_TIMESTAMP) / 60
+                : V2_FORK_HEIGHT + (timestamp - v2ForkTimestamp) / 120);
+    }
+
+    /** Check whether the seed is a valid wallet seed, using an offline temporary wallet (native or RPC). */
+    public boolean isSeedValid(String seed) {
+        if (isUseNativeXmrWallet()) MoneroUtils.tryLoadNativeLibrary();
+        synchronized (seedValidationLock) {
+            return isNativeLibraryApplied() ? isSeedValidNative(seed) : isSeedValidRpc(seed);
+        }
+    }
+
+    /** Preload the native library and wallet creation path so the first seed validation is fast. */
+    public void warmUpSeedValidation() {
+        if (!isUseNativeXmrWallet()) return; // rpc validation starts a new process per check, so nothing to warm
+        MoneroUtils.tryLoadNativeLibrary();
+        if (!isNativeLibraryApplied()) return;
+        synchronized (seedValidationLock) {
+            MoneroWalletFull wallet = null;
+            try {
+                wallet = MoneroWalletFull.createWallet(new MoneroWalletConfig()
+                        .setNetworkType(getMoneroNetworkType())
+                        .setPassword(""));
+            } finally {
+                if (wallet != null) forceCloseWallet(wallet, null);
+            }
+        }
+    }
+
+    // validate the seed by creating an in-memory wallet with the native library
+    private boolean isSeedValidNative(String seed) {
+        MoneroWalletFull wallet = null;
+        try {
+            wallet = MoneroWalletFull.createWallet(new MoneroWalletConfig()
+                    .setNetworkType(getMoneroNetworkType())
+                    .setPassword("")
+                    .setSeed(seed));
+            return true;
+        } catch (MoneroError e) {
+            log.info("Seed failed validation: {}", e.getMessage());
+            return false;
+        } finally {
+            if (wallet != null) forceCloseWallet(wallet, null);
+        }
+    }
+
+    // validate the seed by restoring a temporary wallet with an offline monero-wallet-rpc instance
+    private boolean isSeedValidRpc(String seed) {
+        String walletName = MONERO_WALLET_NAME + "_seed_validation";
+        deleteWalletFiles(walletName); // remove stale files from any previous validation
+        MoneroWalletRpc walletRpc = startWalletRpcInstance(null, null);
+        try {
+            walletRpc.createWallet(getWalletConfig(walletName).setSeed(seed).setPassword(UUID.randomUUID().toString())); // never reopened, so leftover files after a crash stay unreadable
+            return true;
+        } catch (MoneroError e) {
+            log.info("Seed failed validation: {}", e.getMessage());
+            return false;
+        } finally {
+            forceCloseWallet(walletRpc, walletName);
+            deleteWalletFiles(walletName);
+        }
+    }
+
+    public MoneroWallet openWallet(String walletName, boolean applyProxyUri, boolean trustDaemon) {
+        return openWallet(walletName, null, applyProxyUri, trustDaemon);
+    }
+
+    public MoneroWallet openWallet(String walletName, Integer walletRpcPort, boolean applyProxyUri, boolean trustDaemon) {
         log.debug("{}.openWallet({})", getClass().getSimpleName(), walletName);
         if (isShutDownStarted) throw new IllegalStateException("Cannot open wallet '" + walletName + "' because shutting down");
         MoneroWalletConfig config = getWalletConfig(walletName);
-        return isNativeLibraryApplied() ? openWalletFull(config, applyProxyUri) : openWalletRpc(config, walletRpcPort, applyProxyUri);
+        return isNativeLibraryApplied() ? openWalletFull(config, applyProxyUri) : openWalletRpc(config, walletRpcPort, applyProxyUri, trustDaemon);
+    }
+
+    // Restore the main wallet from the given seed, scanning from restoreHeight or else restoreDate. The restored wallet
+    // is fully created and saved before the current one is backed up and replaced, so failure leaves the current wallet intact.
+    public void restoreWalletFromSeed(String seed, Long restoreHeight, LocalDate restoreDate) {
+        if (!isSeedValid(seed)) throw new IllegalArgumentException("Invalid wallet seed");
+        synchronized (walletLock) {
+            if (isShutDownStarted) throw new IllegalStateException("Cannot restore wallet because shutting down");
+            if (!Boolean.TRUE.equals(xmrConnectionService.isConnected())) throw new RuntimeException("Cannot restore wallet because there is no connection to Monero daemon");
+            if (restoreHeight == null && restoreDate != null) restoreHeight = estimateHeightForDate(restoreDate);
+            long height = restoreHeight == null ? 0 : restoreHeight;
+            log.info("{}.restoreWalletFromSeed(restoreHeight={})", getClass().getSimpleName(), height);
+
+            // create the restored wallet under a temporary name so the current wallet is preserved if the seed is invalid
+            String restoreName = MONERO_WALLET_NAME + "_restore";
+            completeInterruptedRestore(); // else the only complete wallet files would be deleted
+            deleteWalletFiles(restoreName);
+            MoneroWalletConfig config = getWalletConfig(restoreName).setPassword(getWalletPassword()).setSeed(seed).setRestoreHeight(height);
+            MoneroWallet restored = isNativeLibraryApplied() ? createWalletFull(config, isProxyApplied()) : createWalletRpc(config, null, isProxyApplied(), xmrConnectionService.isTrustedDaemon());
+            closeWallet(restored, true);
+
+            // replace the current wallet with the restored wallet, keeping a backup
+            if (!closeMainWallet(true)) {
+
+                // reopen the wallet with a fresh handle since its state is unknown after a failed close
+                forceCloseMainWallet();
+                reopenMainWallet();
+                throw new IllegalStateException("Cannot restore wallet because closing the current wallet failed");
+            }
+            long previousWalletCreationDate = user.getWalletCreationDate();
+            user.setWalletCreationDate(estimateHeightTimestamp(height)); // before replacing files, so a replacement completed on startup keeps it
+            try {
+                if (walletExists(MONERO_WALLET_NAME)) {
+                    if (!backupWallet(MONERO_WALLET_NAME)) throw new IllegalStateException("Cannot restore wallet because backing up the current wallet failed");
+                    deleteWallet(MONERO_WALLET_NAME);
+                }
+                moveWallet(restoreName, MONERO_WALLET_NAME);
+            } catch (RuntimeException e) {
+
+                // resume with the current wallet if it is still in place
+                if (walletExists(MONERO_WALLET_NAME) && walletExists(restoreName)) {
+                    user.setWalletCreationDate(previousWalletCreationDate);
+                    reopenMainWallet();
+                }
+                throw e;
+            }
+        }
+    }
+
+    // Reopen the main wallet and resume polling after a failed operation left it closed.
+    private void reopenMainWallet() {
+        try {
+            wallet = openWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied(), xmrConnectionService.isTrustedDaemon());
+            startPolling();
+        } catch (Exception e) {
+            log.warn("Error reopening main wallet: {}\n", e.getMessage(), e);
+        }
+    }
+
+    // Complete a restore from seed interrupted after the current wallet was deleted but before the restored wallet was moved.
+    private void completeInterruptedRestore() {
+        String restoreName = MONERO_WALLET_NAME + "_restore";
+        if (!walletExists(MONERO_WALLET_NAME) && walletExists(restoreName)) {
+            log.warn("Completing restore from seed interrupted while replacing the main wallet");
+            moveWallet(restoreName, MONERO_WALLET_NAME);
+        }
+    }
+
+    // Move a wallet's files to another name within the wallet directory, moving the keys file last since it determines which wallet exists.
+    private void moveWallet(String fromName, String toName) {
+        for (String postfix : new String[] {"", ADDRESS_FILE_POSTFIX, KEYS_FILE_POSTFIX}) {
+            File from = new File(walletDir, fromName + postfix);
+            if (!from.exists()) continue; // address file is absent on mainnet
+            File to = new File(walletDir, toName + postfix);
+            if (!from.renameTo(to)) throw new RuntimeException("Failed to move wallet file " + Utilities.redactSensitiveInfo(from.toString()) + " to " + Utilities.redactSensitiveInfo(to.toString()));
+        }
+    }
+
+    // Delete a wallet's files if present, tolerating a partially written wallet.
+    private void deleteWalletFiles(String walletName) {
+        assertNotPath(walletName);
+        for (String postfix : new String[] {"", KEYS_FILE_POSTFIX, ADDRESS_FILE_POSTFIX}) {
+            File file = new File(walletDir, walletName + postfix);
+            if (file.exists() && !file.delete()) throw new RuntimeException("Failed to delete wallet file " + Utilities.redactSensitiveInfo(file.toString()));
+        }
     }
 
     private MoneroWalletConfig getWalletConfig(String walletName) {
-        MoneroWalletConfig config = new MoneroWalletConfig().setPath(getWalletPath(walletName)).setPassword(getWalletPassword());
+        MoneroWalletConfig config = new MoneroWalletConfig().setPath(getWalletPath(walletName)).setPassword(getWalletPassword(walletName));
         if (isNativeLibraryApplied()) config.setNetworkType(getMoneroNetworkType());
         return config;
     }
@@ -331,56 +650,157 @@ public class XmrWalletService extends XmrWalletBase {
         return walletPath.substring(walletPath.lastIndexOf(File.separator) + 1);
     }
 
+    private boolean isUseNativeXmrWallet() {
+        return preferences.isUseNativeXmrWallet();
+    }
+
     private boolean isNativeLibraryApplied() {
-        return useNativeXmrWallet && MoneroUtils.isNativeLibraryLoaded();
+        return isUseNativeXmrWallet() && MoneroUtils.isNativeLibraryLoaded();
     }
 
     public void closeWallet(MoneroWallet wallet, boolean save) {
-        log.debug("Closing wallet with path={}, save={}", wallet.getPath(), save);
-        MoneroError err = null;
-        String path = wallet.getPath();
-        try {
-            if (save && wallet instanceof MoneroWalletRpc) {
-                ((MoneroWalletRpc) wallet).stop(); // saves wallet and stops rpc server
-            } else {
-                wallet.close(save);
+        if (!(wallet instanceof MoneroWalletRpc)) {
+            PendingWalletClose close = registerWalletClose(wallet, save, null);
+            log.debug("Closing wallet with path={}, save={}", Utilities.redactSensitiveInfo(close.path), save);
+            close.task.run();
+            try {
+                close.task.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new MoneroError(e);
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof RuntimeException) throw (RuntimeException) e.getCause();
+                if (e.getCause() instanceof Error) throw (Error) e.getCause();
+                throw new MoneroError(e.getCause());
             }
+            return;
+        }
+
+        String path = wallet.getPath();
+        log.debug("Closing wallet with path={}, save={}", Utilities.redactSensitiveInfo(path), save);
+        MoneroError err = null;
+        try {
+            if (save) ((MoneroWalletRpc) wallet).stop(); // saves wallet and stops rpc server
+            else wallet.close(false);
         } catch (MoneroError e) {
             err = e;
         }
-
-        // stop wallet rpc instance if applicable
-        if (wallet instanceof MoneroWalletRpc) MONERO_WALLET_RPC_MANAGER.stopInstance((MoneroWalletRpc) wallet, path, false);
+        MONERO_WALLET_RPC_MANAGER.stopInstance((MoneroWalletRpc) wallet, path, false);
         if (err != null) throw err;
+    }
+
+    private static PendingWalletClose registerWalletClose(MoneroWallet wallet, boolean save, String path) {
+        return PENDING_WALLET_CLOSES.compute(wallet, (key, pending) -> {
+            if (pending != null && !pending.task.isDone()) return pending;
+            // a failed close rejects getPath(), so retain the path for an explicit retry
+            String walletPath = pending != null && pending.path != null ? pending.path : path;
+            if (walletPath == null && !wallet.isClosed()) walletPath = wallet.getPath();
+            return new PendingWalletClose(wallet, save, walletPath);
+        });
     }
 
     public void forceCloseWallet(MoneroWallet wallet, String path) {
         if (wallet == null) {
-            log.warn("Ignoring force close wallet because wallet is null, path={}", path);
+            log.warn("Ignoring force close wallet because wallet is null, path={}", Utilities.redactSensitiveInfo(path));
             return;
         }
         if (wallet instanceof MoneroWalletRpc) {
             MONERO_WALLET_RPC_MANAGER.stopInstance((MoneroWalletRpc) wallet, path, true);
         } else {
-            wallet.close(false);
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(FORCE_CLOSE_TIMEOUT_MS);
+            for (int attempt = 0;; attempt++) {
+
+                // register before starting so reopening can observe the native handle
+                PendingWalletClose close = registerWalletClose(wallet, false, path);
+                close.start();
+                try {
+                    close.task.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                    return;
+                } catch (TimeoutException e) {
+                    log.warn("Timeout force closing wallet after {} ms, path={}, will finish closing in background", FORCE_CLOSE_TIMEOUT_MS, Utilities.redactSensitiveInfo(close.path));
+                    return;
+                } catch (Exception e) {
+                    if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+                    log.warn("Error force closing wallet, path={}: {}", Utilities.redactSensitiveInfo(close.path), e.getMessage());
+                    // a failed close retains the native handle, so retry once in case a joined close failed
+                    if (e instanceof InterruptedException || attempt > 0) return;
+                }
+            }
+        }
+    }
+
+    // native locks belong to the process, so a second handle must never open while the first is closing
+    private void awaitPendingWalletClose(String path) {
+        if (path == null) return;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PENDING_CLOSE_TIMEOUT_MS);
+        for (Map.Entry<MoneroWallet, PendingWalletClose> entry : PENDING_WALLET_CLOSES.entrySet()) {
+            PendingWalletClose close = entry.getValue();
+            if (!path.equals(close.path)) continue;
+            log.warn("Waiting for wallet to finish closing before opening, path={}", Utilities.redactSensitiveInfo(path));
+            try {
+                close.start(); // resume a registered close whose worker could not start
+                try {
+                    close.task.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                } catch (ExecutionException e) {
+                    // retry cleanup without saving stale state over files replaced since the failed close
+                    close = PENDING_WALLET_CLOSES.computeIfPresent(entry.getKey(), (wallet, pending) ->
+                            pending.task.isDone() ? new PendingWalletClose(wallet, false, pending.path) : pending);
+                    if (close == null) continue; // another caller finished closing it
+                    close.start();
+                    close.task.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                }
+            } catch (Exception e) {
+                if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+                throw new IllegalStateException("Wallet has not closed safely; please retry opening it: " + Utilities.redactSensitiveInfo(path), e);
+            }
         }
     }
 
     public void deleteWallet(String walletName) {
-        assertNotPath(walletName);
-        log.info("{}.deleteWallet({})", getClass().getSimpleName(), walletName);
-        if (!walletExists(walletName)) throw new RuntimeException("Wallet does not exist at path: " + walletName);
-        String path = walletDir.toString() + File.separator + walletName;
-        if (!new File(path).delete()) throw new RuntimeException("Failed to delete wallet cache file: " + path);
-        if (!new File(path + KEYS_FILE_POSTFIX).delete()) throw new RuntimeException("Failed to delete wallet keys file: " + path + KEYS_FILE_POSTFIX);
-        if (!new File(path + ADDRESS_FILE_POSTFIX).delete() && !Config.baseCurrencyNetwork().isMainnet()) throw new RuntimeException("Failed to delete wallet address file: " + path + ADDRESS_FILE_POSTFIX); // mainnet does not have address file by default
+        walletLifecycleLock.readLock().lock();
+        try {
+            assertNotPath(walletName);
+            log.info("{}.deleteWallet({})", getClass().getSimpleName(), walletName);
+            if (!walletExists(walletName)) throw new RuntimeException("Wallet does not exist at path: " + walletName);
+            String path = walletDir.toString() + File.separator + walletName;
+            String redactedPath = Utilities.redactSensitiveInfo(path);
+            if (!new File(path).delete()) throw new RuntimeException("Failed to delete wallet cache file: " + redactedPath);
+            if (!new File(path + KEYS_FILE_POSTFIX).delete()) throw new RuntimeException("Failed to delete wallet keys file: " + redactedPath + KEYS_FILE_POSTFIX);
+            if (!new File(path + ADDRESS_FILE_POSTFIX).delete() && !Config.baseCurrencyNetwork().isMainnet()) throw new RuntimeException("Failed to delete wallet address file: " + redactedPath + ADDRESS_FILE_POSTFIX); // mainnet does not have address file by default
+        } finally {
+            walletLifecycleLock.readLock().unlock();
+        }
     }
 
-    public void backupWallet(String walletName) {
+    public void deleteWalletAndRetainBackup(String walletName) {
+        walletLifecycleLock.readLock().lock();
+        try {
+            assertNotPath(walletName);
+            awaitPendingWalletClose(new File(walletDir, walletName).getPath());
+            if (!backupWallet(walletName)) throw new IllegalStateException("Could not back up wallet " + walletName);
+            try {
+                for (String suffix : List.of("", KEYS_FILE_POSTFIX, ADDRESS_FILE_POSTFIX)) {
+                    File backup = FileUtil.getLatestBackupFile(walletDir, walletName + suffix);
+                    if (backup != null) FileUtil.syncFileAndDirectory(backup.toPath());
+                }
+                FileUtil.syncDirectory(new File(walletDir, "backup").toPath());
+                FileUtil.syncDirectory(walletDir.toPath());
+            } catch (IOException e) {
+                throw new IllegalStateException("Could not flush wallet backup for " + walletName, e);
+            }
+            deleteWallet(walletName);
+        } finally {
+            walletLifecycleLock.readLock().unlock();
+        }
+    }
+
+    // returns false if backing up any existing wallet file failed
+    public boolean backupWallet(String walletName) {
         assertNotPath(walletName);
-        FileUtil.rollingBackup(walletDir, walletName, NUM_WALLET_BACKUPS);
-        FileUtil.rollingBackup(walletDir, walletName + KEYS_FILE_POSTFIX, NUM_WALLET_BACKUPS);
-        FileUtil.rollingBackup(walletDir, walletName + ADDRESS_FILE_POSTFIX, NUM_WALLET_BACKUPS);
+        boolean success = FileUtil.rollingBackup(walletDir, walletName, NUM_WALLET_BACKUPS);
+        success &= FileUtil.rollingBackup(walletDir, walletName + KEYS_FILE_POSTFIX, NUM_WALLET_BACKUPS);
+        success &= FileUtil.rollingBackup(walletDir, walletName + ADDRESS_FILE_POSTFIX, NUM_WALLET_BACKUPS);
+        return success;
     }
 
     public void deleteWalletBackups(String walletName) {
@@ -388,6 +808,17 @@ public class XmrWalletService extends XmrWalletBase {
         FileUtil.deleteRollingBackup(walletDir, walletName);
         FileUtil.deleteRollingBackup(walletDir, walletName + KEYS_FILE_POSTFIX);
         FileUtil.deleteRollingBackup(walletDir, walletName + ADDRESS_FILE_POSTFIX);
+        File[] snapshots = new File(walletDir, "backup").listFiles(file -> file.isDirectory() && file.getName().startsWith("password-change-"));
+        if (snapshots != null) {
+            for (File snapshot : snapshots) {
+                try {
+                    Files.deleteIfExists(new File(snapshot, walletName).toPath());
+                    Files.deleteIfExists(new File(snapshot, walletName + KEYS_FILE_POSTFIX).toPath());
+                } catch (IOException e) {
+                    throw new IllegalStateException("Could not remove recovery copies for wallet " + walletName, e);
+                }
+            }
+        }
     }
 
     private static void assertNotPath(String name) {
@@ -405,7 +836,9 @@ public class XmrWalletService extends XmrWalletBase {
             synchronized (HavenoUtils.getWalletFunctionLock()) {
                 MoneroTxWallet tx = wallet.createTx(txConfig);
                 if (Boolean.TRUE.equals(txConfig.getRelay())) {
-                    cachedTxs.addFirst(tx);
+                    List<MoneroTxWallet> updatedTxs = new ArrayList<>(cachedTxs);
+                    updatedTxs.addFirst(tx);
+                    cachedTxs = updatedTxs;
                     cacheWalletInfo();
                     saveWallet();
                 }
@@ -423,7 +856,9 @@ public class XmrWalletService extends XmrWalletBase {
             synchronized (HavenoUtils.getWalletFunctionLock()) {
                 List<MoneroTxWallet> txs = wallet.sweepUnlocked(txConfig);
                 if (Boolean.TRUE.equals(txConfig.getRelay())) {
-                    for (MoneroTxWallet tx : txs) cachedTxs.addFirst(tx);
+                    List<MoneroTxWallet> updatedTxs = new ArrayList<>(cachedTxs);
+                    for (MoneroTxWallet tx : txs) updatedTxs.addFirst(tx);
+                    cachedTxs = updatedTxs;
                     cacheWalletInfo();
                     saveWallet();
                 }
@@ -446,20 +881,31 @@ public class XmrWalletService extends XmrWalletBase {
     public void fixReservedOutputs() {
         synchronized (walletLock) {
 
-            // collect reserved outputs
-            Set<String> reservedKeyImages = new HashSet<String>();
-            for (Trade trade : HavenoUtils.tradeManager.getOpenTrades()) {
-                if (trade.getSelf().getReserveTxKeyImages() == null) continue;
-                reservedKeyImages.addAll(trade.getSelf().getReserveTxKeyImages());
-            }
-            for (OpenOffer openOffer : HavenoUtils.tradeManager.getOpenOfferManager().getOpenOffers()) {
-                if (openOffer.getOffer().getOfferPayload().getReserveTxKeyImages() == null) continue;
-                reservedKeyImages.addAll(openOffer.getOffer().getOfferPayload().getReserveTxKeyImages());
-            }
+            // collect reserved outputs including split outputs awaiting reserve txs
+            OpenOfferManager openOfferManager = HavenoUtils.tradeManager.getOpenOfferManager();
+            List<OpenOffer> openOffers = openOfferManager.getOpenOffers();
+            Set<String> reservedKeyImages = getReservedKeyImages(openOffers);
+            for (OpenOffer openOffer : openOffers) reservedKeyImages.addAll(openOfferManager.getSplitOutputKeyImages(openOffer));
 
             freezeReservedOutputs(reservedKeyImages);
             thawUnreservedOutputs(reservedKeyImages);
         }
+    }
+
+    /**
+     * Get the key images of reserve and deposit tx inputs of open trades and the given open offers.
+     */
+    public Set<String> getReservedKeyImages(List<OpenOffer> openOffers) {
+        Set<String> reservedKeyImages = new HashSet<String>();
+        for (Trade trade : HavenoUtils.tradeManager.getOpenTrades()) {
+            if (trade.getSelf().getReserveTxKeyImages() == null) continue;
+            reservedKeyImages.addAll(trade.getSelf().getReserveTxKeyImages());
+        }
+        for (OpenOffer openOffer : openOffers) {
+            if (openOffer.getOffer().getOfferPayload().getReserveTxKeyImages() == null) continue;
+            reservedKeyImages.addAll(openOffer.getOffer().getOfferPayload().getReserveTxKeyImages());
+        }
+        return reservedKeyImages;
     }
 
     private void freezeReservedOutputs(Set<String> reservedKeyImages) {
@@ -524,6 +970,7 @@ public class XmrWalletService extends XmrWalletBase {
                     .map(output -> output.getKeyImage().getHex())
                     .collect(Collectors.toList());
             unfrozenKeyImages.retainAll(keyImages);
+            if (unfrozenKeyImages.isEmpty()) return;
 
             // freeze outputs
             for (String keyImage : unfrozenKeyImages) getInitializedWallet().freezeOutput(keyImage);
@@ -547,6 +994,7 @@ public class XmrWalletService extends XmrWalletBase {
                     .map(output -> output.getKeyImage().getHex())
                     .collect(Collectors.toList());
             frozenKeyImages.retainAll(keyImages);
+            if (frozenKeyImages.isEmpty()) return;
 
             // thaw outputs
             for (String keyImage : frozenKeyImages) getInitializedWallet().thawOutput(keyImage);
@@ -562,17 +1010,19 @@ public class XmrWalletService extends XmrWalletBase {
         List<MoneroTxWallet> nonPoolTxs = wallet.getTxs(new MoneroTxQuery().setIncludeOutputs(true).setInTxPool(false));
 
         // replace non-pool txs in cache
+        List<MoneroTxWallet> updatedTxs = new ArrayList<>(cachedTxs);
         for (MoneroTxWallet nonPoolTx : nonPoolTxs) {
             boolean replaced = false;
-            for (int i = 0; i < cachedTxs.size(); i++) {
-                if (cachedTxs.get(i).getHash().equals(nonPoolTx.getHash())) {
-                    cachedTxs.set(i, nonPoolTx);
+            for (int i = 0; i < updatedTxs.size(); i++) {
+                if (updatedTxs.get(i).getHash().equals(nonPoolTx.getHash())) {
+                    updatedTxs.set(i, nonPoolTx);
                     replaced = true;
                     break;
                 }
             }
-            if (!replaced) cachedTxs.add(nonPoolTx);
+            if (!replaced) updatedTxs.add(nonPoolTx);
         }
+        cachedTxs = updatedTxs;
     }
 
     private List<Integer> getSubaddressesWithExactInput(BigInteger amount) {
@@ -594,6 +1044,7 @@ public class XmrWalletService extends XmrWalletBase {
      * Create the reserve tx and freeze its inputs. The full amount is returned
      * to the sender's payout address less the penalty and mining fees.
      *
+     * @param tradable the offer or trade to reserve funds for
      * @param penaltyFee penalty fee for breaking protocol
      * @param tradeFee trade fee
      * @param sendTradeAmount trade amount to send peer
@@ -603,14 +1054,14 @@ public class XmrWalletService extends XmrWalletBase {
      * @param preferredSubaddressIndex preferred source subaddress to spend from (optional)
      * @return the reserve tx
      */
-    public MoneroTxWallet createReserveTx(BigInteger penaltyFee, BigInteger tradeFee, BigInteger sendTradeAmount, BigInteger securityDeposit, String returnAddress, boolean reserveExactAmount, Integer preferredSubaddressIndex) {
+    public MoneroTxWallet createReserveTx(Tradable tradable, BigInteger penaltyFee, BigInteger tradeFee, BigInteger sendTradeAmount, BigInteger securityDeposit, String returnAddress, boolean reserveExactAmount, Integer preferredSubaddressIndex) {
         synchronized (walletLock) {
             synchronized (HavenoUtils.getWalletFunctionLock()) {
-                log.info("Creating reserve tx with preferred subaddress index={}, return address={}", preferredSubaddressIndex, returnAddress);
+                log.info("Creating reserve tx for {} {} with preferred subaddress index={}, return address={}", tradable.getClass().getSimpleName(), tradable.getShortId(), preferredSubaddressIndex, returnAddress);
                 long time = System.currentTimeMillis();
                 BigInteger sendAmount = sendTradeAmount.add(securityDeposit).add(tradeFee).subtract(penaltyFee);
                 MoneroTxWallet reserveTx = createTradeTx(penaltyFee, HavenoUtils.getBurnAddress(), sendAmount, returnAddress, reserveExactAmount, preferredSubaddressIndex);
-                log.info("Done creating reserve tx in {} ms", System.currentTimeMillis() - time);
+                log.info("Done creating reserve tx for {} {} in {} ms", tradable.getClass().getSimpleName(), tradable.getShortId(), System.currentTimeMillis() - time);
                 return reserveTx;
             }
         }
@@ -729,7 +1180,6 @@ public class XmrWalletService extends XmrWalletBase {
     public MoneroTx verifyTradeTx(String offerId, BigInteger tradeFeeAmount, String feeAddress, BigInteger sendAmount, String sendAddress, String txHash, String txHex, String txKey, List<String> keyImages) {
         if (txHash == null) throw new IllegalArgumentException("Cannot verify trade tx with null id");
         MoneroDaemonRpc monerod = getMonerod();
-        MoneroWallet wallet = getWallet();
         MoneroTx tx = null;
         synchronized (lock) {
             try {
@@ -764,13 +1214,13 @@ public class XmrWalletService extends XmrWalletBase {
                 // verify proof to fee address
                 BigInteger actualTradeFee = BigInteger.ZERO;
                 if (tradeFeeAmount.compareTo(BigInteger.ZERO) > 0) {
-                    MoneroCheckTx tradeFeeCheck = wallet.checkTxKey(txHash, txKey, feeAddress);
+                    MoneroCheckTx tradeFeeCheck = checkTxKey(txHash, txKey, feeAddress);
                     if (!tradeFeeCheck.isGood()) throw new RuntimeException("Invalid proof to trade fee address");
                     actualTradeFee = tradeFeeCheck.getReceivedAmount();
                 }
 
                 // verify proof to transfer address
-                MoneroCheckTx transferCheck = wallet.checkTxKey(txHash, txKey, sendAddress);
+                MoneroCheckTx transferCheck = checkTxKey(txHash, txKey, sendAddress);
                 if (!transferCheck.isGood()) throw new RuntimeException("Invalid proof to transfer address");
                 BigInteger actualSendAmount = transferCheck.getReceivedAmount();
 
@@ -807,6 +1257,20 @@ public class XmrWalletService extends XmrWalletBase {
         }
     }
 
+    // check tx key with bounded retries since the request can fail transiently under load
+    private MoneroCheckTx checkTxKey(String txHash, String txKey, String address) {
+        int numAttempts = 0;
+        while (true) {
+            try {
+                return getWallet().checkTxKey(txHash, txKey, address);
+            } catch (Exception e) {
+                if (++numAttempts >= NUM_CHECK_TX_KEY_ATTEMPTS) throw e;
+                log.warn("Error checking tx key, attempt={}/{}, txHash={}: {}", numAttempts, NUM_CHECK_TX_KEY_ATTEMPTS, txHash, e.getMessage());
+                HavenoUtils.waitFor(CHECK_TX_KEY_ATTEMPT_DELAY_MS);
+            }
+        }
+    }
+
     // TODO: old bug in atomic unit conversion could cause fractional difference error, remove this in future release, maybe re-sign all offers then
     private static boolean equalsWithinFractionError(BigInteger a, BigInteger b) {
         return a.subtract(b).abs().compareTo(new BigInteger("1")) <= 0;
@@ -818,7 +1282,7 @@ public class XmrWalletService extends XmrWalletBase {
      * @param txWeight - the tx weight
      * @return the tx fee estimate
      */
-    private BigInteger getFeeEstimate(long txWeight) {
+    public BigInteger getFeeEstimate(long txWeight) {
 
         // get fee priority
         MoneroTxPriority priority;
@@ -826,6 +1290,12 @@ public class XmrWalletService extends XmrWalletBase {
             priority = wallet.getDefaultFeePriority();
         } else {
             priority = PROTOCOL_FEE_PRIORITY;
+        }
+
+        // fall back to lowest priority if wallet cannot determine, e.g. on internal daemon error
+        if (priority == MoneroTxPriority.DEFAULT) {
+            log.warn("Wallet returned default fee priority, falling back to {}", MoneroTxPriority.UNIMPORTANT);
+            priority = MoneroTxPriority.UNIMPORTANT;
         }
 
         // get fee estimates per kB from daemon
@@ -847,6 +1317,7 @@ public class XmrWalletService extends XmrWalletBase {
     public void onShutDownStarted() {
         log.info("XmrWalletService.onShutDownStarted()");
         this.isShutDownStarted = true;
+        MONERO_WALLET_RPC_MANAGER.onShutDownStarted();
     }
 
     public void shutDown() {
@@ -881,77 +1352,105 @@ public class XmrWalletService extends XmrWalletBase {
 
     // -------------------------- ADDRESS ENTRIES -----------------------------
 
-    public synchronized XmrAddressEntry getNewAddressEntry() {
+    public XmrAddressEntry getNewAddressEntry() {
         return getNewAddressEntryAux(null, XmrAddressEntry.Context.AVAILABLE);
     }
 
-    public synchronized XmrAddressEntry getNewAddressEntry(String offerId, XmrAddressEntry.Context context) {
+    public XmrAddressEntry getNewAddressEntry(String offerId, XmrAddressEntry.Context context) {
+        synchronized (walletLock) { // wallet lock first, since a new subaddress may be created
+            synchronized (addressEntryLock) {
 
-        // try to use available and not yet used entries
-        try {
-            List<XmrAddressEntry> unusedAddressEntries = getUnusedAddressEntries();
-            if (!unusedAddressEntries.isEmpty()) return xmrAddressEntryList.swapAvailableToAddressEntryWithOfferId(unusedAddressEntries.get(0), context, offerId);
-        } catch (Exception e) {
-            log.warn("Error getting new address entry based on incoming transactions: {}\n", e.getMessage(), e);
+                // try to use available and not yet used entries
+                try {
+                    List<XmrAddressEntry> unusedAddressEntries = getUnusedAddressEntries();
+                    if (!unusedAddressEntries.isEmpty()) return xmrAddressEntryList.swapAvailableToAddressEntryWithOfferId(unusedAddressEntries.get(0), context, offerId);
+                } catch (Exception e) {
+                    log.warn("Error getting new address entry based on incoming transactions: {}\n", e.getMessage(), e);
+                }
+
+                // create new entry
+                return getNewAddressEntryAux(offerId, context);
+            }
         }
-
-        // create new entry
-        return getNewAddressEntryAux(offerId, context);
     }
 
     private XmrAddressEntry getNewAddressEntryAux(String offerId, XmrAddressEntry.Context context) {
         synchronized (walletLock) {
-            MoneroSubaddress subaddress = wallet.createSubaddress(0);
-            XmrAddressEntry entry = new XmrAddressEntry(subaddress.getIndex(), subaddress.getAddress(), context, offerId, null);
-            log.info("Add new XmrAddressEntry {}", entry);
-            xmrAddressEntryList.addAddressEntry(entry);
-            return entry;
+            synchronized (addressEntryLock) {
+                MoneroSubaddress subaddress = wallet.createSubaddress(0);
+                XmrAddressEntry entry = new XmrAddressEntry(subaddress.getIndex(), subaddress.getAddress(), context, offerId, null);
+                log.info("Add new XmrAddressEntry {}", entry);
+                xmrAddressEntryList.addAddressEntry(entry);
+                return entry;
+            }
         }
     }
 
-    public synchronized XmrAddressEntry getFreshAddressEntry() {
-        List<XmrAddressEntry> unusedAddressEntries = getUnusedAddressEntries();
-        if (unusedAddressEntries.isEmpty()) return getNewAddressEntry();
-        else return unusedAddressEntries.get(0);
+    public XmrAddressEntry getFreshAddressEntry() {
+        synchronized (addressEntryLock) { // reuse an unused entry without waiting on the wallet
+            List<XmrAddressEntry> unusedAddressEntries = getUnusedAddressEntries();
+            if (!unusedAddressEntries.isEmpty()) return unusedAddressEntries.get(0);
+        }
+        synchronized (walletLock) { // wallet lock first, since a new subaddress may be created
+            synchronized (addressEntryLock) {
+                List<XmrAddressEntry> unusedAddressEntries = getUnusedAddressEntries();
+                if (unusedAddressEntries.isEmpty()) return getNewAddressEntry();
+                else return unusedAddressEntries.get(0);
+            }
+        }
     }
 
-    public synchronized XmrAddressEntry recoverAddressEntry(String offerId, String address, XmrAddressEntry.Context context) {
-        var available = findAddressEntry(address, XmrAddressEntry.Context.AVAILABLE);
-        if (!available.isPresent()) return null;
-        return xmrAddressEntryList.swapAvailableToAddressEntryWithOfferId(available.get(), context, offerId);
+    public XmrAddressEntry recoverAddressEntry(String offerId, String address, XmrAddressEntry.Context context) {
+        synchronized (addressEntryLock) {
+            var available = findAddressEntry(address, XmrAddressEntry.Context.AVAILABLE);
+            if (!available.isPresent()) return null;
+            return xmrAddressEntryList.swapAvailableToAddressEntryWithOfferId(available.get(), context, offerId);
+        }
     }
 
-    public synchronized XmrAddressEntry getOrCreateAddressEntry(String offerId, XmrAddressEntry.Context context) {
+    public XmrAddressEntry getOrCreateAddressEntry(String offerId, XmrAddressEntry.Context context) {
         Optional<XmrAddressEntry> addressEntry = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).filter(e -> context == e.getContext()).findAny();
         if (addressEntry.isPresent()) return addressEntry.get();
-        else return getNewAddressEntry(offerId, context);
-    }
-
-    public synchronized Optional<XmrAddressEntry> getAddressEntry(String offerId, XmrAddressEntry.Context context) {
-        List<XmrAddressEntry> entries = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).filter(e -> context == e.getContext()).collect(Collectors.toList());
-        if (entries.size() > 1) throw new RuntimeException("Multiple address entries exist with offer ID " + offerId + " and context " + context + ". That should never happen.");
-        return entries.isEmpty() ? Optional.empty() : Optional.of(entries.get(0));
-    }
-
-    public synchronized void swapAddressEntryToAvailable(String offerId, XmrAddressEntry.Context context) {
-        Optional<XmrAddressEntry> addressEntryOptional = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).filter(e -> context == e.getContext()).findAny();
-        addressEntryOptional.ifPresent(e -> {
-            xmrAddressEntryList.swapToAvailable(e);
-            saveAddressEntryList();
-        });
-    }
-
-    public synchronized void cloneAddressEntries(String offerId, String cloneOfferId) {
-        List<XmrAddressEntry> entries = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).collect(Collectors.toList());
-        for (XmrAddressEntry entry : entries) {
-            XmrAddressEntry clonedEntry = new XmrAddressEntry(entry.getSubaddressIndex(), entry.getAddressString(), entry.getContext(), cloneOfferId, null);
-            Optional<XmrAddressEntry> existingEntry = getAddressEntry(clonedEntry.getOfferId(), clonedEntry.getContext());
-            if (existingEntry.isPresent()) continue;
-            xmrAddressEntryList.addAddressEntry(clonedEntry);
+        synchronized (walletLock) { // wallet lock first, since a new subaddress may be created
+            synchronized (addressEntryLock) {
+                addressEntry = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).filter(e -> context == e.getContext()).findAny();
+                if (addressEntry.isPresent()) return addressEntry.get();
+                else return getNewAddressEntry(offerId, context);
+            }
         }
     }
 
-    public synchronized void resetAddressEntriesForOpenOffer(String offerId) {
+    public Optional<XmrAddressEntry> getAddressEntry(String offerId, XmrAddressEntry.Context context) {
+        synchronized (addressEntryLock) {
+            List<XmrAddressEntry> entries = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).filter(e -> context == e.getContext()).collect(Collectors.toList());
+            if (entries.size() > 1) throw new RuntimeException("Multiple address entries exist with offer ID " + offerId + " and context " + context + ". That should never happen.");
+            return entries.isEmpty() ? Optional.empty() : Optional.of(entries.get(0));
+        }
+    }
+
+    public void swapAddressEntryToAvailable(String offerId, XmrAddressEntry.Context context) {
+        synchronized (addressEntryLock) {
+            Optional<XmrAddressEntry> addressEntryOptional = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).filter(e -> context == e.getContext()).findAny();
+            addressEntryOptional.ifPresent(e -> {
+                xmrAddressEntryList.swapToAvailable(e);
+                saveAddressEntryList();
+            });
+        }
+    }
+
+    public void cloneAddressEntries(String offerId, String cloneOfferId) {
+        synchronized (addressEntryLock) {
+            List<XmrAddressEntry> entries = getAddressEntryListAsImmutableList().stream().filter(e -> offerId.equals(e.getOfferId())).collect(Collectors.toList());
+            for (XmrAddressEntry entry : entries) {
+                XmrAddressEntry clonedEntry = new XmrAddressEntry(entry.getSubaddressIndex(), entry.getAddressString(), entry.getContext(), cloneOfferId, null);
+                Optional<XmrAddressEntry> existingEntry = getAddressEntry(clonedEntry.getOfferId(), clonedEntry.getContext());
+                if (existingEntry.isPresent()) continue;
+                xmrAddressEntryList.addAddressEntry(clonedEntry);
+            }
+        }
+    }
+
+    public void resetAddressEntriesForOpenOffer(String offerId) {
         log.info("resetAddressEntriesForOpenOffer offerId={}", offerId);
 
         // skip if failed trade is scheduled for processing // TODO: do not call this function in this case?
@@ -968,7 +1467,7 @@ public class XmrWalletService extends XmrWalletBase {
         if (trade == null || trade.isPayoutFinalized()) swapAddressEntryToAvailable(offerId, XmrAddressEntry.Context.TRADE_PAYOUT);
     }
 
-    public synchronized void swapPayoutAddressEntryToAvailable(String offerId) {
+    public void swapPayoutAddressEntryToAvailable(String offerId) {
         swapAddressEntryToAvailable(offerId, XmrAddressEntry.Context.TRADE_PAYOUT);
     }
 
@@ -1179,6 +1678,32 @@ public class XmrWalletService extends XmrWalletBase {
         }
     }
 
+    public String getWalletAsString(boolean includePrivKeys) {
+        synchronized (walletLock) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Primary address: ").append(wallet.getPrimaryAddress()).append("\n");
+            sb.append("Wallet height: ").append(getHeight()).append("\n");
+            appendKeyIfSupported(sb, "Public view key", wallet::getPublicViewKey);
+            appendKeyIfSupported(sb, "Public spend key", wallet::getPublicSpendKey);
+            if (includePrivKeys) {
+                sb.append("Seed: ").append(wallet.getSeed()).append("\n");
+                sb.append("Private view key: ").append(wallet.getPrivateViewKey()).append("\n");
+                sb.append("Private spend key: ").append(wallet.getPrivateSpendKey()).append("\n");
+            }
+            return sb.toString();
+        }
+    }
+
+    // monero-wallet-rpc release-v0.18 does not support querying public keys
+    private static void appendKeyIfSupported(StringBuilder sb, String label, Supplier<String> getter) {
+        try {
+            String key = getter.get();
+            sb.append(label).append(": ").append(key).append("\n");
+        } catch (MoneroRpcError e) {
+            if (e.getMessage() == null || !e.getMessage().startsWith("key_type")) throw e;
+        }
+    }
+
     public List<MoneroTxWallet> getTxs(boolean includeFailed) {
         List<MoneroTxWallet> txs = getTxs();
         if (includeFailed) return txs;
@@ -1286,7 +1811,7 @@ public class XmrWalletService extends XmrWalletBase {
     private void initialize() {
 
         // try to load native monero library
-        if (useNativeXmrWallet && !MoneroUtils.isNativeLibraryLoaded()) {
+        if (isUseNativeXmrWallet() && !MoneroUtils.isNativeLibraryLoaded()) {
             try {
                 MoneroUtils.loadNativeLibrary();
             } catch (Exception | UnsatisfiedLinkError e) {
@@ -1294,7 +1819,7 @@ public class XmrWalletService extends XmrWalletBase {
             }
         }
         String appliedMsg = "Monero native libraries applied: " + isNativeLibraryApplied();
-        if (useNativeXmrWallet && !isNativeLibraryApplied()) log.warn(appliedMsg);
+        if (isUseNativeXmrWallet() && !isNativeLibraryApplied()) log.warn(appliedMsg);
         else log.info(appliedMsg);
 
         // listen for connection changes
@@ -1303,26 +1828,9 @@ public class XmrWalletService extends XmrWalletBase {
             // skip default handling if processing a synchronous connection switch (this is assumed to be called on same thread as requester)
             if (isProcessingRequestConnectionSwitchSynchronous) return;
             
-            // process off thread
-            ThreadUtils.submitToPool(() -> {
-                if (wasWalletSynced && !isSyncing()) {
-                    onConnectionChanged(connection);
-                } else {
-
-                    // check if ignored
-                    if (wallet == null || isShutDownStarted) return;
-                    if (HavenoUtils.connectionConfigsEqual(connection, wallet.getDaemonConnection())) {
-                        updatePollPeriod();
-                        return;
-                    }
-
-                    // force restart main wallet if connection changed while syncing
-                    if (isSyncing()) {
-                        log.warn("Force restarting main wallet because connection changed while syncing");
-                        forceRestartMainWallet();
-                    }
-                }
-            });
+            // process off thread; notifier can hold a daemon lock, so taking walletLock here could deadlock
+            MoneroWallet sourceWallet = wallet;
+            ThreadUtils.submitToPool(() -> onConnectionChanged(connection, sourceWallet));
         });
 
         // initialize main wallet when daemon synced
@@ -1331,16 +1839,43 @@ public class XmrWalletService extends XmrWalletBase {
         initMainWalletIfConnected();
     }
 
+    private void onConnectionChanged(MoneroRpcConnection connection, MoneroWallet sourceWallet) {
+        if (isShutDownStarted) return;
+        if (wasWalletSynced && !isSyncing()) {
+            onConnectionChanged(connection);
+            return;
+        }
+        if (sourceWallet == null || wallet != sourceWallet || connection != xmrConnectionService.getConnection()) return;
+
+        // preserve the current sync's proxy choice until onFirstSync applies AFTER_SYNC
+        MoneroRpcConnection sourceConnection = sourceWallet.getDaemonConnection();
+        MoneroRpcConnection walletConnection = connection == null ? null : new MoneroRpcConnection(connection);
+        if (walletConnection != null) xmrConnectionService.applyWalletProxyUri(walletConnection, MONERO_WALLET_NAME, sourceConnection != null && sourceConnection.getProxyUri() != null);
+        if (HavenoUtils.connectionConfigsEqual(walletConnection, sourceConnection)) {
+            updatePollPeriod();
+            return;
+        }
+
+        // stay off walletLock so a connection change can abort the sync holding it
+        if (isSyncing()) {
+            log.warn("Force restarting main wallet because connection changed while syncing");
+            forceRestartMainWallet();
+        }
+    }
+
     private void startWalletHeightMonitor() {
         synchronized (WALLET_HEIGHT_MONITOR_LOCK) {
             if (walletHeightMonitorTimer != null) walletHeightMonitorTimer.stop();
             walletHeightMonitorTimer = UserThread.runPeriodically(() -> {
                 ThreadUtils.execute(() -> {
                     try {
-                        if (System.currentTimeMillis() - lastWalletHeightMonitorUpdate >= WALLET_HEIGHT_MONITOR_PERIOD_SEC * 1000) {
-                            log.warn("Requesting connection change because main wallet height has not updated in over {} minutes", (double) WALLET_HEIGHT_MONITOR_PERIOD_SEC / (double) 60);
-                            requestConnectionSwitchSynchronous(null);
-                            lastWalletHeightMonitorUpdate = System.currentTimeMillis();
+                        synchronized (requestConnectionSwitchSynchronousLock) {
+                            if (isSyncing()) return; // active sync already has its own timeout
+                            if (System.currentTimeMillis() - lastWalletHeightMonitorUpdate >= WALLET_HEIGHT_MONITOR_PERIOD_SEC * 1000) {
+                                log.warn("Requesting connection change because main wallet height has not updated in over {} minutes", (double) WALLET_HEIGHT_MONITOR_PERIOD_SEC / (double) 60);
+                                xmrConnectionService.requestConnectionSwitch(null, this); // preserve normal listener handling instead of suppressing it
+                                lastWalletHeightMonitorUpdate = System.currentTimeMillis();
+                            }
                         }
                     } catch (Throwable t) {
                         log.warn("Error in wallet height monitor: {}\n", t.getMessage(), t);
@@ -1381,10 +1916,11 @@ public class XmrWalletService extends XmrWalletBase {
                     break;
                 } catch (Exception e) {
                     if (isShutDownStarted) return;
+                    if (accountService.isPasswordRecoveryRequired() || WalletPasswordChange.isPasswordError(e)) throw e;
                     log.warn("Error opening or creating main wallet, attempt={}/{}: {}", i + 1, MAX_SYNC_ATTEMPTS, e.getMessage());
                     if (i + 1 >= MAX_SYNC_ATTEMPTS) {
                         log.warn("Failed to open or create main wallet after {} attempts: {}", MAX_SYNC_ATTEMPTS, e.getMessage());
-                        return;
+                        throw e;
                     } else {
                         HavenoUtils.waitFor(INIT_WALLET_DELAY_MS); // wait before retrying
                     }
@@ -1404,18 +1940,19 @@ public class XmrWalletService extends XmrWalletBase {
                     // repeatedly attempt to sync wallet on startup, otherwise open application
                     long initialSyncTimeoutMs = getInitialSyncTimeoutMs();
                     for (int i = 0; i < MAX_SYNC_ATTEMPTS; i++) {
+                        MoneroRpcConnection sourceConnection = xmrConnectionService.getConnection();
                         try {
                             doPollWallet(initialSyncTimeoutMs);
                             break;
-                        } catch (Exception e) {
+                        } catch (Exception e) { // error is logged when polling
                             if (isShutDownStarted) return;
-                            log.warn("Error polling main wallet on startup, attempt={}/{}: {}", i + 1, MAX_SYNC_ATTEMPTS, e.getMessage());
                             if (i + 1 >= MAX_SYNC_ATTEMPTS) {
-                                log.warn("Opening application without syncing main wallet");
+                                log.warn("Opening application without syncing main wallet after {} attempts, last monerod={}, last error: {}", MAX_SYNC_ATTEMPTS, sourceConnection == null ? null : sourceConnection.getUri(), e.getMessage());
                                 HavenoUtils.setTopError("Could not sync main wallet on startup.\n\nError: " + e.getMessage());
                                 UserThread.execute(() -> onWalletServiceInitialized());
                             } else {
                                 initialSyncTimeoutMs = Math.min(XmrWalletBase.SYNC_TIMEOUT_MS, initialSyncTimeoutMs * 2);
+                                log.warn("Retrying to sync main wallet on startup in {}s, attempt={}/{}, last monerod={}, last error: {}", INIT_WALLET_DELAY_MS / 1000, i + 2, MAX_SYNC_ATTEMPTS, sourceConnection == null ? null : sourceConnection.getUri(), e.getMessage());
                                 HavenoUtils.waitFor(INIT_WALLET_DELAY_MS); // wait before retrying
                             }
                         }
@@ -1448,6 +1985,7 @@ public class XmrWalletService extends XmrWalletBase {
     }
 
     private MoneroWalletFull createWalletFull(MoneroWalletConfig config, boolean applyProxyUri) {
+        awaitPendingWalletClose(config.getPath());
 
         // must be connected to daemon
         if (!Boolean.TRUE.equals(xmrConnectionService.isConnected())) throw new RuntimeException("Must be connected to daemon before creating wallet");
@@ -1458,116 +1996,65 @@ public class XmrWalletService extends XmrWalletBase {
 
             // configure wallet connection
             MoneroRpcConnection connection = new MoneroRpcConnection(xmrConnectionService.getConnection());
-            if (!applyProxyUri) connection.setProxyUri(null);
+            xmrConnectionService.applyWalletProxyUri(connection, getWalletName(config.getPath()), applyProxyUri);
 
             // create wallet
-            log.debug("Creating full wallet '{}' with monerod={}, proxyUri={}", config.getPath(), connection.getUri(), connection.getProxyUri());
+            log.debug("Creating full wallet '{}' with monerod={}, proxyUri={}", Utilities.redactSensitiveInfo(config.getPath()), connection.getUri(), connection.getProxyUri());
             long time = System.currentTimeMillis();
             config.setServer(connection);
             walletFull = MoneroWalletFull.createWallet(config);
             walletFull.getDaemonConnection().setPrintStackTrace(PRINT_RPC_STACK_TRACE);
-            log.info("Done creating full wallet " + config.getPath() + " in " + (System.currentTimeMillis() - time) + " ms");
+            log.info("Done creating full wallet " + Utilities.redactSensitiveInfo(config.getPath()) + " in " + (System.currentTimeMillis() - time) + " ms");
             return walletFull;
         } catch (Exception e) {
-            String errorMsg = "Could not create wallet '" + config.getPath() + "': " + e.getMessage();
+            String errorMsg = "Could not create wallet '" + Utilities.redactSensitiveInfo(config.getPath()) + "': " + e.getMessage();
+            if (WalletPasswordChange.isPasswordError(e)) {
+                UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                errorMsg += ". Close Haveno and run the recovery tool with the passwords used during the failed change; see docs/password-recovery.md";
+            }
             log.warn(errorMsg + "\n", e);
             if (walletFull != null) forceCloseWallet(walletFull, config.getPath());
-            throw new IllegalStateException(errorMsg);
+            throw new WalletUnavailableException(errorMsg, e);
         }
     }
 
     private MoneroWalletFull openWalletFull(MoneroWalletConfig config, boolean applyProxyUri) {
+        awaitPendingWalletClose(config.getPath());
         MoneroWalletFull walletFull = null;
         try {
 
             // configure wallet connection
             MoneroRpcConnection connection = new MoneroRpcConnection(xmrConnectionService.getConnection());
-            if (!applyProxyUri) connection.setProxyUri(null);
+            xmrConnectionService.applyWalletProxyUri(connection, getWalletName(config.getPath()), applyProxyUri);
 
             // try opening wallet
             config.setNetworkType(getMoneroNetworkType());
             config.setServer(connection);
-            log.debug("Opening full wallet '{}' with monerod={}, proxyUri={}", config.getPath(), connection.getUri(), connection.getProxyUri());
+            log.debug("Opening full wallet '{}' with monerod={}, proxyUri={}", Utilities.redactSensitiveInfo(config.getPath()), connection.getUri(), connection.getProxyUri());
             try {
                 walletFull = MoneroWalletFull.openWallet(config);
-            } catch (Exception e) {
-                if (isShutDownStarted) throw e;
-                log.warn("Failed to open full wallet '{}', attempting to use backup cache files, error={}", config.getPath(), e.getMessage());
-                boolean retrySuccessful = false;
-                try {
-                    
-                    // rename wallet cache to backup
-                    String cachePath = walletDir.toString() + File.separator + getWalletName(config.getPath());
-                    File originalCacheFile = new File(cachePath);
-                    if (originalCacheFile.exists()) originalCacheFile.renameTo(new File(cachePath + ".backup"));
-
-                    // try opening wallet with backup cache files in descending order
-                    List<File> backupCacheFiles = FileUtil.getBackupFiles(walletDir, getWalletName(config.getPath()));
-                    Collections.reverse(backupCacheFiles);
-                    for (File backupCacheFile : backupCacheFiles) {
-                        try {
-                            FileUtil.copyFile(backupCacheFile, new File(cachePath));
-                            walletFull = MoneroWalletFull.openWallet(config);
-                            log.warn("Successfully opened full wallet using backup cache");
-                            retrySuccessful = true;
-                            break;
-                        } catch (Exception e2) {
-
-                            // delete cache file if failed to open
-                            File cacheFile = new File(cachePath);
-                            if (cacheFile.exists()) cacheFile.delete();
-                            File unportableCacheFile = new File(cachePath + ".unportable");
-                            if (unportableCacheFile.exists()) unportableCacheFile.delete();
-                        }
-                    }
-
-                    // handle success or failure
-                    File originalCacheBackup = new File(cachePath + ".backup");
-                    if (retrySuccessful) {
-                        if (originalCacheBackup.exists()) originalCacheBackup.delete(); // delete original wallet cache backup
-                    } else {
-
-                        // retry opening wallet after cache deleted
-                        try {
-                            log.warn("Failed to open full wallet '{}' using backup cache files, retrying with cache deleted", config.getPath());
-                            walletFull = MoneroWalletFull.openWallet(config);
-                            log.warn("Successfully opened full wallet after cache deleted");
-                            retrySuccessful = true;
-                        } catch (Exception e2) {
-                            // ignore
-                        }
-
-                        // handle success or failure
-                        if (retrySuccessful) {
-                            if (originalCacheBackup.exists()) originalCacheBackup.delete(); // delete original wallet cache backup
-                        } else {
-    
-                            // restore original wallet cache
-                            log.warn("Failed to open full wallet '{}' after deleting cache, restoring original cache", config.getPath());
-                            File cacheFile = new File(cachePath);
-                            if (cacheFile.exists()) cacheFile.delete();
-                            if (originalCacheBackup.exists()) originalCacheBackup.renameTo(new File(cachePath));
-    
-                            // throw original exception
-                            throw e;
-                        }
-                    }
-                } catch (Exception e2) {
-                    throw e; // throw original exception
-                }
+            } catch (Throwable e) {
+                // preserve the original cache; a split password can look like corrupt serialized data
+                UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                throw e;
             }
             if (walletFull.getDaemonConnection() != null) walletFull.getDaemonConnection().setPrintStackTrace(PRINT_RPC_STACK_TRACE);
-            log.info("Done opening full wallet " + config.getPath());
+            log.debug("Done opening full wallet " + Utilities.redactSensitiveInfo(config.getPath()));
             return walletFull;
-        } catch (Exception e) {
-            String errorMsg = "Could not open full wallet '" + config.getPath() + "': " + e.getMessage();
+        } catch (Throwable e) {
+            String errorMsg = "Could not open full wallet '" + Utilities.redactSensitiveInfo(config.getPath()) + "': " + e.getMessage();
+            if (WalletPasswordChange.isPasswordError(e)) {
+                UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                errorMsg += ". Close Haveno and run the recovery tool with the passwords used during the failed change; see docs/password-recovery.md";
+            }
             log.warn(errorMsg + "\n", e);
             if (walletFull != null) forceCloseWallet(walletFull, config.getPath());
-            throw new IllegalStateException(errorMsg);
+            if (e instanceof Error) throw (Error) e;
+            throw new WalletUnavailableException(errorMsg + ". Wallet files were preserved; use password recovery if a change was interrupted", e);
         }
     }
 
-    private MoneroWalletRpc createWalletRpc(MoneroWalletConfig config, Integer port, boolean applyProxyUri) {
+    private MoneroWalletRpc createWalletRpc(MoneroWalletConfig config, Integer port, boolean applyProxyUri, boolean trustDaemon) {
 
         // must be connected to daemon
         if (!Boolean.TRUE.equals(xmrConnectionService.isConnected())) throw new RuntimeException("Must be connected to daemon before creating wallet");
@@ -1582,7 +2069,7 @@ public class XmrWalletService extends XmrWalletBase {
 
             // configure wallet connection
             MoneroRpcConnection connection = new MoneroRpcConnection(serviceConnection);
-            if (!applyProxyUri) connection.setProxyUri(null);
+            xmrConnectionService.applyWalletProxyUri(connection, getWalletName(config.getPath()), applyProxyUri);
 
             // start monero-wallet-rpc instance
             walletRpc = startWalletRpcInstance(port, connection);
@@ -1595,19 +2082,19 @@ public class XmrWalletService extends XmrWalletBase {
             if (isShutDownStarted) throw new IllegalStateException("Cannot create wallet '" + config.getPath() + "' because shutdown is started");
             log.info("Creating RPC wallet '{}' with monerod={}, proxyUri={}", config.getPath(), connection.getUri(), connection.getProxyUri());
             long time = System.currentTimeMillis();
-            config.setServer(connection);
             walletRpc.createWallet(config);
+            setDaemonConnection(walletRpc, connection, trustDaemon);
             walletRpc.getDaemonConnection().setPrintStackTrace(PRINT_RPC_STACK_TRACE);
             log.info("Done creating RPC wallet " + config.getPath() + " in " + (System.currentTimeMillis() - time) + " ms");
             return walletRpc;
         } catch (Exception e) {
             if (walletRpc != null) forceCloseWallet(walletRpc, config.getPath());
             if (!isShutDownStarted) log.warn("Could not create RPC wallet '" + config.getPath() + "': " + e.getMessage() + "\n", e);
-            throw new IllegalStateException("Could not create wallet '" + config.getPath() + "'. Please close Haveno, stop all monero-wallet-rpc processes in your task manager, and restart Haveno.\n\nError message: " + e.getMessage(), e);
+            throw new WalletUnavailableException("Could not create wallet '" + config.getPath() + "'. Please close Haveno, stop all monero-wallet-rpc processes in your task manager, and restart Haveno.\n\nError message: " + e.getMessage(), e);
         }
     }
 
-    private MoneroWalletRpc openWalletRpc(MoneroWalletConfig config, Integer port, boolean applyProxyUri) {
+    private MoneroWalletRpc openWalletRpc(MoneroWalletConfig config, Integer port, boolean applyProxyUri, boolean trustDaemon) {
         MoneroWalletRpc walletRpc = null;
         try {
 
@@ -1617,7 +2104,7 @@ public class XmrWalletService extends XmrWalletBase {
 
             // configure wallet connection
             MoneroRpcConnection connection = new MoneroRpcConnection(serviceConnection);
-            if (!applyProxyUri) connection.setProxyUri(null);
+            xmrConnectionService.applyWalletProxyUri(connection, getWalletName(config.getPath()), applyProxyUri);
 
             // start monero-wallet-rpc instance
             walletRpc = startWalletRpcInstance(port, connection);
@@ -1629,94 +2116,64 @@ public class XmrWalletService extends XmrWalletBase {
             // try opening wallet
             if (isShutDownStarted) throw new IllegalStateException("Cannot open wallet '" + config.getPath() + "' because shutdown is started");
             log.debug("Opening RPC wallet '{}' with monerod={}, proxyUri={}", config.getPath(), connection.getUri(), connection.getProxyUri());
-            config.setServer(connection);
             try {
                 walletRpc.openWallet(config);
-            } catch (Exception e) {
-                if (isShutDownStarted) throw e;
-                log.warn("Failed to open RPC wallet '{}', attempting to use backup cache files, error={}", config.getPath(), e.getMessage());
-                boolean retrySuccessful = false;
-                try {
-                    
-                    // rename wallet cache to backup
-                    String cachePath = walletDir.toString() + File.separator + config.getPath();
-                    File originalCacheFile = new File(cachePath);
-                    if (originalCacheFile.exists()) originalCacheFile.renameTo(new File(cachePath + ".backup"));
-
-                    // try opening wallet with backup cache files in descending order
-                    List<File> backupCacheFiles = FileUtil.getBackupFiles(walletDir, config.getPath());
-                    Collections.reverse(backupCacheFiles);
-                    for (File backupCacheFile : backupCacheFiles) {
-                        try {
-                            FileUtil.copyFile(backupCacheFile, new File(cachePath));
-                            walletRpc.openWallet(config);
-                            log.warn("Successfully opened RPC wallet using backup cache");
-                            retrySuccessful = true;
-                            break;
-                        } catch (Exception e2) {
-
-                            // delete cache file if failed to open
-                            File cacheFile = new File(cachePath);
-                            if (cacheFile.exists()) cacheFile.delete();
-                            File unportableCacheFile = new File(cachePath + ".unportable");
-                            if (unportableCacheFile.exists()) unportableCacheFile.delete();
-                        }
-                    }
-
-                    // handle success or failure
-                    File originalCacheBackup = new File(cachePath + ".backup");
-                    if (retrySuccessful) {
-                        if (originalCacheBackup.exists()) originalCacheBackup.delete(); // delete original wallet cache backup
-                    } else {
-
-                        // retry opening wallet after cache deleted
-                        try {
-                            log.warn("Failed to open RPC wallet '{}' using backup cache files, retrying with cache deleted", config.getPath());
-                            walletRpc.openWallet(config);
-                            log.warn("Successfully opened RPC wallet after cache deleted");
-                            retrySuccessful = true;
-                        } catch (Exception e2) {
-                            // ignore
-                        }
-
-                        // handle success or failure
-                        if (retrySuccessful) {
-                            if (originalCacheBackup.exists()) originalCacheBackup.delete(); // delete original wallet cache backup
-                        } else {
-    
-                            // restore original wallet cache
-                            log.warn("Failed to open RPC wallet '{}' after deleting cache, restoring original cache", config.getPath());
-                            File cacheFile = new File(cachePath);
-                            if (cacheFile.exists()) cacheFile.delete();
-                            if (originalCacheBackup.exists()) originalCacheBackup.renameTo(new File(cachePath));
-    
-                            // throw original exception
-                            throw e;
-                        }
-                    }
-                } catch (Exception e2) {
-                    throw e; // throw original exception
-                }
+            } catch (Throwable e) {
+                // preserve the original cache; a split password can look like corrupt serialized data
+                UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                throw e;
             }
-            if (walletRpc.getDaemonConnection() != null) walletRpc.getDaemonConnection().setPrintStackTrace(PRINT_RPC_STACK_TRACE);
+            setDaemonConnection(walletRpc, connection, trustDaemon);
+            walletRpc.getDaemonConnection().setPrintStackTrace(PRINT_RPC_STACK_TRACE);
             log.debug("Done opening RPC wallet " + config.getPath());
             return walletRpc;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             if (walletRpc != null) forceCloseWallet(walletRpc, config.getPath());
+            if (e instanceof Error) throw (Error) e;
             if (!isShutDownStarted) log.warn("Could not open RPC wallet '{}': {}\n", config.getPath(), e.getMessage(), e);
-            throw new IllegalStateException("Could not open wallet '" + config.getPath() + "'. Please close Haveno, stop all monero-wallet-rpc processes in your task manager, and restart Haveno.\n\nError message: " + e.getMessage(), e);
+            if (WalletPasswordChange.isPasswordError(e)) {
+                UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                throw new WalletUnavailableException("Could not open wallet '" + config.getPath() + "': invalid password. Close Haveno and run the recovery tool with the passwords used during the failed change; see docs/password-recovery.md", e);
+            }
+            throw new WalletUnavailableException("Could not open wallet '" + config.getPath() + "'. Please close Haveno, stop all monero-wallet-rpc processes in your task manager, and restart Haveno.\n\nError message: " + e.getMessage(), e);
+        }
+    }
+
+    public ReadOnlyBooleanProperty passwordRecoveryRequiredProperty() {
+        return passwordRecoveryRequired.getReadOnlyProperty();
+    }
+
+    /** Install monero-wallet-rpc from resources if missing, or if updating and the resource differs. */
+    public static void maybeInstallMoneroWalletRpc(boolean update) {
+        try {
+            File walletRpcFile = new File(getMoneroWalletRpcPath());
+            String resourcePath = "bin/" + MONERO_WALLET_RPC_NAME;
+            if (!walletRpcFile.exists() || (update && !FileUtil.resourceEqualToFile(resourcePath, walletRpcFile))) {
+                log.info("Installing monero-wallet-rpc");
+                walletRpcFile.getParentFile().mkdirs();
+                FileUtil.resourceToFile(resourcePath, walletRpcFile);
+                walletRpcFile.setExecutable(true);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to install monero-wallet-rpc: {}\n", e.getMessage(), e);
         }
     }
 
     private MoneroWalletRpc startWalletRpcInstance(Integer port, MoneroRpcConnection connection) {
 
+        // install monero-wallet-rpc if missing (e.g. validating a seed before initial setup)
+        maybeInstallMoneroWalletRpc(false);
+
         // check if monero-wallet-rpc exists
-        if (!new File(MONERO_WALLET_RPC_PATH).exists()) throw new RuntimeException("monero-wallet-rpc executable doesn't exist at path " + MONERO_WALLET_RPC_PATH
-                + "; copy monero-wallet-rpc to the project root or set WalletConfig.java MONERO_WALLET_RPC_PATH for your system");
+        if (!new File(getMoneroWalletRpcPath()).exists()) {
+            String errorMessage = "monero-wallet-rpc executable doesn't exist at path " + Utilities.redactSensitiveInfo(getMoneroWalletRpcPath());
+            if (Utilities.isWindows()) errorMessage += ". It may have been quarantined by antivirus software; remove it from quarantine and mark it as safe, then restart Haveno";
+            throw new RuntimeException(errorMessage);
+        }
 
         // build command to start monero-wallet-rpc
         List<String> cmd = new ArrayList<>(Arrays.asList( // modifiable list
-                MONERO_WALLET_RPC_PATH,
+                getMoneroWalletRpcPath(),
                 "--rpc-login",
                 MONERO_WALLET_RPC_USERNAME + ":" + MONERO_WALLET_RPC_DEFAULT_PASSWORD,
                 "--wallet-dir", walletDir.toString()));
@@ -1724,6 +2181,11 @@ public class XmrWalletService extends XmrWalletBase {
         // omit --mainnet flag since it does not exist
         if (MONERO_NETWORK_TYPE != MoneroNetworkType.MAINNET) {
             cmd.add("--" + MONERO_NETWORK_TYPE.toString().toLowerCase());
+        }
+
+        // testnet may use custom hard fork heights
+        if (MONERO_NETWORK_TYPE == MoneroNetworkType.TESTNET) {
+            cmd.add("--allow-mismatched-daemon-version");
         }
 
         // set connection flags
@@ -1743,6 +2205,8 @@ public class XmrWalletService extends XmrWalletBase {
                 cmd.add("--daemon-login");
                 cmd.add(connection.getUsername() + ":" + connection.getPassword());
             }
+        } else {
+            cmd.add("--offline");
         }
         if (port != null && port > 0) {
             cmd.add("--rpc-bind-port");
@@ -1759,7 +2223,7 @@ public class XmrWalletService extends XmrWalletBase {
 
             // configure wallet connection
             connection = new MoneroRpcConnection(xmrConnectionService.getConnection());
-            if (!isProxyApplied()) connection.setProxyUri(null);
+            xmrConnectionService.applyWalletProxyUri(connection, MONERO_WALLET_NAME, isProxyApplied());
 
             // ignore if no change
             if (HavenoUtils.connectionConfigsEqual(connection, wallet.getDaemonConnection())) {
@@ -1777,7 +2241,7 @@ public class XmrWalletService extends XmrWalletBase {
                 initMainWallet();
                 return; // wallet re-initializes off thread
             } else {
-                wallet.setDaemonConnection(connection);
+                setDaemonConnection(wallet, connection, xmrConnectionService.isTrustedDaemon());
             }
 
             // update poll period
@@ -1791,34 +2255,172 @@ public class XmrWalletService extends XmrWalletBase {
     }
 
     private void changeWalletPasswords(String oldPassword, String newPassword) {
-
-        // create task to change main wallet password
-        List<Runnable> tasks = new ArrayList<Runnable>();
-        tasks.add(() -> {
+        Set<String> remaining = new HashSet<>();
+        synchronized (walletLock) {
+            walletLifecycleLock.writeLock().lock();
             try {
-                wallet.changePassword(oldPassword, newPassword);
-                saveWallet();
-            } catch (Exception e) {
-                log.warn("Error changing main wallet password: " + e.getMessage() + "\n", e);
+                // finish wallet creations and main-wallet replacement before taking the disk snapshot
+                File[] files = walletDir.listFiles((dir, name) -> name.endsWith(KEYS_FILE_POSTFIX));
+                if (files == null) throw new IllegalStateException("Cannot enumerate wallet keys for password change");
+                for (File file : files) remaining.add(file.getName().substring(0, file.getName().length() - KEYS_FILE_POSTFIX.length()));
+                Set<String> pending = ConcurrentHashMap.newKeySet();
+                pending.addAll(remaining);
+                passwordChange = new PasswordChange(normalizeWalletPassword(oldPassword), normalizeWalletPassword(newPassword), pending, ConcurrentHashMap.newKeySet(),
+                        new File(walletDir, "backup/password-change-" + UUID.randomUUID()));
+            } finally {
+                walletLifecycleLock.writeLock().unlock();
+            }
+            remaining.remove(MONERO_WALLET_NAME);
+            remaining.remove(MONERO_WALLET_NAME + "_restore"); // owned by the main wallet lock
+            remaining.remove(MONERO_WALLET_NAME + "_seed_validation"); // temporary, random-password validation wallet
+            try {
+                if (walletExists(MONERO_WALLET_NAME)) {
+                    boolean trustDaemon = wallet != null && xmrConnectionService.isTrustedDaemon(wallet.getDaemonConnection());
+                    changeWalletPassword(MONERO_WALLET_NAME, wallet, newPassword, trustDaemon);
+                }
+            } catch (Throwable e) {
+                if (accountService.isPasswordRecoveryRequired()) {
+                    wallet = null;
+                    stopPolling();
+                }
                 throw e;
             }
-        });
+            String restoreName = MONERO_WALLET_NAME + "_restore";
+            if (walletExists(restoreName)) changeWalletPassword(restoreName, null, newPassword, false);
+        }
+        for (Trade trade : HavenoUtils.tradeManager.getAllTrades()) {
+            remaining.remove(trade.getWalletName());
+            trade.changeWalletPassword(newPassword);
+        }
+        for (String walletName : remaining) {
+            walletLifecycleLock.writeLock().lock();
+            try {
+                // a trade can delete its wallet and unregister after the disk snapshot
+                if (!walletExists(walletName) && !new File(walletDir, walletName).exists()) continue;
+                try {
+                    changeWalletPassword(walletName, null, newPassword, false);
+                } catch (Throwable e) {
+                    // wallets outside current trades may predate earlier password changes, which only re-keyed trade wallets
+                    if (accountService.isPasswordRecoveryRequired() || !WalletPasswordChange.isPasswordError(e)) throw e;
+                    log.warn("Skipping password change for wallet {} which does not open with the current password", walletName);
+                    passwordChange.skipped().add(walletName);
+                }
+            } finally {
+                walletLifecycleLock.writeLock().unlock();
+            }
+        }
+        log.info("Done changing all wallet passwords");
+    }
 
-        // create tasks to change trade wallet passwords
-        List<Trade> trades = HavenoUtils.tradeManager.getAllTrades();
-        for (Trade trade : trades) {
-            tasks.add(() -> {
-                synchronized (trade.getWalletLock()) {
-                    if (trade.walletExists()) {
-                        trade.changeWalletPassword(oldPassword, newPassword); // TODO (woodser): this unnecessarily connects and syncs unopen wallets and leaves open
+    private static String normalizeWalletPassword(String password) {
+        return WalletPasswordChange.normalizePassword(password);
+    }
+
+    public boolean isPasswordRecoveryRequired() {
+        return accountService.isPasswordRecoveryRequired();
+    }
+
+    // the caller holds the owning wallet lock; temporary handles never start trade polling or synchronization
+    public void changeWalletPassword(String walletName, MoneroWallet openWallet, String newPassword, boolean trustDaemon) {
+        if (isShutDownStarted) throw new IllegalStateException("Cannot change wallet password because shutdown has started");
+        String current = getWalletPassword(walletName);
+        String target = normalizeWalletPassword(newPassword);
+        MoneroWallet temporary = null;
+        Throwable failure = null;
+        boolean opened = openWallet != null;
+        try {
+            MoneroWallet changing = openWallet;
+            if (changing == null) {
+                if (!new File(walletDir, walletName).isFile()) {
+                    throw new IllegalStateException("Wallet cache is missing for " + walletName
+                            + ". Restore its cache from backup or use password recovery before changing the password");
+                }
+                MoneroWalletConfig config = getWalletConfig(walletName).setPassword(current);
+                if (isNativeLibraryApplied()) {
+                    awaitPendingWalletClose(config.getPath());
+                    temporary = MoneroWalletFull.openWallet(config);
+                } else {
+                    MoneroWalletRpc rpc = startWalletRpcInstance(null, null);
+                    temporary = rpc;
+                    rpc.stopSyncing();
+                    rpc.openWallet(config);
+                }
+                changing = temporary;
+                opened = true;
+            }
+            PasswordChange change = passwordChange;
+            File backupDir = change == null ? new File(walletDir, "backup/password-change-" + UUID.randomUUID()) : change.backupDir();
+            backupWalletForPasswordChange(changing, walletName, current, backupDir, trustDaemon, false);
+            changing.changePassword(current, target); // stores the keys and cache
+            backupWalletForPasswordChange(changing, walletName, target, backupDir, trustDaemon, true);
+            if (passwordChange != null) passwordChange.remaining().remove(walletName);
+        } catch (Throwable e) {
+            failure = e;
+            if (opened || !WalletPasswordChange.isPasswordError(e)) accountService.requirePasswordRecovery(); // a rejected open leaves the wallet unchanged
+            if (openWallet != null) forceCloseWallet(openWallet, getWalletPath(walletName));
+            throw e;
+        } finally {
+            if (temporary != null && !opened) {
+                forceCloseWallet(temporary, getWalletPath(walletName)); // stop an RPC instance whose open was rejected
+            } else if (temporary != null) {
+                try {
+                    closeWallet(temporary, false);
+                } catch (Exception closeError) {
+                    accountService.requirePasswordRecovery();
+                    forceCloseWallet(temporary, getWalletPath(walletName));
+                    if (failure == null) throw closeError;
+                    if (failure != closeError) failure.addSuppressed(closeError);
+                }
+            }
+        }
+    }
+
+    // the caller holds the owning wallet lock; never open a second descriptor for a live native keys file
+    // stored indicates the wallet files already reflect its in-memory state
+    private void backupWalletForPasswordChange(MoneroWallet changing, String walletName, String password, File backupDir, boolean trustDaemon, boolean stored) {
+        try {
+            byte[][] data;
+            if (changing instanceof MoneroWalletFull) {
+                data = ((MoneroWalletFull) changing).getData();
+            } else if (changing instanceof MoneroWalletRpc) {
+                MoneroWalletRpc rpc = (MoneroWalletRpc) changing;
+                List<MoneroWalletListenerI> listeners = new ArrayList<>(rpc.getListeners());
+                MoneroRpcConnection connection = rpc.getDaemonConnection();
+                if (!stored) rpc.changePassword(password, password); // rewrite keys so in-memory state such as the multisig flag survives the reopen
+                // progress polling uses this handle's monitor without needing the owning wallet lock
+                synchronized (rpc) {
+                    rpc.close(false); // Windows denies access to an open RPC wallet's keys file
+                    try {
+                        Path keys = new File(walletDir, walletName + KEYS_FILE_POSTFIX).toPath();
+                        Path cache = new File(walletDir, walletName).toPath();
+                        FileUtil.syncFileAndDirectory(keys);
+                        FileUtil.syncFileAndDirectory(cache);
+                        data = new byte[][] { Files.readAllBytes(keys), Files.readAllBytes(cache) };
+                    } finally {
+                        rpc.openWallet(new MoneroWalletConfig().setPath(walletName).setPassword(password));
+                        if (connection != null) setDaemonConnection(rpc, connection, trustDaemon);
+                        for (MoneroWalletListenerI listener : listeners) rpc.addListener(listener);
                     }
                 }
-            });
+            } else {
+                throw new IllegalArgumentException("Unsupported wallet backend");
+            }
+            Files.createDirectories(backupDir.toPath());
+            FileUtil.writeAtomically(new File(backupDir, walletName).toPath(), data[1]);
+            FileUtil.writeAtomically(new File(backupDir, walletName + KEYS_FILE_POSTFIX).toPath(), data[0]);
+            // a seed restore can reuse the main-wallet filename for a different wallet
+            if (MONERO_WALLET_NAME.equals(walletName)) {
+                String address = changing.getPrimaryAddress();
+                if (address != null) FileUtil.writeAtomically(new File(backupDir, WalletPasswordChange.MAIN_WALLET_ID_FILE).toPath(), WalletPasswordChange.getMainWalletId(address).getBytes(StandardCharsets.UTF_8));
+            }
+            FileUtil.syncDirectory(backupDir.getParentFile().toPath());
+            FileUtil.syncDirectory(walletDir.toPath());
+            // wallet2 canonicalizes the cache path when rekeying, including for keys-only native wallets
+            Path cache = new File(walletDir, walletName).toPath();
+            if (!Files.exists(cache)) FileUtil.writeAtomically(cache, data[1]);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not preserve recovery copies for wallet " + walletName, e);
         }
-
-        // execute tasks in parallel
-        ThreadUtils.awaitTasks(tasks, Math.min(10, 1 + trades.size()));
-        log.info("Done changing all wallet passwords");
     }
 
     private MoneroWallet openOrCreateMainWallet() {
@@ -1828,23 +2430,39 @@ public class XmrWalletService extends XmrWalletBase {
             try {
 
                 // open or create wallet
+                long time = System.currentTimeMillis();
                 MoneroDaemonRpc monerod = xmrConnectionService.getMonerod();
                 boolean isProxyApplied = isProxyApplied();
                 log.info("Initializing main wallet with monerod=" + (monerod == null ? "null" : monerod.getRpcConnection().getUri()) + ", proxyUri=" + (monerod == null || !isProxyApplied ? "null" : monerod.getRpcConnection().getProxyUri()));
+                completeInterruptedRestore(); // else a new wallet would be created
                 if (walletExists(MONERO_WALLET_NAME)) {
-                    wallet = openWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied);
+                    wallet = openWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied, xmrConnectionService.isTrustedDaemon());
                 } else {
                     if (!Boolean.TRUE.equals(xmrConnectionService.isConnected())) throw new RuntimeException("Cannot create main wallet because there is no connection to Monero daemon");
-                    wallet = createWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied);
+                    String importSeed = accountService.getWalletImportSeed();
+                    if (importSeed == null) {
+                        wallet = createWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied, xmrConnectionService.isTrustedDaemon());
 
-                    // set wallet creation date to yesterday to guarantee complete restore
-                    LocalDateTime localDateTime = LocalDate.now().atStartOfDay().minusDays(1);
-                    long date = localDateTime.toEpochSecond(ZoneOffset.UTC);
-                    user.setWalletCreationDate(date);
+                        // set wallet creation date to yesterday to guarantee complete restore
+                        LocalDateTime localDateTime = LocalDate.now().atStartOfDay().minusDays(1);
+                        long date = localDateTime.toEpochSecond(ZoneOffset.UTC);
+                        user.setWalletCreationDate(date);
+                    } else {
+
+                        // import wallet from seed with the user's restore height, estimated offline from a restore date
+                        Long importHeight = accountService.getWalletImportRestoreHeight();
+                        LocalDate importDate = accountService.getWalletImportRestoreDate();
+                        if (importHeight == null && importDate != null) importHeight = estimateHeightForDate(importDate);
+                        long restoreHeight = importHeight == null ? 0 : importHeight;
+                        walletRestoreHeight = restoreHeight;
+                        wallet = createWalletFromSeed(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied, xmrConnectionService.isTrustedDaemon(), importSeed, restoreHeight);
+                        user.setWalletCreationDate(estimateHeightTimestamp(restoreHeight));
+                        accountService.setWalletImportDetails(null, null, null);
+                    }
                 }
 
-                // set state from wallet
-                walletHeight.set(wallet.getHeight());
+                // set state from wallet, reporting the restore height while syncing towards it
+                walletHeight.set(Math.max(wallet.getHeight(), getSyncFromHeight()));
                 cacheWalletInfo();
                 resetIfWalletChanged();
 
@@ -1854,10 +2472,11 @@ public class XmrWalletService extends XmrWalletBase {
                     closeMainWallet();
                     doBackupWallet();
                     log.info("Reopening main wallet with monerod=" + (monerod == null ? "null" : monerod.getRpcConnection().getUri()) + ", proxyUri=" + (monerod == null || !isProxyApplied ? "null" : monerod.getRpcConnection().getProxyUri()));
-                    wallet = openWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied);
+                    wallet = openWallet(MONERO_WALLET_NAME, rpcBindPort, isProxyApplied, xmrConnectionService.isTrustedDaemon());
                 } else {
                     doBackupWallet();
                 }
+                log.info("Done initializing main wallet in " + (System.currentTimeMillis() - time) + " ms");
             } catch (Exception e) {
                 log.warn("Error initializing main wallet: {}\n", e.getMessage(), e);
                 throw e;
@@ -1882,7 +2501,8 @@ public class XmrWalletService extends XmrWalletBase {
         closeMainWallet(false);
     }
 
-    private void closeMainWallet(boolean stopPolling) {
+    // Close and save the main wallet, returning false if it could not be closed.
+    private boolean closeMainWallet(boolean stopPolling) {
         synchronized (walletLock) {
             if (stopPolling) stopPolling();
             try {
@@ -1891,13 +2511,16 @@ public class XmrWalletService extends XmrWalletBase {
                     closeWallet(wallet, true);
                     wallet = null;
                 }
+                return true;
             } catch (Exception e) {
                 log.warn("Error closing main wallet: {}. Was Haveno stopped manually with ctrl+c?", e.getMessage());
+                return false;
             }
         }
     }
 
     private void forceCloseMainWallet() {
+        log.warn("Force closing main wallet");
         stopPolling();
         if (wallet != null) {
             MoneroWallet walletRef = wallet;
@@ -1914,7 +2537,20 @@ public class XmrWalletService extends XmrWalletBase {
 
     public void handleMainWalletError(Exception e, MoneroRpcConnection sourceConnection, int numAttempts) {
         if (HavenoUtils.isUnresponsive(e)) forceCloseMainWallet(); // wallet can be stuck a while
-        if (numAttempts % TradeProtocol.REQUEST_CONNECTION_SWITCH_EVERY_NUM_ATTEMPTS == 0) requestConnectionSwitchSynchronous(sourceConnection); // request connection switch every n attempts
+        // bounded transaction retries can exhaust their attempts before the normal switch cooldown expires
+        if (numAttempts % TradeProtocol.REQUEST_CONNECTION_SWITCH_EVERY_NUM_ATTEMPTS == 0) requestConnectionSwitchSynchronous(sourceConnection, true);
+
+        // transaction retries hold walletLock, so apply even a concurrent switch whose listener is waiting on that lock
+        if (!isShutDownStarted && accountService.isAccountOpen()) {
+            MoneroRpcConnection connection = xmrConnectionService.getConnection();
+            if (connection != null) {
+                try {
+                    onConnectionChanged(connection);
+                } catch (Exception connectionError) {
+                    log.warn("Error applying connection to main wallet during transaction retry: {}", connectionError.getMessage());
+                }
+            }
+        }
         initMainWallet();
     }
 
@@ -1981,6 +2617,21 @@ public class XmrWalletService extends XmrWalletBase {
         doPollWallet();
     }
 
+    // height syncing begins from: the restore height when it is ahead of the wallet height
+    @Override
+    protected long getSyncFromHeight() {
+        Long restoreHeight = walletRestoreHeight; // mixed long/Long ternary would unbox and NPE when null
+        if (wallet instanceof MoneroWalletFull) restoreHeight = ((MoneroWalletFull) wallet).getRestoreHeight();
+        if (restoreHeight == null && user.getWalletCreationDate() > 0) {
+
+            // recover the restore height from the wallet creation date, which encodes it
+            restoreHeight = estimateTimestampHeight(user.getWalletCreationDate());
+            Long targetHeight = xmrConnectionService.getTargetHeight();
+            if (targetHeight != null) restoreHeight = Math.min(restoreHeight, targetHeight);
+        }
+        return restoreHeight == null ? walletHeight.get() : Math.max(walletHeight.get(), restoreHeight);
+    }
+
     public void doPollWallet() {
         doPollWallet(null);
     }
@@ -2006,6 +2657,7 @@ public class XmrWalletService extends XmrWalletBase {
         }
 
         // poll wallet
+        boolean pollFailed = false;
         try {
 
             // test sync error on startup
@@ -2043,7 +2695,7 @@ public class XmrWalletService extends XmrWalletBase {
             // sync wallet if first sync or behind daemon
             boolean isFirstSync = !wasWalletSynced;
             if (isFirstSync || walletHeight.get() < xmrConnectionService.getTargetHeight() - 1) {
-                if (isFirstSync) log.info("Syncing main wallet from height " + walletHeight.get());
+                if (isFirstSync) log.info("Syncing main wallet from height " + getSyncFromHeight());
                 long startTime = System.currentTimeMillis();
                 syncWithProgress(initialSyncTimeoutMs);
                 if (isFirstSync) log.info("Done syncing main wallet in " + (System.currentTimeMillis() - startTime) + " ms");
@@ -2051,26 +2703,34 @@ public class XmrWalletService extends XmrWalletBase {
 
             // fetch transactions and store to cache
             // TODO: ideally wallet should sync every poll and then avoid updating from pool on fetching txs?
-            synchronized (HavenoUtils.getDaemonLock()) {
-                if (lastPollTxsTimestamp == 0) lastPollTxsTimestamp = System.currentTimeMillis(); // set initial timestamp
+            synchronized (walletLock) { // lock wallet to prevent concurrent close
+                if (wallet == null || isShutDownStarted) return;
+                ReentrantLock daemonLock = HavenoUtils.acquireDaemonLock();
                 try {
-                    cachedTxs = wallet.getTxs(new MoneroTxQuery().setIncludeOutputs(true));
-                    lastPollTxsTimestamp = System.currentTimeMillis();
-                } catch (Exception e) { // fetch from pool can fail
-                    if (!isShutDownStarted && wallet == sourceWallet) {
+                    if (lastPollTxsTimestamp == 0) lastPollTxsTimestamp = System.currentTimeMillis(); // set initial timestamp
+                    try {
+                        cachedTxs = wallet.getTxs(new MoneroTxQuery().setIncludeOutputs(true));
+                        lastPollTxsTimestamp = System.currentTimeMillis();
+                    } catch (Exception e) { // fetch from pool can fail
+                        if (!isShutDownStarted && wallet == sourceWallet) {
 
-                        // throttle error handling
-                        if (!logPollErrorRateThrottler.onEvent().throttled) {
-                            log.warn("Error polling main wallet's transactions from the pool: {}", e.getMessage());
-                            if (System.currentTimeMillis() - lastPollTxsTimestamp > POLL_TXS_TOLERANCE_MS) ThreadUtils.submitToPool(() -> requestConnectionSwitchSynchronous(sourceConnection));
+                            // throttle error handling
+                            if (!logPollErrorRateThrottler.onEvent().throttled) {
+                                log.warn("Error polling main wallet's transactions from the pool: {}", e.getMessage());
+                                if (System.currentTimeMillis() - lastPollTxsTimestamp > POLL_TXS_TOLERANCE_MS) ThreadUtils.submitToPool(() -> requestConnectionSwitchSynchronous(sourceConnection));
+                            }
                         }
                     }
+                } finally {
+                    HavenoUtils.releaseDaemonLock(daemonLock);
                 }
             }
 
             // handle sucessful sync before wallet service initialized
             if (isFirstSync || (wasWalletSynced && !isWalletServiceInitialized())) onFirstSync();
+            resetDisconnectionTracking();
         } catch (Exception e) {
+            pollFailed = true;
 
             // skip error handling if shut down or another thread force restarts while polling
             if (isShutDownStarted || wallet == null || wallet != sourceWallet) return;
@@ -2084,13 +2744,13 @@ public class XmrWalletService extends XmrWalletBase {
                 }
             }
 
-            // handle unresponsive wallet
+            // force close wallet if unresponsive
             if (HavenoUtils.isUnresponsive(e)) {
                 forceCloseMainWallet();
             }
 
-            // request connection switch
-            if (!isWalletServiceInitialized() || HavenoUtils.isUnresponsive(e)) {
+            // request connection switch when uninitialized, unresponsive, or disconnected beyond a grace period
+            if (!isWalletServiceInitialized() || HavenoUtils.isUnresponsive(e) || isSustainedDisconnection(e)) {
                 requestConnectionSwitchSynchronous(sourceConnection);
             }
 
@@ -2105,9 +2765,9 @@ public class XmrWalletService extends XmrWalletBase {
             }
             requestSaveWalletIfElapsedTime();
 
-            // cache wallet info last
+            // cache wallet info last unless poll failed
             synchronized (walletLock) {
-                if (wallet != null && !isShutDownStarted) {
+                if (!pollFailed && wallet != null && !isShutDownStarted) {
                     try {
                         cacheWalletInfo();
                     } catch (Exception e) {
@@ -2167,10 +2827,14 @@ public class XmrWalletService extends XmrWalletBase {
     }
 
     public boolean requestConnectionSwitchSynchronous(MoneroRpcConnection sourceConnection) {
+        return requestConnectionSwitchSynchronous(sourceConnection, false);
+    }
+
+    private boolean requestConnectionSwitchSynchronous(MoneroRpcConnection sourceConnection, boolean skipCooldown) {
         synchronized (requestConnectionSwitchSynchronousLock) {
             isProcessingRequestConnectionSwitchSynchronous = true;
             try {
-                if (xmrConnectionService.requestConnectionSwitch(sourceConnection)) {
+                if (xmrConnectionService.requestConnectionSwitch(sourceConnection, this, skipCooldown)) {
                     onConnectionChanged(xmrConnectionService.getConnection()); // handle connection change on same thread
                     return true;
                 }
@@ -2190,11 +2854,12 @@ public class XmrWalletService extends XmrWalletBase {
 
     private void cacheWalletInfo() {
         synchronized (walletLock) {
+            MoneroWallet wallet = this.wallet; // snapshot because a concurrent force close can null the field without walletLock
             if (wallet == null) {
                 log.warn("Cannot cache wallet info because wallet is null");
                 return;
             }
-            
+
             // get basic wallet info
             long height = wallet.getHeight();
             BigInteger balance = wallet.getBalance();

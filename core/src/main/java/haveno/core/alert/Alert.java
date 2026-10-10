@@ -29,11 +29,13 @@ import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
+import org.bitcoinj.core.Utils;
 
 import javax.annotation.Nullable;
 import java.security.PublicKey;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -44,6 +46,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 @Slf4j
 public final class Alert implements ProtectedStoragePayload, ExpirablePayload {
     public static final long TTL = TimeUnit.DAYS.toMillis(90);
+    private static final String METADATA_SIGNATURE = "metadataSignature";
 
     private final String message;
     private final boolean isUpdateInfo;
@@ -146,6 +149,30 @@ public final class Alert implements ProtectedStoragePayload, ExpirablePayload {
         ownerPubKeyBytes = Sig.getPublicKeyBytes(ownerPubKey);
     }
 
+    public String getMetadataSignaturePayload() {
+        Map<String, String> metadata = new TreeMap<>();
+        if (extraDataMap != null) metadata.putAll(extraDataMap);
+        metadata.remove(METADATA_SIGNATURE);
+        protobuf.Alert payload = toProtoMessage().getAlert().toBuilder()
+                .clearExtraData().putAllExtraData(metadata).build();
+        // bind all fields and the owner, with stable map ordering and a distinct signature domain;
+        // clients drop unknown Alert fields before verifying, so new fields belong in the extra data map
+        return "Haveno alert metadata v1:" + Utils.HEX.encode(payload.toByteArray());
+    }
+
+    @Nullable
+    public String getMetadataSignature() {
+        return extraDataMap == null ? null : extraDataMap.get(METADATA_SIGNATURE);
+    }
+
+    public void setMetadataSignature(String signature) {
+        Map<String, String> metadata = new TreeMap<>();
+        if (extraDataMap != null) metadata.putAll(extraDataMap);
+        metadata.put(METADATA_SIGNATURE, signature);
+        ExtraDataMapValidator.validate(metadata);
+        extraDataMap = metadata;
+    }
+
     public boolean isNewVersion(Preferences preferences) {
         // regular release: always notify user
         // pre-release: if user has set preference to receive pre-release notification
@@ -158,6 +185,10 @@ public final class Alert implements ProtectedStoragePayload, ExpirablePayload {
 
     public boolean isSoftwareUpdateNotification() {
         return (isUpdateInfo || isPreReleaseInfo);
+    }
+
+    public boolean isApplicable(Preferences preferences) {
+        return !isSoftwareUpdateNotification() || isNewVersion(preferences);
     }
 
     public boolean canShowPopup(Preferences preferences) {

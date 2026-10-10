@@ -49,10 +49,12 @@ import haveno.common.handlers.ResultHandler;
 import haveno.common.persistence.PersistenceManager;
 import haveno.common.proto.network.NetworkEnvelope;
 import haveno.common.proto.persistable.PersistedDataHost;
+import haveno.common.util.Utilities;
 import haveno.core.api.AccountServiceListener;
 import haveno.core.api.CoreAccountService;
 import haveno.core.api.CoreNotificationService;
 import haveno.core.locale.Res;
+import haveno.core.monetary.Volume;
 import haveno.core.offer.Offer;
 import haveno.core.offer.OfferBookService;
 import haveno.core.offer.OfferDirection;
@@ -103,7 +105,6 @@ import haveno.network.p2p.network.TorNetworkNode;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
@@ -113,6 +114,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -137,8 +143,14 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
 
     private static final Logger log = LoggerFactory.getLogger(TradeManager.class);
 
-    private boolean isShutDownStarted;
-    private boolean isShutDown;
+    private static class AmbiguousPaymentException extends IllegalArgumentException {
+        private AmbiguousPaymentException(String message) {
+            super(message);
+        }
+    }
+
+    private volatile boolean isShutDownStarted;
+    private volatile boolean isShutDown;
     private final User user;
     @Getter
     private final KeyRing keyRing;
@@ -162,11 +174,15 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
     private final ProcessModelServiceProvider processModelServiceProvider;
     private final ClockWatcher clockWatcher;
 
-    private final Map<String, TradeProtocol> tradeProtocolByTradeId = new HashMap<>();
+    private final Map<String, TradeProtocol> tradeProtocolByUid = new HashMap<>();
+    private final ExecutorService initTradeRequestExecutor = Utilities.getThreadPoolExecutor("InitTradeRequests", 1, 1, 64, 60);
+    private final List<Consumer<String>> ambiguousPaymentRejectedListeners = new CopyOnWriteArrayList<>();
     private final PersistenceManager<TradableList<Trade>> persistenceManager;
     private final TradableList<Trade> tradableList = new TradableList<>();
     @Getter
     private final BooleanProperty tradesInitialized = new SimpleBooleanProperty();
+    @Getter
+    private final CompletableFuture<Void> tradeInitializationFuture = new CompletableFuture<>();
     @Getter
     private final LongProperty numPendingTrades = new SimpleLongProperty();
     private final ReferralIdService referralIdService;
@@ -285,20 +301,82 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
     @Override
     public void onDirectMessage(DecryptedMessageWithPubKey decryptedMessageWithPubKey, NodeAddress sender) {
         NetworkEnvelope networkEnvelope = decryptedMessageWithPubKey.getNetworkEnvelope();
-        if (!(networkEnvelope instanceof InitTradeRequest)) return;
+        if (!(networkEnvelope instanceof InitTradeRequest) || isShutDownStarted) return;
         InitTradeRequest initTradeRequest = (InitTradeRequest) networkEnvelope;
-        String tradeId = initTradeRequest.getOfferId();
-        log.info("TradeManager received {} for tradeId={}, sender={}, uid={}", networkEnvelope.getClass().getSimpleName(), tradeId, sender, initTradeRequest.getUid());
         try {
-            ThreadUtils.execute(() -> {
-                handleInitTradeRequest(decryptedMessageWithPubKey, initTradeRequest, sender);
-            }, tradeId);
-        } catch (Throwable t) {
-            log.warn("Error handling direct message on trade thread. That should never happen. tradeId=" + tradeId + ", error: " + t.getMessage(), t);
-            return;
+            initTradeRequestExecutor.execute(() -> dispatchInitTradeRequest(decryptedMessageWithPubKey, initTradeRequest, sender));
+        } catch (RejectedExecutionException e) {
+            log.debug("Ignoring InitTradeRequest because admission is busy or shutting down");
         }
     }
 
+    private void dispatchInitTradeRequest(DecryptedMessageWithPubKey message, InitTradeRequest request, NodeAddress sender) {
+        String tradeId = request.getOfferId();
+        try {
+            // reject untrusted ids before allocating a trade thread
+            if (isShutDownStarted || !isInitTradeRequestExpected(message, request, sender)) return;
+            ThreadUtils.execute(() -> {
+                if (!isShutDownStarted) handleInitTradeRequest(message, request, sender);
+            }, tradeId);
+        } catch (Throwable t) {
+            log.warn("Error dispatching InitTradeRequest for tradeId={}: {}", tradeId, t.getMessage());
+        }
+    }
+
+    private boolean isInitTradeRequestExpected(DecryptedMessageWithPubKey message, InitTradeRequest request, NodeAddress sender) {
+        String tradeId = request.getOfferId();
+        if (tradeId == null || tradeId.isEmpty() || sender == null || request.getMakerNodeAddress() == null
+                || request.getTakerNodeAddress() == null || request.getTakerPubKeyRing() == null) return false;
+        NodeAddress thisAddress = p2PService.getNetworkNode().getNodeAddress();
+        if (thisAddress == null || request.getMakerNodeAddress().equals(request.getTakerNodeAddress())
+                || request.getMakerNodeAddress().equals(request.getArbitratorNodeAddress())
+                || request.getTakerNodeAddress().equals(request.getArbitratorNodeAddress())) return false;
+
+        if (thisAddress.equals(request.getMakerNodeAddress())) {
+            if (!sender.equals(request.getTakerNodeAddress())
+                    || !message.getSignaturePubKey().equals(request.getTakerPubKeyRing().getSignaturePubKey())) return false;
+            Optional<OpenOffer> openOffer = openOfferManager.getOpenOffer(tradeId);
+            if (openOffer.isEmpty() || !openOffer.get().isAvailable()) {
+                Optional<Trade> trade = getOpenOrClosedTrade(tradeId);
+                if (trade.isEmpty() || !request.getTakerPubKeyRing().equals(trade.get().getTaker().getPubKeyRing())) {
+                    sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, "The offer with ID " + tradeId + " " + Offer.OFFER_UNAVAILABLE_MSG, null);
+                }
+                return false;
+            }
+            if (openOffer.get().getOffer().getPubKeyRing().equals(request.getTakerPubKeyRing())) return false;
+            return openOffer.get().getChallenge() == null
+                    || HavenoUtils.getChallengeHash(openOffer.get().getChallenge()).equals(HavenoUtils.getChallengeHash(request.getChallenge()));
+        }
+
+        if (thisAddress.equals(request.getArbitratorNodeAddress())) {
+            Arbitrator arbitrator = user.getRegisteredArbitrator();
+            if (arbitrator == null || !thisAddress.equals(arbitrator.getNodeAddress())) return false;
+            Optional<Offer> offer = offerBookService.getOffers().stream().filter(e -> tradeId.equals(e.getId())).findFirst();
+            if (offer.isEmpty() || !offer.get().getOwnerNodeAddress().equals(request.getMakerNodeAddress())) return false;
+            // book admission alone does not verify the arbitrator signature
+            if (offer.get().getOfferPayload().getArbitratorSignature() == null) return false;
+            NodeAddress signerAddress = offer.get().getOfferPayload().getArbitratorSigner();
+            Arbitrator signer = thisAddress.equals(signerAddress) ? arbitrator : user.getAcceptedArbitratorByAddress(signerAddress);
+            if (signer == null || !HavenoUtils.isArbitratorSignatureValid(offer.get().getOfferPayload(), signer)) return false;
+            if (offer.get().getChallengeHash() != null && !offer.get().getChallengeHash().equals(HavenoUtils.getChallengeHash(request.getChallenge()))) return false;
+            if (!HavenoUtils.isGeneralPrivateOffersEnabled() && offer.get().isPrivateOffer() && !offer.get().hasBuyerAsTakerWithoutDeposit()) return false;
+            Optional<Trade> trade = getOpenOrClosedTrade(tradeId);
+            if (trade.isPresent() && (!(trade.get() instanceof ArbitratorTrade) || !hasOpenTrade(trade.get()))) return false;
+            if (sender.equals(request.getMakerNodeAddress())) {
+                return message.getSignaturePubKey().equals(offer.get().getPubKeyRing().getSignaturePubKey());
+            }
+            return trade.isPresent() && sender.equals(trade.get().getTaker().getNodeAddress())
+                    && trade.get().getTaker().getPubKeyRing() != null
+                    && message.getSignaturePubKey().equals(trade.get().getTaker().getPubKeyRing().getSignaturePubKey());
+        }
+
+        if (thisAddress.equals(request.getTakerNodeAddress()) && getOpenTrade(tradeId).filter(t -> t instanceof TakerTrade).isPresent()) {
+            Arbitrator arbitrator = user.getAcceptedArbitratorByAddress(sender);
+            return arbitrator != null && sender.equals(request.getArbitratorNodeAddress())
+                    && message.getSignaturePubKey().equals(arbitrator.getPubKeyRing().getSignaturePubKey());
+        }
+        return false;
+    }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Lifecycle
@@ -342,17 +420,51 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
                 // handled in XmrWalletService
             }
         });
+
+        // periodically delete retained trade wallets whose finalized payout has reached the deletion threshold
+        clockWatcher.addListener(new ClockWatcher.Listener() {
+            @Override
+            public void onSecondTick() {
+            }
+
+            @Override
+            public void onMinuteTick() {
+                ThreadUtils.submitToPool(() -> maybeDeleteExpiredTradeWallets());
+            }
+        });
+    }
+
+    private final Set<String> deletedTradeWalletIds = new HashSet<String>(); // cache of trade ids whose wallets have been deleted
+    private final AtomicBoolean isDeletingExpiredTradeWallets = new AtomicBoolean(); // guard against overlapping sweeps
+    private void maybeDeleteExpiredTradeWallets() {
+        if (isShutDownStarted) return;
+        if (!isDeletingExpiredTradeWallets.compareAndSet(false, true)) return; // skip if a sweep is already running
+        try {
+            for (Trade trade : getAllTrades()) {
+                if (isShutDownStarted) return;
+                try {
+                    if (deletedTradeWalletIds.contains(trade.getId())) continue;
+                    if (!trade.isPayoutDeletable()) continue;
+                    if (!trade.walletExists()) {
+                        deletedTradeWalletIds.add(trade.getId());
+                        continue;
+                    }
+                    log.info("Deleting retained trade wallet for {} {} because finalized payout reached deletion threshold", trade.getClass().getSimpleName(), trade.getId());
+                    trade.deleteWallet();
+                    if (!trade.walletExists()) deletedTradeWalletIds.add(trade.getId());
+                } catch (Exception e) {
+                    log.warn("Error deleting expired trade wallet for {}: {}", trade.getId(), e.getMessage(), e);
+                }
+            }
+        } finally {
+            isDeletingExpiredTradeWallets.set(false);
+        }
     }
 
     public void onShutDownStarted() {
         log.info("{}.onShutDownStarted()", getClass().getSimpleName());
         isShutDownStarted = true;
-
-        // skip trade shut down if not initialized
-        if (!HavenoUtils.isSeedNode() && !tradesInitialized.get()) {
-            log.warn("Skipping start trade shut down because trades were not initialized");
-            return;
-        }
+        initTradeRequestExecutor.shutdownNow();
 
         // collect trades to prepare for shut down
         List<Trade> trades = getAllTrades();
@@ -360,6 +472,7 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         // prepare to shut down trades in parallel
         Set<Runnable> tasks = new HashSet<Runnable>();
         for (Trade trade : trades) tasks.add(() -> {
+            if (!trade.isInitialized()) return;
             try {
                 trade.onShutDownStarted();
             } catch (Exception e) {
@@ -378,16 +491,12 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
     public void shutDown() {
         log.info("Shutting down {}", getClass().getSimpleName());
         isShutDown = true;
+        initTradeRequestExecutor.shutdownNow();
         closeAllTrades();
+        closedTradableManager.shutDown();
     }
 
     private void closeAllTrades() {
-
-        // skip trade shut down if not initialized
-        if (!HavenoUtils.isSeedNode() && !tradesInitialized.get()) {
-            log.warn("Skipping trade shut down because trades were not initialized");
-            return;
-        }
 
         // collect trades to shutdown
         List<Trade> trades = getAllTrades();
@@ -395,6 +504,7 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         // shut down trades in parallel
         Set<Runnable> tasks = new HashSet<Runnable>();
         for (Trade trade : trades) tasks.add(() -> {
+            if (!trade.isInitialized()) return;
             try {
                 trade.shutDown();
             } catch (Exception e) {
@@ -410,21 +520,21 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
     }
 
     public TradeProtocol getTradeProtocol(Trade trade) {
-        synchronized (tradeProtocolByTradeId) {
-            return tradeProtocolByTradeId.get(trade.getUid());
+        synchronized (tradeProtocolByUid) {
+            return tradeProtocolByUid.get(trade.getUid());
         }
     }
 
     private void unregisterTradeProtocol(Trade trade) {
-        synchronized (tradeProtocolByTradeId) {
-            tradeProtocolByTradeId.remove(trade.getUid());
+        synchronized (tradeProtocolByUid) {
+            tradeProtocolByUid.remove(trade.getUid());
         }
     }
 
     public TradeProtocol createTradeProtocol(Trade trade) {
-        synchronized (tradeProtocolByTradeId) {
+        synchronized (tradeProtocolByUid) {
             TradeProtocol tradeProtocol = TradeProtocolFactory.getNewTradeProtocol(trade);
-            TradeProtocol prev = tradeProtocolByTradeId.put(trade.getUid(), tradeProtocol);
+            TradeProtocol prev = tradeProtocolByUid.put(trade.getUid(), tradeProtocol);
             if (prev != null) log.error("We had already an entry with uid {}", trade.getUid());
             return tradeProtocol;
         }
@@ -441,14 +551,16 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
             // get all trades
             List<Trade> trades = getAllTrades();
 
+            // remove trades duplicated across stores by an interrupted move
+            removeDuplicateTrades(trades);
+            resumeInterruptedTradeMoves();
+
             // initialize trades in parallel
             int threadPoolSize = 10;
             Set<Runnable> initTradeTasks = new HashSet<Runnable>();
-            Set<String> uids = new HashSet<String>();
             Set<Trade> tradesToSkip = new HashSet<Trade>();
-            Set<Trade> uninitializedTrades = new HashSet<Trade>();
             for (Trade trade : trades) {
-                initTradeTasks.add(getInitTradeTask(trade, trades, tradesToSkip, uninitializedTrades, uids));
+                initTradeTasks.add(getInitTradeTask(trade, tradesToSkip));
             };
             ThreadUtils.awaitTasks(initTradeTasks, threadPoolSize);
             log.info("Done initializing trades");
@@ -456,6 +568,47 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
 
             // remove skipped trades
             trades.removeAll(tradesToSkip);
+
+            // repair main wallet reservations before offers or UI actions can spend its outputs
+            if (!HavenoUtils.isSeedNode()) {
+                try {
+                    xmrWalletService.fixReservedOutputs();
+                } catch (Exception e) {
+                    log.warn("Error repairing reserved outputs before trade wallet initialization: {}\n", e.getMessage(), e);
+                }
+            }
+
+            // open trade wallets off the setup thread after all protocols have registered their listeners
+            ThreadUtils.submitToPool(() -> initTradeWallets(trades));
+        } catch (Exception e) {
+            log.warn("Error initializing trades: {}\n", e.getMessage(), e);
+            if (!isShutDownStarted) tradeInitializationFuture.completeExceptionally(e);
+        }
+    }
+
+    private void initTradeWallets(List<Trade> trades) {
+        try {
+            Set<Trade> uninitializedTrades = new HashSet<Trade>();
+            Set<Runnable> initWalletTasks = new HashSet<Runnable>();
+            for (Trade trade : trades) {
+                initWalletTasks.add(() -> {
+                    if (isShutDownStarted || trade.getInitError() != null) return;
+                    try {
+                        trade.initializeWallet();
+
+                        // record if protocol didn't initialize, except closed trades, which are terminal
+                        if (!trade.isDepositsPublished() && !closedTradableManager.getClosedTrades().contains(trade)) {
+                            synchronized (uninitializedTrades) {
+                                uninitializedTrades.add(trade);
+                            }
+                        }
+                    } catch (Exception e) {
+                        handleTradeInitializationError(trade, e);
+                    }
+                });
+            }
+            ThreadUtils.awaitTasks(initWalletTasks, 10);
+            if (isShutDownStarted) return;
 
             // process after all trades initialized
             if (!HavenoUtils.isSeedNode()) {
@@ -481,10 +634,16 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
                 checkForLockedUpFunds();
             }
 
+            // apply trade period state
+            if (isShutDownStarted) return;
+            applyTradePeriodState();
+
             // notify that persisted trades initialized
             log.info("Done postprocessing after initializing trades");
             if (isShutDownStarted) return;
-            tradesInitialized.set(true);
+            UserThread.execute(() -> {
+                if (!isShutDownStarted) tradesInitialized.set(true);
+            });
             getObservableList().addListener((ListChangeListener<Trade>) change -> onTradesChanged());
             onTradesChanged();
 
@@ -495,56 +654,111 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
             String referralId = referralIdService.getOptionalReferralId().orElse(null);
             boolean isTorNetworkNode = p2PService.getNetworkNode() instanceof TorNetworkNode;
             tradeStatisticsManager.maybePublishTradeStatistics(nonFailedTrades, referralId, isTorNetworkNode);
+            if (!isShutDownStarted) tradeInitializationFuture.complete(null);
         } catch (Exception e) {
             log.warn("Error initializing trades: {}\n", e.getMessage(), e);
+            if (!isShutDownStarted) tradeInitializationFuture.completeExceptionally(e);
         }
     }
 
-    private Runnable getInitTradeTask(Trade trade, Collection<Trade> trades, Set<Trade> tradesToSkip, Set<Trade> uninitializedTrades, Set<String> uids) {
+    private Runnable getInitTradeTask(Trade trade, Set<Trade> tradesToSkip) {
         return () -> {
             try {
 
-                // check for duplicate uid
-                synchronized (uids) {
-                    if (!uids.add(trade.getUid())) {
-                        log.warn("Found trade with duplicate uid, skipping. That should never happen. {} {}, uid={}", trade.getClass().getSimpleName(), trade.getId(), trade.getUid());
-                        tradesToSkip.add(trade);
+                // skip if failed and error handling not scheduled
+                if (failedTradesManager.getObservableList().contains(trade)) {
+                    if (!trade.isProtocolErrorHandlingScheduled()) {
+                        log.warn("Skipping initialization of failed trade {} {}", trade.getClass().getSimpleName(), trade.getId());
+                        synchronized (tradesToSkip) {
+                            tradesToSkip.add(trade);
+                        }
                         return;
                     }
-                }
 
-                // skip if failed and error handling not scheduled
-                if (failedTradesManager.getObservableList().contains(trade) && !trade.isProtocolErrorHandlingScheduled()) {
-                    log.warn("Skipping initialization of failed trade {} {}", trade.getClass().getSimpleName(), trade.getId());
-                    synchronized (tradesToSkip) {
-                        tradesToSkip.add(trade);
+                    // skip if superseded by an open trade for the same id, completing cleanup which did not finish before the last shutdown
+                    if (getOpenTrade(trade.getId()).isPresent()) {
+                        log.warn("Skipping initialization of failed {} {} superseded by an open trade for the same id", trade.getClass().getSimpleName(), trade.getShortId());
+                        trade.onSuperseded();
+                        ThreadUtils.submitToPool(() -> {
+                            try {
+                                trade.maybeCompleteProtocolErrorCleanup();
+                            } catch (Exception e) {
+                                log.warn("Error cleaning up superseded failed {} {}: {}", trade.getClass().getSimpleName(), trade.getShortId(), e.getMessage(), e);
+                            }
+                        });
+                        synchronized (tradesToSkip) {
+                            tradesToSkip.add(trade);
+                        }
                         return;
                     }
                 }
 
                 // initialize trade
-                initTrade(trade);
-
-                // record if protocol didn't initialize
-                if (!trade.isDepositsPublished()) {
-                    synchronized (uninitializedTrades) {
-                        uninitializedTrades.add(trade);
-                    }
-                }
+                initTrade(trade, false);
             } catch (Exception e) {
-                if (!isShutDownStarted) {
-                    log.warn("Error initializing {} {}: {}\n", trade.getClass().getSimpleName(), trade.getId(), e.getMessage(), e);
-                    trade.setInitError(e);
-                    trade.prependErrorMessage(e.getMessage());
-                }
+                handleTradeInitializationError(trade, e);
             }
         };
     }
 
+    private void handleTradeInitializationError(Trade trade, Exception e) {
+        if (isShutDownStarted) return;
+        log.warn("Error initializing {} {}: {}\n", trade.getClass().getSimpleName(), trade.getId(), e.getMessage(), e);
+        trade.setInitError(e);
+        trade.prependErrorMessage(e.getMessage());
+    }
+
+    // remove trades with duplicate uids from their stores, which can happen when a move between stores is interrupted
+    // by shutdown. prefer the latest completion transition, then completed closed over pending over failed
+    private void removeDuplicateTrades(List<Trade> trades) {
+        Map<String, Trade> tradesByUid = new HashMap<String, Trade>();
+        for (Trade trade : new ArrayList<Trade>(trades)) {
+            Trade other = tradesByUid.get(trade.getUid());
+            if (other == null) {
+                tradesByUid.put(trade.getUid(), trade);
+                continue;
+            }
+            int revisionOrder = Long.compare(trade.getCompletedRevision(), other.getCompletedRevision());
+            Trade duplicate = revisionOrder > 0 || (revisionOrder == 0 && getStorePriority(trade) > getStorePriority(other)) ? other : trade;
+            if (duplicate == other) tradesByUid.put(trade.getUid(), trade);
+            log.warn("Removing {} {} with duplicate uid from its store. That should never happen. uid={}", duplicate.getClass().getSimpleName(), duplicate.getId(), duplicate.getUid());
+            removeDuplicateTrade(duplicate);
+            trades.remove(duplicate);
+        }
+    }
+
+    private int getStorePriority(Trade trade) {
+        if (closedTradableManager.getClosedTrades().contains(trade)) return trade.isReopened() ? 0 : 3;
+        if (failedTradesManager.getObservableList().contains(trade)) return 1;
+        return 2; // pending
+    }
+
+    private void resumeInterruptedTradeMoves() {
+        for (Trade trade : closedTradableManager.getClosedTrades()) {
+            synchronized (trade) {
+                if (!trade.isReopened()) continue;
+                addTrade(trade); // initialization follows once all interrupted moves have been recovered
+                persistReopenedTrade(trade);
+            }
+        }
+    }
+
+    // remove a duplicate trade from whichever store holds it
+    private void removeDuplicateTrade(Trade trade) {
+        if (closedTradableManager.getClosedTrades().contains(trade)) closedTradableManager.removeTrade(trade);
+        else if (failedTradesManager.getObservableList().contains(trade)) failedTradesManager.removeTrade(trade);
+        else removeTrade(trade);
+    }
+
     private void initTrade(Trade trade) {
+        initTrade(trade, true);
+    }
+
+    private void initTrade(Trade trade, boolean initializeWallet) {
         if (isShutDown) return;
         if (getTradeProtocol(trade) != null) return;
         initTradeAndProtocol(trade, createTradeProtocol(trade));
+        if (initializeWallet) trade.initializeWallet();
         requestPersistence();
     }
 
@@ -559,6 +773,38 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
 
     public void persistNow(@Nullable Runnable completeHandler) {
         persistenceManager.persistNow(completeHandler);
+    }
+
+    /**
+     * Persists a mutation of the given trade to whichever container owns it: post-close mutations
+     * (payout/dispute state, ack state) go to the closed-trades log, failed trades to the failed-trades
+     * store, the rest to the pending store.
+     */
+    public void requestPersistence(Trade trade) {
+        if (isClosedTradeOwner(trade)) {
+            closedTradableManager.persistClosedTrade(trade);
+        } else if (failedTradesManager.getObservableList().contains(trade)) {
+            failedTradesManager.requestPersistence();
+        } else {
+            requestPersistence();
+        }
+    }
+
+    public void persistNow(Trade trade, @Nullable Runnable completeHandler) {
+        if (isClosedTradeOwner(trade)) {
+            closedTradableManager.persistClosedTrade(trade); // durable (or queued for retry) on return
+            if (completeHandler != null) completeHandler.run();
+        } else if (failedTradesManager.getObservableList().contains(trade)) {
+            failedTradesManager.persistNow(completeHandler);
+        } else {
+            persistNow(completeHandler);
+        }
+    }
+
+    private boolean isClosedTradeOwner(Trade trade) {
+        // a reopened trade can retain a closed recovery copy until its pending write succeeds
+        return closedTradableManager.getClosedTrades().contains(trade)
+                && (trade.isCompleted() || !hasTradeInstance(trade));
     }
 
     private void handleInitTradeRequest(DecryptedMessageWithPubKey decryptedMessageWithPubKey, InitTradeRequest request, NodeAddress sender) {
@@ -584,15 +830,17 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
 
             // get open offer
             Optional<OpenOffer> openOfferOptional = openOfferManager.getOpenOffer(request.getOfferId());
-            if (!openOfferOptional.isPresent()) return;
-            OpenOffer openOffer = openOfferOptional.get();
-            Offer offer = openOffer.getOffer();
 
-            // check availability
-            if (openOffer.getState() != OpenOffer.State.AVAILABLE) {
-                log.warn("Ignoring InitTradeRequest to maker because offer is not available, offerId={}, sender={}", request.getOfferId(), sender);
+            // reject if offer is unavailable so taker fails fast instead of timing out
+            if (!openOfferOptional.isPresent() || openOfferOptional.get().getState() != OpenOffer.State.AVAILABLE) {
+                log.warn("Rejecting InitTradeRequest to maker because offer is not available, offerId={}, sender={}", request.getOfferId(), sender);
+                Optional<Trade> existingTrade = getOpenOrClosedTrade(request.getOfferId());
+                boolean isCurrentTaker = existingTrade.isPresent() && request.getTakerPubKeyRing().equals(existingTrade.get().getTaker().getPubKeyRing());
+                if (!isCurrentTaker) sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, "The offer with ID " + request.getOfferId() + " " + Offer.OFFER_UNAVAILABLE_MSG, null); // skip nack on duplicate request from current taker
                 return;
             }
+            OpenOffer openOffer = openOfferOptional.get();
+            Offer offer = openOffer.getOffer();
 
             // validate challenge
             if (openOffer.getChallenge() != null && !HavenoUtils.getChallengeHash(openOffer.getChallenge()).equals(HavenoUtils.getChallengeHash(request.getChallenge()))) {
@@ -607,21 +855,31 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
                 return;
             }
   
-            // reserve open offer
-            openOfferManager.reserveOpenOffer(openOffer);
-
             // verify maker and taker pubKeyRings are different
             if (offer.getPubKeyRing().equals(request.getTakerPubKeyRing())) {
                 log.warn("Ignoring InitTradeRequest to maker because maker and taker pubKeyRings are the same, tradeId={}, sender={}", request.getOfferId(), sender);
                 return;
             }
-  
+
+            // validate the amount and price before they can block another trade's payment
+            try {
+                checkArgument(request.getTradeAmount() > 0, "Trade amount must be positive");
+                checkArgument(BigInteger.valueOf(request.getTradeAmount()).compareTo(offer.getMinAmount()) >= 0, "Trade amount is less than minimum offer amount");
+                checkArgument(BigInteger.valueOf(request.getTradeAmount()).compareTo(offer.getAmount()) <= 0, "Trade amount exceeds offer amount");
+                checkArgument(request.getTradePrice() > 0, "Trade price must be positive");
+                offer.verifyTradePrice(request.getTradePrice(), true);
+            } catch (Exception e) {
+                log.warn("Rejecting InitTradeRequest to maker, tradeId={}, error={}", request.getOfferId(), e.getMessage());
+                sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, e.getMessage(), null);
+                return;
+            }
+
             // initialize trade
             Trade trade;
             if (offer.isBuyOffer())
                 trade = new BuyerAsMakerTrade(offer,
                         BigInteger.valueOf(request.getTradeAmount()),
-                        offer.getOfferPayload().getPrice(),
+                        request.getTradePrice(),
                         xmrWalletService,
                         getNewProcessModel(offer),
                         UUID.randomUUID().toString(),
@@ -632,7 +890,7 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
             else
                 trade = new SellerAsMakerTrade(offer,
                         BigInteger.valueOf(request.getTradeAmount()),
-                        offer.getOfferPayload().getPrice(),
+                        request.getTradePrice(),
                         xmrWalletService,
                         getNewProcessModel(offer),
                         UUID.randomUUID().toString(),
@@ -649,8 +907,42 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
             trade.getSelf().setReserveTxHex(openOffer.getReserveTxHex());
             trade.getSelf().setReserveTxKey(openOffer.getReserveTxKey());
             trade.getSelf().setReserveTxKeyImages(offer.getOfferPayload().getReserveTxKeyImages());
-            initTradeAndProtocol(trade, createTradeProtocol(trade));
-            addTrade(trade);
+
+            // claim the offer atomically with cancellation
+            if (!openOfferManager.reserveOpenOffer(openOffer)) {
+                sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, "The offer with ID " + request.getOfferId() + " " + Offer.OFFER_UNAVAILABLE_MSG, null);
+                return;
+            }
+
+            boolean tradeAdded = false;
+            boolean ambiguousPaymentRejected = false;
+            try {
+                addMakerTrade(trade);
+                tradeAdded = true;
+            } catch (AmbiguousPaymentException e) {
+                sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, e.getMessage(), null);
+                ambiguousPaymentRejected = true;
+            } catch (IllegalArgumentException e) {
+                sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, e.getMessage(), null);
+                return;
+            } finally {
+                if (!tradeAdded) openOfferManager.unreserveOpenOffer(openOffer);
+            }
+            if (ambiguousPaymentRejected) {
+                notifyAmbiguousPaymentRejected(offer.getId());
+                return;
+            }
+
+            // initialize only after the offer and payment amount have been claimed
+            try {
+                shutDownPriorFailedTrades(request.getOfferId());
+                initTradeAndProtocol(trade, createTradeProtocol(trade));
+            } catch (Exception e) {
+                log.warn("Maker error initializing trade protocol, tradeId={}", trade.getId(), e);
+                trade.onProtocolInitializationError();
+                sendAckMessage(sender, request.getTakerPubKeyRing(), request, false, e.getMessage(), null);
+                return;
+            }
   
             // process with protocol
             ((MakerProtocol) getTradeProtocol(trade)).handleInitTradeRequest(request, sender, errorMessage -> {
@@ -703,6 +995,17 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
             // handle trade
             Trade trade;
             Optional<Trade> tradeOptional = getOpenOrClosedTrade(offer.getId());
+
+            // supersede open unfunded trade on new request from maker, e.g. a prior attempt failed without cleanup on this node
+            if (tradeOptional.isPresent()
+                    && hasOpenTrade(tradeOptional.get())
+                    && !tradeOptional.get().isDepositRequested()
+                    && sender.equals(tradeOptional.get().getMaker().getNodeAddress())
+                    && offer.getPubKeyRing().getSignaturePubKey().equals(decryptedMessageWithPubKey.getSignaturePubKey())) {
+                supersedeOpenTrade(tradeOptional.get());
+                tradeOptional = Optional.empty();
+            }
+
             if (tradeOptional.isPresent()) {
                 trade = tradeOptional.get();
 
@@ -727,6 +1030,9 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
                     log.warn("Ignoring InitTradeRequest to arbitrator because request must be from maker when trade is not initialized, tradeId={}, sender={}", request.getOfferId(), sender);
                     return;
                 }
+
+                // shut down any prior failed trades for this id so they stop processing messages for the new attempt
+                shutDownPriorFailedTrades(offer.getId());
 
                 // create arbitrator trade
                 trade = new ArbitratorTrade(offer,
@@ -819,7 +1125,7 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
                 ThreadUtils.execute(() -> {
                     try {
 
-                        // check that offer is not already used in a trade
+                        // check that offer is not already used in an open, closed, or failed trade
                         checkArgument(!wasOfferAlreadyUsedInTrade(offer.getId()));
 
                         // check that trade is not already open
@@ -934,10 +1240,14 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
 
     // If trade was completed (closed without fault but might be closed by a dispute) we move it to the closed trades
     public void onTradeCompleted(Trade trade) {
-        if (trade.isCompleted()) throw new RuntimeException("Trade " + trade.getId() + " was already completed");
-        closedTradableManager.add(trade);
-        trade.setCompleted(true);
-        removeTrade(trade);
+        synchronized (trade) {
+            if (trade.isCompleted()) throw new RuntimeException("Trade " + trade.getId() + " was already completed");
+            // Mark completed BEFORE adding: add() synchronously appends a snapshot to the closed log,
+            // so this persisted flag must already be set. Do not reorder.
+            trade.setCompleted(true);
+            closedTradableManager.add(trade);
+            removeTrade(trade);
+        }
         xmrWalletService.swapPayoutAddressEntryToAvailable(trade.getId()); // TODO The address entry should have been removed already. Check and if its the case remove that.
         requestPersistence();
     }
@@ -948,6 +1258,15 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         removeFailedTrade(trade);
         if (!trade.isMaker()) xmrWalletService.swapPayoutAddressEntryToAvailable(trade.getId()); // TODO The address entry should have been removed already. Check and if its the case remove that.
         requestPersistence();
+        ThreadUtils.submitToPool(() -> {
+            if (isShutDownStarted) return;
+            try {
+                // release inputs no longer owned by an open offer or trade
+                xmrWalletService.fixReservedOutputs();
+            } catch (Exception e) {
+                log.warn("Error updating reserved outputs after removing trade {}", trade.getId(), e);
+            }
+        });
     }
 
     public void removeTrade(Trade trade) {
@@ -979,8 +1298,11 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
     // Trade period state
     ///////////////////////////////////////////////////////////////////////////////////////////
 
-    public void applyTradePeriodState() {
+    private boolean tradePeriodStateApplied; // guard so the clock watcher listener is only registered once
+    private void applyTradePeriodState() {
         updateTradePeriodState();
+        if (tradePeriodStateApplied) return;
+        tradePeriodStateApplied = true;
         clockWatcher.addListener(new ClockWatcher.Listener() {
             @Override
             public void onSecondTick() {
@@ -1028,7 +1350,9 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
     // we move the trade to FailedTradesManager
     public void onMoveInvalidTradeToFailedTrades(Trade trade) {
         log.warn("Moving {} {} to failed trades", trade.getClass().getSimpleName(), trade.getShortId());
-        if (trade.isInitialized()) {
+
+        // shut down trade unless protocol error handling is scheduled, so it stays alive for polling
+        if (trade.isInitialized() && !trade.isProtocolErrorHandlingScheduled()) {
             ThreadUtils.submitToPool(() -> {
                 try {
                     trade.shutDown();
@@ -1051,15 +1375,75 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         xmrWalletService.fixReservedOutputs();
     }
 
-    public void onMoveClosedTradeToPendingTrades(Trade trade) { 
-        log.warn("Moving {} {} from closed trades to pending trades", trade.getClass().getSimpleName(), trade.getShortId());
-        trade.setCompleted(false);
-        addTradeToPendingTrades(trade);
+    public void onMoveClosedTradeToPendingTrades(Trade trade) {
+        synchronized (trade) {
+            log.warn("Moving {} {} from closed trades to pending trades", trade.getClass().getSimpleName(), trade.getShortId());
+            trade.setCompleted(false);
+            closedTradableManager.persistClosedTrade(trade);
+            addTradeToPendingTrades(trade);
+            persistReopenedTrade(trade);
+        }
+    }
+
+    private void persistReopenedTrade(Trade trade) {
+        try {
+            // the ordinary persistence callback also runs on failure, so require a successful write
+            persistenceManager.persistNowAndWait();
+        } catch (RuntimeException e) {
+            log.error("Could not persist reopened trade {}; retaining its closed record for recovery", trade.getId(), e);
+            requestPersistence();
+            UserThread.runAfter(() -> ThreadUtils.execute(() -> retryReopenedTrade(trade), trade.getId()), 30);
+            return;
+        }
         closedTradableManager.removeTrade(trade);
+    }
+
+    void retryReopenedTrade(Trade trade) {
+        synchronized (trade) {
+            if (isShutDownStarted || !trade.isReopened() || !hasOpenTrade(trade)
+                    || !closedTradableManager.getClosedTrades().contains(trade)) return;
+            persistReopenedTrade(trade);
+        }
     }
 
     private void removeFailedTrade(Trade trade) {
         failedTradesManager.removeTrade(trade);
+    }
+
+    // shut down prior failed trades for the same id so they stop processing messages routed by offer id,
+    // while retaining them in the failed trades list for records
+    private void shutDownPriorFailedTrades(String tradeId) {
+        for (Trade priorFailed : failedTradesManager.getTradesById(tradeId)) {
+            if (priorFailed.isShutDown() || priorFailed.isSuperseded()) continue; // already handled by a prior attempt
+            log.warn("Shutting down prior failed {} {} because a new trade is being created for the same id", priorFailed.getClass().getSimpleName(), priorFailed.getShortId());
+            priorFailed.onSuperseded(); // keeps the shared trade-id executors for the new trade
+            ThreadUtils.submitToPool(() -> {
+
+                // complete scheduled error cleanup early so the wallet is deleted and not re-initialized on restart
+                try {
+                    priorFailed.maybeCompleteProtocolErrorCleanup();
+                } catch (Exception e) {
+                    log.warn("Error cleaning up prior failed {} {}: {}", priorFailed.getClass().getSimpleName(), priorFailed.getShortId(), e.getMessage(), e);
+                }
+
+                // shut down trade
+                try {
+                    priorFailed.shutDown();
+                } catch (Exception e) {
+                    log.warn("Error shutting down prior failed {} {}: {}", priorFailed.getClass().getSimpleName(), priorFailed.getShortId(), e.getMessage(), e);
+                } finally {
+                    unregisterTradeProtocol(priorFailed);
+                }
+            });
+        }
+    }
+
+    // remove an open unfunded trade so a new trade can be created for the same id
+    private void supersedeOpenTrade(Trade trade) {
+        log.warn("Removing open {} {} superseded by a new trade for the same id", trade.getClass().getSimpleName(), trade.getShortId());
+        trade.onSuperseded(); // keeps the shared trade-id executors for the new trade
+        removeTrade(trade);
+        trade.clearAndShutDown(); // deletes the unfunded trade's wallet
     }
 
     private void addTradeToPendingTrades(Trade trade) {
@@ -1068,7 +1452,7 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
                 try {
                     initTrade(trade);
                 } catch (Exception e) {
-                    log.warn("Error initializing {} {} on move to pending trades", trade.getClass().getSimpleName(), trade.getShortId(), e);
+                    handleTradeInitializationError(trade, e);
                 }
             });
         }
@@ -1282,8 +1666,13 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         }
     }
 
+    // checks for the trade instance, since id lookups can match another trade with the same id
+    public boolean hasTradeInstance(Trade trade) {
+        return hasOpenTrade(trade) || failedTradesManager.getObservableList().contains(trade);
+    }
+
     public boolean hasFailedScheduledTrade(String offerId) {
-        return failedTradesManager.getTradeById(offerId).isPresent() && failedTradesManager.getTradeById(offerId).get().isProtocolErrorHandlingScheduled();
+        return failedTradesManager.getTradesById(offerId).stream().anyMatch(Trade::isProtocolErrorHandlingScheduled);
     }
 
     public Optional<Trade> getOpenTradeByUid(String tradeUid) {
@@ -1321,6 +1710,13 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         }
     }
 
+    public List<Trade> getFailedTrades() {
+        List<Trade> failedTrades = failedTradesManager.getObservableList();
+        synchronized (failedTrades) {
+            return ImmutableList.copyOf(failedTrades);
+        }
+    }
+
     public List<Trade> getClosedTrades() {
         return closedTradableManager.getClosedTrades();
     }
@@ -1339,12 +1735,83 @@ public class TradeManager implements PersistedDataHost, DecryptedDirectMessageLi
         return failedTradesManager.getTradeById(tradeId);
     }
 
+    public void addAmbiguousPaymentRejectedListener(Consumer<String> listener) {
+        ambiguousPaymentRejectedListeners.add(listener);
+    }
+
+    private void notifyAmbiguousPaymentRejected(String offerId) {
+        ambiguousPaymentRejectedListeners.forEach(listener -> {
+            try {
+                listener.accept(offerId);
+            } catch (RuntimeException e) {
+                log.warn("Failed to notify ambiguous payment rejection listener for offer {}: {}", offerId, e.getMessage());
+            }
+        });
+    }
+
     private void addTrade(Trade trade) {
         synchronized (tradableList.getList()) {
             if (tradableList.add(trade)) {
                 requestPersistence();
             }
         }
+    }
+
+    void addMakerTrade(Trade trade) {
+        // Different offers initialize on different threads; checking and adding must be atomic.
+        synchronized (tradableList.getList()) {
+            setTradePrice(trade, trade.getRawPrice().getValue());
+            addTrade(trade);
+        }
+    }
+
+    public void setTradePrice(Trade trade, long price) {
+        if (!trade.isMaker()) {
+            trade.setPrice(price);
+            return;
+        }
+        synchronized (tradableList.getList()) {
+            Volume volume = trade.getVolume(price);
+            checkArgument(price > 0 && volume != null, "Cannot determine trade payment amount");
+            Trade other = findAmbiguousPaymentTrade(trade.getOffer(), volume, trade);
+            if (other != null) {
+                log.warn("Rejecting ambiguous maker payment, tradeId={}, conflictingTradeId={}, paymentAmount={} {}",
+                        trade.getId(), other.getId(), volume, volume.getCurrencyCode());
+                throw new AmbiguousPaymentException("This offer is temporarily unavailable for the selected amount. Please choose a different amount or try again later.");
+            }
+            // Keep repricing atomic with admission, including the arbitrator's final price.
+            trade.setPrice(price);
+        }
+    }
+
+    public boolean hasAmbiguousPayment(Offer offer, Volume volume) {
+        synchronized (tradableList.getList()) {
+            return findAmbiguousPaymentTrade(offer, volume, null) != null;
+        }
+    }
+
+    @Nullable
+    private Trade findAmbiguousPaymentTrade(Offer offer, Volume volume, Trade excludedTrade) {
+        List<Trade> trades = new ArrayList<>(tradableList.getList());
+        trades.addAll(closedTradableManager.getClosedTrades());
+        ObservableList<Trade> failedTrades = failedTradesManager.getObservableList();
+        synchronized (failedTrades) {
+            // Retain failed deposits while cleanup is pending, deposits are published, or a wallet remains.
+            // Check wallet files without taking the wallet lock while holding the trade-list locks.
+            failedTrades.stream()
+                    .filter(Trade::isDepositRequested)
+                    .filter(t -> t.isProtocolErrorHandlingScheduled() || t.isDepositsPublished() || t.walletExistsNoSync())
+                    .forEach(trades::add);
+        }
+        for (Trade other : trades) {
+            if (other == excludedTrade || !other.isMaker() || other.isPayoutPublished()) continue;
+            if (other.getOffer().getDirection() != offer.getDirection()) continue;
+            if (!other.getOffer().getCounterCurrencyCode().equals(offer.getCounterCurrencyCode())) continue;
+            if (!other.getOffer().getMakerPaymentAccountId().equals(offer.getMakerPaymentAccountId())) continue;
+            Volume otherVolume = other.getVolume();
+            if (otherVolume == null || otherVolume.getValue() == volume.getValue()) return other;
+        }
+        return null;
     }
 
     // TODO Remove once tradableList is refactored to a final field

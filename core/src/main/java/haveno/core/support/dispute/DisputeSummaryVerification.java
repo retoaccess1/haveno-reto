@@ -61,6 +61,13 @@ public class DisputeSummaryVerification {
                 SEPARATOR2);
     }
 
+    // true when the signed summary carries no content outside the signed text and signature block
+    public static boolean isWellFormed(String summaryText) {
+        int sepIndex = summaryText.indexOf(SEPARATOR1);
+        if (sepIndex < 0 || summaryText.indexOf(SEPARATOR1, sepIndex + 1) >= 0) return false;
+        return summaryText.indexOf(SEPARATOR2, sepIndex) == summaryText.length() - SEPARATOR2.length();
+    }
+
     public static void verifySignature(String input,
                                          ArbitratorManager arbitratorManager) {
         // get dispute agent
@@ -68,12 +75,12 @@ public class DisputeSummaryVerification {
         try {
             String[] parts = input.split(SEPARATOR1);
             String textToSign = parts[0];
-            String fullAddress = textToSign.split("\n")[1].split(": ")[1];
+            String fullAddress = textToSign.split("\n")[1].split("[:：]", 2)[1].trim();
             NodeAddress nodeAddress = new NodeAddress(fullAddress);
             disputeAgent = arbitratorManager.getDisputeAgentByNodeAddress(nodeAddress).orElse(null);
             checkNotNull(disputeAgent, "Dispute agent is null");
         } catch (Throwable e) {
-            log.error("Error verifying signature: {}\n", e.getMessage(), e);
+            log.debug("Error verifying signature: {}", e.getMessage()); // expected on partial input, checked per keystroke
             throw new IllegalArgumentException(Res.get("support.sigCheck.popup.invalidFormat"));
         }
 
@@ -95,7 +102,7 @@ public class DisputeSummaryVerification {
                 throw new IllegalArgumentException(Res.get("support.sigCheck.popup.failed"));
             }
         } catch (Throwable e) {
-            log.error("Error verifying signature with agent pub key ring: {}\n", e.getMessage(), e);
+            log.debug("Error verifying signature with agent pub key ring: {}", e.getMessage());
             throw new IllegalArgumentException(Res.get("support.sigCheck.popup.invalidFormat"));
         }
     }

@@ -5,6 +5,11 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      attach_installers:
+        description: 'Attach desktop installers to the run'
+        type: boolean
+        default: false
   push:
   pull_request:
     paths-ignore:
@@ -12,6 +17,10 @@ on:
 
 jobs:
   build:
+    # Installers always build (to validate packaging) but are attached only on
+    # tags, manual dispatch with the option enabled, or an [attach-installers] commit.
+    env:
+      ATTACH_INSTALLERS: ${{ github.event_name == 'workflow_dispatch' && inputs.attach_installers || startsWith(github.ref, 'refs/tags/') || contains(github.event.head_commit.message, '[attach-installers]') }}
     strategy:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15, windows-2025]
@@ -36,7 +45,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           java-version: '21'
-          distribution: 'adopt'
+          distribution: 'temurin'
           cache: gradle
       - name: Create local share directory
         # ubuntu-24.04 Github runners do not have `~/.local/share` directory by default.
@@ -45,14 +54,14 @@ jobs:
         run: mkdir -p ~/.local/share
       - name: Build with Gradle with tests
         if: ${{ !(runner.os == 'Linux' && matrix.arch == 'aarch64') }}
-        run: ./gradlew build --stacktrace --scan
+        run: ./gradlew build --stacktrace
       - name: Build with Gradle, skip Desktop tests
         # JavaFX `21.x.x` ships with `x86_64` versions of
         # `libprism_es2.so` and `libprism_s2.so` shared objects.
         # This causes desktop tests to fail on `linux/aarch64`
         if: ${{ (runner.os == 'Linux' && matrix.arch == 'aarch64') }}
         run: |
-          ./gradlew build --stacktrace --scan -x desktop:test
+          ./gradlew build --stacktrace -x desktop:test
           echo "::warning title=Desktop Tests Skipped::Desktop tests (desktop:test) were \
           intentionally skipped for linux/aarch64 builds as JavaFX 21.x.x ships with x86_64 \
           shared objects, causing tests to fail. \
@@ -100,6 +109,9 @@ jobs:
       - name: Package Haveno Installer
         run: ./gradlew packageInstallers
         working-directory: .
+      - name: Build Daemon JAR
+        run: ./gradlew :daemon:shadowJar
+        working-directory: .
 
       - name: Build Daemon JAR
         if: >
@@ -110,19 +122,19 @@ jobs:
 
       # get version from jar
       - name: Set Version Unix
-        if: runner.os != 'Windows'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os != 'Windows' }}
         run: |
           export VERSION=$(ls desktop/build/temp-*/binaries/desktop-*.jar.SHA-256 | grep -Eo 'desktop-[0-9]+\.[0-9]+\.[0-9]+' | sed 's/desktop-//')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
       - name: Set Version Windows
-        if: runner.os == 'Windows'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Windows' }}
         run: |
           $VERSION = (Get-ChildItem -Path desktop\build\temp-*/binaries\desktop-*.jar.SHA-256).Name -replace 'desktop-', '' -replace '-.*', ''
           "VERSION=$VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
         shell: powershell
 
       - name: Move Release Files for Linux
-        if: runner.os == 'Linux'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
         run: |
             mkdir ${{ github.workspace }}/release-linux-rpm
             mkdir ${{ github.workspace }}/release-linux-deb
@@ -139,7 +151,7 @@ jobs:
             cp desktop/build/temp-*/binaries/desktop-*.jar.SHA-256 ${{ github.workspace }}/haveno-v${{ env.VERSION }}-linux-${{ matrix.arch }}-SNAPSHOT-all.jar.SHA-256
         shell: bash
       - name: Move Release Files for macOS
-        if: runner.os == 'MacOS'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'MacOS' }}
         run: |
             mkdir ${{ github.workspace }}/release-macos-${{ matrix.arch }}
             mv desktop/build/temp-*/binaries/Haveno-*.dmg ${{ github.workspace }}/release-macos-${{ matrix.arch }}/haveno-v${{ env.VERSION }}-macos-${{ matrix.arch }}-installer.dmg
@@ -147,43 +159,43 @@ jobs:
             cp desktop/build/temp-*/binaries/desktop-*.jar.SHA-256 ${{ github.workspace }}/haveno-v${{ env.VERSION }}-macos-${{ matrix.arch }}-SNAPSHOT-all.jar.SHA-256
         shell: bash
       - name: Move Release Files on Windows
-        if: runner.os == 'Windows'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Windows' }}
         run: |
           mkdir ${{ github.workspace }}/release-windows
           Move-Item -Path desktop\build\temp-*/binaries\Haveno-*.exe -Destination ${{ github.workspace }}/release-windows/haveno-v${{ env.VERSION }}-windows-${{ matrix.arch }}-installer.exe
           Copy-Item -Path desktop\build\temp-*/binaries\desktop-*.jar.SHA-256 -Destination ${{ github.workspace }}/release-windows
           Move-Item -Path desktop\build\temp-*/binaries\desktop-*.jar.SHA-256 -Destination ${{ github.workspace }}/haveno-v${{ env.VERSION }}-windows-SNAPSHOT-all.jar.SHA-256
         shell: powershell
-      - name: Move Daemon JAR on Linux
-        if: runner.os == 'Linux'
+      - name: Move Daemon JAR for Linux
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
         run: |
-            mkdir -p ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}
+            mkdir ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}
             mv daemon/build/libs/daemon-all.jar ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}/daemon-linux-${{ matrix.arch }}.jar
-            sha256sum ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}/daemon-linux-${{ matrix.arch }}.jar > ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}/daemon-linux-${{ matrix.arch }}.jar.SHA-256
+            cd "${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}"
+            sha256sum daemon-linux-${{ matrix.arch }}.jar > daemon-linux-${{ matrix.arch }}.jar.SHA-256
+        shell: bash
+      - name: Move Daemon JAR for macOS
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'MacOS' }}
+        run: |
+            mkdir ${{ github.workspace }}/release-daemon-macos-${{ matrix.arch }}
+            mv daemon/build/libs/daemon-all.jar ${{ github.workspace }}/release-daemon-macos-${{ matrix.arch }}/daemon-macos-${{ matrix.arch }}.jar
+            cd "${{ github.workspace }}/release-daemon-macos-${{ matrix.arch }}"
+            shasum -a 256 daemon-macos-${{ matrix.arch }}.jar > daemon-macos-${{ matrix.arch }}.jar.SHA-256
         shell: bash
       - name: Move Daemon JAR on Windows
-        if: runner.os == 'Windows'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Windows' }}
         run: |
-            mkdir ${{ github.workspace }}\release-daemon-windows
-            Move-Item daemon\build\libs\daemon-all.jar ${{ github.workspace }}\release-daemon-windows\daemon-windows.jar
-            Get-FileHash ${{ github.workspace }}\release-daemon-windows\daemon-windows.jar -Algorithm SHA256 | ForEach-Object { $_.Hash } > ${{ github.workspace }}\release-daemon-windows\daemon-windows.jar.SHA-256
+          mkdir ${{ github.workspace }}/release-daemon-windows
+          Move-Item -Path daemon\build\libs\daemon-all.jar -Destination ${{ github.workspace }}/release-daemon-windows/daemon-windows.jar
+          Set-Location "${{ github.workspace }}/release-daemon-windows"
+          $daemonHash = (Get-FileHash daemon-windows.jar -Algorithm SHA256).Hash
+          "$daemonHash *daemon-windows.jar`n" | Set-Content daemon-windows.jar.SHA-256 -Encoding ascii -NoNewline
         shell: powershell
-      - uses: actions/upload-artifact@v4
-        name: "Linux daemon artifacts"
-        if: runner.os == 'Linux'
-        with:
-            name: daemon-linux-${{ matrix.arch }}
-            path: ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
-        name: "Windows daemon artifacts"
-        if: runner.os == 'Windows'
-        with:
-            name: daemon-windows
-            path: ${{ github.workspace }}/release-daemon-windows
+
       # Windows artifacts
       - uses: actions/upload-artifact@v4
         name: "Windows artifacts"
-        if: runner.os == 'Windows'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Windows' }}
         with:
           name: haveno-windows-${{ matrix.arch }}
           path: ${{ github.workspace }}/release-windows
@@ -191,7 +203,7 @@ jobs:
       # macOS artifacts
       - uses: actions/upload-artifact@v4
         name: "macOS artifacts"
-        if: runner.os == 'MacOS'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'MacOS' }}
         with:
           name: haveno-macos-${{ matrix.arch }}
           path: ${{ github.workspace }}/release-macos-${{ matrix.arch }}
@@ -199,31 +211,53 @@ jobs:
       # Linux artifacts
       - uses: actions/upload-artifact@v4
         name: "Linux - deb artifact"
-        if: runner.os == 'Linux'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
         with:
           name: haveno-linux-${{ matrix.arch }}-deb
           path: ${{ github.workspace }}/release-linux-deb
 
       - uses: actions/upload-artifact@v4
         name: "Linux - rpm artifact"
-        if: runner.os == 'Linux'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
         with:
           name: haveno-linux-${{ matrix.arch }}-rpm
           path: ${{ github.workspace }}/release-linux-rpm
 
       - uses: actions/upload-artifact@v4
         name: "Linux - AppImage artifact"
-        if: runner.os == 'Linux'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
         with:
           name: haveno-linux-${{ matrix.arch }}-appimage
           path: ${{ github.workspace }}/release-linux-appimage
 
       - uses: actions/upload-artifact@v4
         name: "Linux - flatpak artifact"
-        if: runner.os == 'Linux'
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
         with:
           name: haveno-linux-${{ matrix.arch }}-flatpak
           path: ${{ github.workspace }}/release-linux-flatpak
+
+      # Daemon artifacts
+      - uses: actions/upload-artifact@v4
+        name: "Daemon - Linux artifact"
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Linux' }}
+        with:
+          name: daemon-linux-${{ matrix.arch }}
+          path: ${{ github.workspace }}/release-daemon-linux-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        name: "Daemon - macOS artifact"
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'MacOS' }}
+        with:
+          name: daemon-macos-${{ matrix.arch }}
+          path: ${{ github.workspace }}/release-daemon-macos-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        name: "Daemon - Windows artifact"
+        if: ${{ env.ATTACH_INSTALLERS == 'true' && runner.os == 'Windows' }}
+        with:
+          name: daemon-windows
+          path: ${{ github.workspace }}/release-daemon-windows
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -259,10 +293,12 @@ jobs:
             # Daemon JARs
             ${{ github.workspace }}/release-daemon-linux-x86_64/daemon-linux-x86_64.jar
             ${{ github.workspace }}/release-daemon-linux-x86_64/daemon-linux-x86_64.jar.SHA-256
-
             ${{ github.workspace }}/release-daemon-linux-aarch64/daemon-linux-aarch64.jar
             ${{ github.workspace }}/release-daemon-linux-aarch64/daemon-linux-aarch64.jar.SHA-256
-
+            ${{ github.workspace }}/release-daemon-macos-x86_64/daemon-macos-x86_64.jar
+            ${{ github.workspace }}/release-daemon-macos-x86_64/daemon-macos-x86_64.jar.SHA-256
+            ${{ github.workspace }}/release-daemon-macos-aarch64/daemon-macos-aarch64.jar
+            ${{ github.workspace }}/release-daemon-macos-aarch64/daemon-macos-aarch64.jar.SHA-256
             ${{ github.workspace }}/release-daemon-windows/daemon-windows.jar
             ${{ github.workspace }}/release-daemon-windows/daemon-windows.jar.SHA-256
 

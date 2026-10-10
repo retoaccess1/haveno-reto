@@ -29,6 +29,7 @@ import java.time.Duration;
 public class UITimer implements Timer {
     private final Logger log = LoggerFactory.getLogger(UITimer.class);
     private haveno.common.reactfx.Timer timer;
+    private volatile boolean stopped;
 
     public UITimer() {
     }
@@ -36,8 +37,9 @@ public class UITimer implements Timer {
     @Override
     public Timer runLater(Duration delay, Runnable runnable) {
         executeDirectlyIfPossible(() -> {
+            if (stopped) return;
             if (timer == null) {
-                timer = FxTimer.create(delay, runnable);
+                timer = FxTimer.create(delay, guarded(runnable));
                 timer.restart();
             } else {
                 log.warn("runLater called on an already running timer.");
@@ -49,8 +51,9 @@ public class UITimer implements Timer {
     @Override
     public Timer runPeriodically(Duration interval, Runnable runnable) {
         executeDirectlyIfPossible(() -> {
+            if (stopped) return;
             if (timer == null) {
-                timer = FxTimer.createPeriodic(interval, runnable);
+                timer = FxTimer.createPeriodic(interval, guarded(runnable));
                 timer.restart();
             } else {
                 log.warn("runPeriodically called on an already running timer.");
@@ -61,6 +64,7 @@ public class UITimer implements Timer {
 
     @Override
     public void stop() {
+        stopped = true;
         executeDirectlyIfPossible(() -> {
             if (timer != null) {
                 timer.stop();
@@ -75,5 +79,11 @@ public class UITimer implements Timer {
         } else {
             UserThread.execute(runnable);
         }
+    }
+
+    private Runnable guarded(Runnable runnable) {
+        return () -> {
+            if (!stopped) runnable.run();
+        };
     }
 }

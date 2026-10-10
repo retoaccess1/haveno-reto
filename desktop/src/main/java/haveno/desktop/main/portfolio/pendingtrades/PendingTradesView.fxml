@@ -27,25 +27,32 @@
 <VBox fx:id="root" fx:controller="haveno.desktop.main.portfolio.pendingtrades.PendingTradesView"
       spacing="10" xmlns:fx="http://javafx.com/fxml">
     <padding>
-        <Insets bottom="0.0" left="15.0" right="15.0" top="15.0"/>
+        <Insets bottom="15.0" left="15.0" right="15.0" top="15.0"/>
     </padding>
-    <FilterBox fx:id="filterBox" />
-    <TableView fx:id="tableView" VBox.vgrow="SOMETIMES">
-        <columns>
-            <TableColumn fx:id="tradeIdColumn" minWidth="100"/>
-            <TableColumn fx:id="dateColumn" minWidth="180"/>
-            <TableColumn fx:id="marketColumn" minWidth="90"/>
-            <TableColumn fx:id="priceColumn" minWidth="90"/>
-            <TableColumn fx:id="amountColumn" minWidth="130"/>
-            <TableColumn fx:id="volumeColumn" minWidth="130"/>
-            <TableColumn fx:id="paymentMethodColumn" minWidth="130"/>
-            <TableColumn fx:id="roleColumn" minWidth="130"/>
-            <TableColumn fx:id="avatarColumn" minWidth="40" maxWidth="40"/>
-            <TableColumn fx:id="chatColumn" minWidth="40" maxWidth="40"/>
-            <TableColumn fx:id="moveTradeToFailedColumn" minWidth="80" maxWidth="80"/>
-        </columns>
-    </TableView>
-    <ScrollPane fx:id="scrollView" fitToWidth="true" hbarPolicy="NEVER"
+    <fx:define>
+        <FilterBox fx:id="filterBox" minWidth="160" prefWidth="220" maxWidth="220"/>
+    </fx:define>
+    <!-- scroll pane provides a horizontal bar when the window is narrower than the table's min width -->
+    <ScrollPane fx:id="tableScrollPane" fitToWidth="true" fitToHeight="true" vbarPolicy="NEVER"
+                focusTraversable="false" styleClass="table-scroll-pane" VBox.vgrow="SOMETIMES">
+        <TableView fx:id="tableView" styleClass="clickable-rows">
+            <columns>
+                <TableColumn fx:id="tradeIdColumn"/>
+                <TableColumn fx:id="dateColumn" minWidth="140"/>
+                <TableColumn fx:id="marketColumn" minWidth="75" maxWidth="130"/>
+                <TableColumn fx:id="priceColumn" minWidth="80"/>
+                <TableColumn fx:id="amountColumn" minWidth="105"/>
+                <TableColumn fx:id="volumeColumn" minWidth="110"/>
+                <TableColumn fx:id="paymentMethodColumn" minWidth="115" maxWidth="260"/>
+                <TableColumn fx:id="roleColumn" minWidth="90"/>
+                <TableColumn fx:id="statusColumn" minWidth="130"/>
+                <TableColumn fx:id="avatarColumn" minWidth="40" maxWidth="40"/>
+                <TableColumn fx:id="chatColumn" minWidth="50" maxWidth="50"/>
+                <TableColumn fx:id="moveTradeToFailedColumn" minWidth="70" maxWidth="70"/>
+            </columns>
+        </TableView>
+    </ScrollPane>
+    <ScrollPane fx:id="scrollView" fitToWidth="true" hbarPolicy="NEVER" VBox.vgrow="ALWAYS"
         AnchorPane.bottomAnchor="0.0" AnchorPane.leftAnchor="0.0"
         AnchorPane.rightAnchor="0.0" AnchorPane.topAnchor="0.0"/>
 

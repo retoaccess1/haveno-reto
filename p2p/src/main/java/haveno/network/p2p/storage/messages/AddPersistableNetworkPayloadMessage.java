@@ -18,6 +18,7 @@
 package haveno.network.p2p.storage.messages;
 
 import haveno.common.app.Version;
+import haveno.common.proto.ProtobufferException;
 import haveno.common.proto.network.NetworkProtoResolver;
 import haveno.network.p2p.storage.payload.PersistableNetworkPayload;
 import lombok.EqualsAndHashCode;
@@ -52,7 +53,7 @@ public final class AddPersistableNetworkPayloadMessage extends BroadcastMessage 
 
     public static AddPersistableNetworkPayloadMessage fromProto(protobuf.AddPersistableNetworkPayloadMessage proto,
                                                                 NetworkProtoResolver resolver,
-                                                                String messageVersion) {
+                                                                String messageVersion) throws ProtobufferException {
         return new AddPersistableNetworkPayloadMessage((PersistableNetworkPayload) resolver.fromProto(proto.getPayload()),
                 messageVersion);
     }

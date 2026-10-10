@@ -108,10 +108,14 @@ public class ProcessPaymentReceivedMessage extends TradeTask {
             // advance state, arbitrator auto completes when payout published
             trade.setStateIfValidTransitionTo(Trade.State.SELLER_SENT_PAYMENT_RECEIVED_MSG);
 
-            // buyer republishes signed witness for resilience
+            // store the signer chain sent in-band so we can validate the signed witness locally (#2182)
+            processModel.getAccountAgeWitnessService().addValidSignerChain(message.getSignerChain(), trade.getSeller().getPubKeyRing().getSignaturePubKeyBytes());
+
+            // buyer republishes signed witness for resilience; the data is peer controlled, so it is
+            // accepted only if it matches the witness the seller was supposed to create for that trade
             SignedWitness signedWitness = message.getBuyerSignedWitness();
             if (signedWitness != null && trade instanceof BuyerTrade) {
-                processModel.getAccountAgeWitnessService().publishOwnSignedWitness(signedWitness);
+                processModel.getAccountAgeWitnessService().publishOwnSignedWitness(signedWitness, trade);
             }
 
             // complete
@@ -156,11 +160,17 @@ public class ProcessPaymentReceivedMessage extends TradeTask {
             // verify and publish payout tx
             if (!trade.isPayoutPublished()) {
                 try {
-                    if (message.getPayoutTxId() != null && trade.isBuyer()) {
-                        trade.processBuyerPayout(message.getPayoutTxId()); // buyer can validate payout tx by id with main wallet (in case of multisig issues)
-                    } else if (message.getSignedPayoutTxHex() != null) {
-                        log.info("{} {} publishing signed payout tx from seller", trade.getClass().getSimpleName(), trade.getId());
-                        trade.processPayoutTx(message.getSignedPayoutTxHex(), false, true);
+                    if (message.getSignedPayoutTxHex() != null) {
+                        try {
+                            log.info("{} {} publishing signed payout tx from seller", trade.getClass().getSimpleName(), trade.getId());
+                            trade.processPayoutTx(message.getSignedPayoutTxHex(), false, true); // re-verifies the seller's signed tx against the contract and re-broadcasts it, never creates a conflicting payout
+                        } catch (Exception e) {
+                            if (message.getPayoutTxId() == null || !trade.isBuyer()) throw e;
+                            log.warn("Failed to process seller's signed payout tx for {} {}, observing payout tx {} by id. error={}", trade.getClass().getSimpleName(), trade.getId(), message.getPayoutTxId(), e.getMessage());
+                            trade.processBuyerPayout(message.getPayoutTxId()); // buyer can validate payout tx by id with main wallet (in case of multisig issues)
+                        }
+                    } else if (message.getPayoutTxId() != null && trade.isBuyer()) {
+                        trade.processBuyerPayout(message.getPayoutTxId());
                     } else {
                         PaymentSentMessage paymentSentMessage = (trade.isArbitrator() ? trade.getBuyer() : trade.getArbitrator()).getPaymentSentMessage();
                         if (paymentSentMessage == null) throw new RuntimeException("Process model does not have payment sent message for " + trade.getClass().getSimpleName() + " " + trade.getId());

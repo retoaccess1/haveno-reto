@@ -18,8 +18,8 @@
 package haveno.desktop.main.funds.transactions;
 
 import com.google.inject.Inject;
-import com.googlecode.jcsv.writer.CSVEntryConverter;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import java.util.function.Function;
+import haveno.common.ThreadUtils;
 import haveno.common.UserThread;
 import haveno.core.api.XmrConnectionService;
 import haveno.core.locale.Res;
@@ -32,6 +32,7 @@ import haveno.desktop.common.view.FxmlView;
 import haveno.desktop.components.AddressWithIconAndDirection;
 import haveno.desktop.components.AutoTooltipButton;
 import haveno.desktop.components.AutoTooltipLabel;
+import haveno.desktop.components.BusyAnimation;
 import haveno.desktop.components.HyperlinkWithIcon;
 import haveno.desktop.components.list.FilterBox;
 import haveno.desktop.main.overlays.windows.OfferDetailsWindow;
@@ -40,7 +41,9 @@ import haveno.desktop.main.overlays.windows.TxDetailsWindow;
 import haveno.desktop.util.GUIUtil;
 import haveno.network.p2p.P2PService;
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
@@ -49,10 +52,12 @@ import javafx.collections.transformation.SortedList;
 import javafx.event.EventHandler;
 import javafx.fxml.FXML;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.Label;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.TableView;
 import javafx.scene.control.Tooltip;
 import javafx.scene.input.KeyEvent;
@@ -70,11 +75,13 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
     @FXML
     FilterBox filterBox;
     @FXML
+    ScrollPane tableScrollPane;
+    @FXML
     TableView<TransactionsListItem> tableView;
     @FXML
     TableColumn<TransactionsListItem, TransactionsListItem> dateColumn, detailsColumn, addressColumn, transactionColumn, amountColumn, txFeeColumn, confidenceColumn, memoColumn;
     @FXML
-    Label numItems;
+    Label numItems, loadErrorLabel;
     @FXML
     Region spacer;
     @FXML
@@ -94,6 +101,12 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
 
     private EventHandler<KeyEvent> keyEventEventHandler;
     private Scene scene;
+    private BusyAnimation busyAnimation;
+    private AutoTooltipLabel placeholderLabel;
+    private boolean active;
+    private boolean hasLoadedTransactions;
+    private long activationId;
+    private static final String THREAD_ID = TransactionsView.class.getName();
 
     private final TransactionsUpdater transactionsUpdater = new TransactionsUpdater();
 
@@ -127,12 +140,12 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
         this.offerDetailsWindow = offerDetailsWindow;
         this.txDetailsWindow = txDetailsWindow;
         this.displayedTransactions = displayedTransactionsFactory.create();
-        updateList();
     }
 
     @Override
     public void initialize() {
         GUIUtil.applyTableStyle(tableView);
+        filterBox.setInputFillWidth(0);
         filterBox.initialize(filteredList, tableView);
         filterBox.setPromptText(Res.get("shared.filter"));
 
@@ -146,7 +159,12 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
         memoColumn.setGraphic(new AutoTooltipLabel(Res.get("funds.tx.memo")));
 
         tableView.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
-        tableView.setPlaceholder(new AutoTooltipLabel(Res.get("funds.tx.noTxAvailable")));
+        busyAnimation = new BusyAnimation(false);
+        placeholderLabel = new AutoTooltipLabel();
+        VBox placeholder = new VBox(10, busyAnimation, placeholderLabel);
+        placeholder.setAlignment(Pos.CENTER);
+        tableView.setPlaceholder(placeholder);
+        GUIUtil.applyTableHorizontalScroll(tableScrollPane, tableView);
         tableView.getStyleClass().add("non-interactive-table");
 
         setDateColumnCellFactory();
@@ -181,11 +199,20 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
         HBox.setHgrow(spacer, Priority.ALWAYS);
         numItems.setId("num-offers");
         numItems.setPadding(new Insets(-5, 0, 0, 10));
+        numItems.setVisible(false);
+        loadErrorLabel.setText(Res.get("funds.tx.loadFailed"));
+        loadErrorLabel.managedProperty().bind(loadErrorLabel.visibleProperty());
         exportButton.updateText(Res.get("shared.exportCSV"));
+        exportButton.setDisable(true);
+    }
+
+    public Region getHeaderControls() {
+        return filterBox;
     }
 
     @Override
     protected void activate() {
+        active = true;
         sortedList.comparatorProperty().bind(tableView.comparatorProperty());
         tableView.setItems(sortedList);
         updateList();
@@ -200,15 +227,15 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
             scene.addEventHandler(KeyEvent.KEY_RELEASED, keyEventEventHandler);
 
         exportButton.setOnAction(event -> {
-            final ObservableList<TableColumn<TransactionsListItem, ?>> tableColumns = GUIUtil.getContentColumns(tableView);
+            final ObservableList<TableColumn<TransactionsListItem, ?>> tableColumns = tableView.getColumns();
             final int reportColumns = tableColumns.size();
-            CSVEntryConverter<TransactionsListItem> headerConverter = item -> {
+            Function<TransactionsListItem, String[]> headerConverter = item -> {
                 String[] columns = new String[reportColumns];
                 for (int i = 0; i < columns.length; i++)
                     columns[i] = ((AutoTooltipLabel) tableColumns.get(i).getGraphic()).getText();
                 return columns;
             };
-            CSVEntryConverter<TransactionsListItem> contentConverter = item -> {
+            Function<TransactionsListItem, String[]> contentConverter = item -> {
                 String[] columns = new String[reportColumns];
                 columns[0] = item.getDateString();
                 columns[1] = item.getDetails();
@@ -228,6 +255,9 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
 
     @Override
     protected void deactivate() {
+        active = false;
+        activationId++;
+        busyAnimation.stop();
         filterBox.deactivate();
         sortedList.comparatorProperty().unbind();
         xmrWalletService.removeWalletListener(transactionsUpdater);
@@ -239,10 +269,44 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
     }
 
     private void updateList() {
-        displayedTransactions.update();
-        UserThread.execute((() -> {
-            observableList.setAll(displayedTransactions);
-        }));
+        UserThread.execute(() -> {
+            if (!active) return;
+            long currentActivation = activationId;
+            if (!hasLoadedTransactions) {
+                placeholderLabel.setText("");
+                busyAnimation.play();
+            }
+            ThreadUtils.execute(() -> {
+                try {
+                    synchronized (displayedTransactions) { // keep each refresh and its UI snapshot together
+                        displayedTransactions.update();
+                        List<TransactionsListItem> snapshot = new ArrayList<>(displayedTransactions);
+                        UserThread.execute(() -> {
+                            if (!active || currentActivation != activationId) return;
+                            hasLoadedTransactions = true;
+                            busyAnimation.stop();
+                            placeholderLabel.setText(Res.get("funds.tx.noTxAvailable"));
+                            loadErrorLabel.setVisible(false);
+                            observableList.setAll(snapshot);
+                            GUIUtil.updateFilterPlaceholder(tableView, sortedList.isEmpty() && !observableList.isEmpty());
+                            numItems.setText(Res.get("shared.numItemsLabel", sortedList.size()));
+                            numItems.setVisible(true);
+                            exportButton.setDisable(false);
+                            // hide the memo column when no transaction has a memo
+                            memoColumn.setVisible(snapshot.stream().anyMatch(item -> item.getMemo() != null && !item.getMemo().isEmpty()));
+                        });
+                    }
+                } catch (Exception e) {
+                    log.warn("Could not update transactions list", e);
+                    UserThread.execute(() -> {
+                        if (!active || currentActivation != activationId) return;
+                        busyAnimation.stop();
+                        placeholderLabel.setText(Res.get("funds.tx.loadFailed"));
+                        loadErrorLabel.setVisible(!observableList.isEmpty());
+                    });
+                }
+            }, THREAD_ID);
+        });
     }
 
     private void openTxInBlockExplorer(TransactionsListItem item) {
@@ -312,7 +376,8 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
 
                                 if (item != null && !empty) {
                                     if (item.getDetailsAvailable()) {
-                                        hyperlinkWithIcon = new HyperlinkWithIcon(item.getDetails(), AwesomeIcon.INFO_SIGN);
+                                        hyperlinkWithIcon = new HyperlinkWithIcon(item.getDetails());
+                                        hyperlinkWithIcon.hideIcon();
                                         hyperlinkWithIcon.setOnAction(event -> openDetailPopup(item));
                                         hyperlinkWithIcon.setTooltip(new Tooltip(Res.get("tooltip.openPopupForDetails")));
                                         setGraphic(hyperlinkWithIcon);
@@ -342,22 +407,17 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
                             TransactionsListItem> column) {
                         return new TableCell<>() {
 
-                            private AddressWithIconAndDirection field;
-
                             @Override
                             public void updateItem(final TransactionsListItem item, boolean empty) {
                                 super.updateItem(item, empty);
 
                                 if (item != null && !empty) {
                                     String addressString = item.getAddressString();
-                                    field = new AddressWithIconAndDirection(item.getDirection(), addressString,
-                                            item.getReceived());
-                                    field.setTooltip(new Tooltip(Res.get("tooltip.openBlockchainForAddress", addressString)));
+                                    AddressWithIconAndDirection field = new AddressWithIconAndDirection(item.getDirection(),
+                                            addressString, item.getReceived());
                                     setGraphic(field);
                                 } else {
                                     setGraphic(null);
-                                    if (field != null)
-                                        field.setOnAction(null);
                                 }
                             }
                         };
@@ -383,7 +443,8 @@ public class TransactionsView extends ActivatableView<VBox, Void> {
                                 //noinspection Duplicates
                                 if (item != null && !empty) {
                                     String transactionId = item.getTxId();
-                                    hyperlinkWithIcon = new HyperlinkWithIcon(transactionId, AwesomeIcon.INFO_SIGN);
+                                    hyperlinkWithIcon = new HyperlinkWithIcon(transactionId);
+                                    hyperlinkWithIcon.hideIcon();
                                     hyperlinkWithIcon.setOnAction(event -> openTxDetailPopup(item));
                                     hyperlinkWithIcon.setTooltip(new Tooltip(Res.get("txDetailsWindow.headline")));
                                     setGraphic(hyperlinkWithIcon);

@@ -29,13 +29,16 @@ import haveno.core.trade.Trade;
 import haveno.core.trade.TradeUtil;
 import haveno.core.xmr.model.XmrAddressEntry;
 import haveno.core.xmr.wallet.XmrWalletService;
+import javax.annotation.Nullable;
 import javafx.collections.ObservableList;
 import lombok.Setter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class FailedTradesManager implements PersistedDataHost {
@@ -87,6 +90,11 @@ public class FailedTradesManager implements PersistedDataHost {
 
     public void add(Trade trade) {
         synchronized (failedTrades.getList()) {
+            // reject a second copy of an already listed trade so the store cannot hold duplicates
+            if (failedTrades.stream().anyMatch(t -> t != trade && t.getUid().equals(trade.getUid()))) {
+                log.warn("Not adding {} {} to failed trades because a copy with the same uid exists", trade.getClass().getSimpleName(), trade.getId());
+                return;
+            }
             if (failedTrades.add(trade)) {
                 requestPersistence();
             }
@@ -114,6 +122,13 @@ public class FailedTradesManager implements PersistedDataHost {
     public Optional<Trade> getTradeById(String id) {
         synchronized (failedTrades.getList()) {
             return failedTrades.stream().filter(e -> e.getId().equals(id)).findFirst();
+        }
+    }
+
+    // repeated attempts for the same offer can accumulate multiple failed trades with the same id
+    public List<Trade> getTradesById(String id) {
+        synchronized (failedTrades.getList()) {
+            return failedTrades.stream().filter(e -> e.getId().equals(id)).collect(Collectors.toList());
         }
     }
 
@@ -156,7 +171,11 @@ public class FailedTradesManager implements PersistedDataHost {
         return blockingTrades.toString();
     }
 
-    private void requestPersistence() {
+    public void requestPersistence() {
         persistenceManager.requestPersistence();
+    }
+
+    public void persistNow(@Nullable Runnable completeHandler) {
+        persistenceManager.persistNow(completeHandler);
     }
 }

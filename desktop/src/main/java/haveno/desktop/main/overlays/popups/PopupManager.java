@@ -18,20 +18,29 @@
 package haveno.desktop.main.overlays.popups;
 
 import haveno.common.UserThread;
+import haveno.desktop.main.overlays.Overlay;
+import javafx.beans.property.ReadOnlyBooleanProperty;
+import javafx.beans.property.ReadOnlyBooleanWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 public class PopupManager {
     private static final Logger log = LoggerFactory.getLogger(PopupManager.class);
-    private static final Queue<Popup> popups = new LinkedBlockingQueue<>(5);
+    private static final Queue<Overlay<?>> popups = new LinkedBlockingQueue<>(5);
+    private static final List<Overlay<?>> displayedPopups = new ArrayList<>();
+    private static final ReadOnlyBooleanWrapper hasPendingPopups = new ReadOnlyBooleanWrapper();
 
-    private static Popup displayedPopup;
+    public static ReadOnlyBooleanProperty hasPendingPopupsProperty() {
+        return hasPendingPopups.getReadOnlyProperty();
+    }
 
-    public static void queueForDisplay(Popup popup) {
+    public static void queueForDisplay(Overlay<?> popup) {
         if (hasDuplicatePopup(popup)) {
             log.warn("The popup is already in the queue or displayed.\n\t" +
                    "New popup not added=" + popup);
@@ -44,33 +53,48 @@ public class PopupManager {
         displayNext();
     }
 
-    public static void onHidden(Popup popup) {
-        if (displayedPopup == null || displayedPopup == popup) {
-            displayedPopup = null;
-            UserThread.runAfter(() -> { displayNext(); }, 100, TimeUnit.MILLISECONDS);
+    // prompts opened from within a popup bypass the queue and block every managed popup beneath them
+    public static void displayNested(Overlay<?> popup) {
+        if (displayedPopups.isEmpty()) {
+            queueForDisplay(popup);
+            return;
+        }
+        if (hasDuplicatePopup(popup)) {
+            log.warn("The popup is already in the queue or displayed.\n\t" +
+                    "New popup not added=" + popup);
+            return;
+        }
+        List<Overlay<?>> parents = List.copyOf(displayedPopups);
+        displayedPopups.add(popup);
+        popup.displayAbove(parents);
+    }
+
+    public static void onHidden(Overlay<?> popup) {
+        if (displayedPopups.remove(popup)) {
+            if (displayedPopups.isEmpty())
+                UserThread.runAfter(PopupManager::displayNext, 100, TimeUnit.MILLISECONDS);
         } else {
-            boolean removed = popups.remove(popup);
-            if (removed) {
-            log.warn("We got a isHidden called with a wrong popup.\n\t" +
-                    "popup (argument)=" + popup + "\n\tdisplayedPopup=" + displayedPopup);
-            }
+            popups.remove(popup);
         }
     }
 
     private static void displayNext() {
-        if (displayedPopup == null) {
-            if (!popups.isEmpty()) {
-                displayedPopup = popups.poll();
-                displayedPopup.onReadyForDisplay();
-            }
+        // keep notifications deferred through the gap between queued popups
+        hasPendingPopups.set(!displayedPopups.isEmpty() || !popups.isEmpty());
+        if (displayedPopups.isEmpty() && !popups.isEmpty()) {
+            Overlay<?> popup = popups.poll();
+            displayedPopups.add(popup);
+            popup.display();
         }
     }
 
-    private static boolean hasDuplicatePopup(Popup popup) {
-        if (displayedPopup != null && displayedPopup.toString().equals(popup.toString())) {
-            return true;
+    private static boolean hasDuplicatePopup(Overlay<?> popup) {
+        for (Overlay<?> p : displayedPopups) {
+            if (p.toString().equals(popup.toString())) {
+                return true;
+            }
         }
-        for (Popup p : popups) {
+        for (Overlay<?> p : popups) {
             if (p.toString().equals(popup.toString())) {
                 return true;
             }

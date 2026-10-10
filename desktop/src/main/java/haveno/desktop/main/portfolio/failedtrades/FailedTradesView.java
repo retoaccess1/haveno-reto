@@ -18,9 +18,9 @@
 package haveno.desktop.main.portfolio.failedtrades;
 
 import com.google.inject.Inject;
-import com.googlecode.jcsv.writer.CSVEntryConverter;
+import java.util.function.Function;
 import com.jfoenix.controls.JFXButton;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import haveno.common.util.Utilities;
 import haveno.core.locale.Res;
 import haveno.core.trade.HavenoUtils;
@@ -36,6 +36,7 @@ import haveno.desktop.components.list.FilterBox;
 import haveno.desktop.main.offer.OfferViewUtil;
 import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.main.overlays.windows.TradeDetailsWindow;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.FormBuilder;
 import haveno.desktop.util.GUIUtil;
 import java.math.BigInteger;
@@ -104,6 +105,7 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
 
     @Override
     public void initialize() {
+        filterBox.setInputFillWidth(0);
         GUIUtil.applyTableStyle(tableView);
 
         priceColumn.setGraphic(new AutoTooltipLabel(Res.get("shared.price")));
@@ -166,6 +168,10 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
         exportButton.updateText(Res.get("shared.exportCSV"));
     }
 
+    public Region getHeaderControls() {
+        return filterBox;
+    }
+
     @Override
     protected void activate() {
         scene = root.getScene();
@@ -183,6 +189,13 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
         filterBox.activate();
 
         contextMenu = new ContextMenu();
+        MenuItem moveToOpenTrades = new MenuItem(Res.get("portfolio.failed.revertToPending"));
+        moveToOpenTrades.setOnAction(event -> {
+            FailedTradesListItem item = tableView.getSelectionModel().getSelectedItem();
+            if (item != null) onRevertTrade(item.getTrade());
+        });
+        contextMenu.getItems().add(moveToOpenTrades);
+
         boolean isArbitrator = user.getRegisteredArbitrator() != null;
         if (isArbitrator) {
             MenuItem item1 = new MenuItem(Res.get("support.contextmenu.penalize.msg", Res.get("shared.maker")));
@@ -214,6 +227,9 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
         tableView.setRowFactory(tv -> {
             TableRow<FailedTradesListItem> row = new TableRow<>();
             row.setOnContextMenuRequested(event -> {
+                FailedTradesListItem item = row.getItem();
+                if (item == null) return;
+                moveToOpenTrades.setDisable(!item.getTrade().isDepositsPublished());
                 contextMenu.show(row, event.getScreenX(), event.getScreenY());
             });
             return row;
@@ -221,15 +237,15 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
 
         numItems.setText(Res.get("shared.numItemsLabel", sortedList.size()));
         exportButton.setOnAction(event -> {
-            ObservableList<TableColumn<FailedTradesListItem, ?>> tableColumns = GUIUtil.getContentColumns(tableView);
+            ObservableList<TableColumn<FailedTradesListItem, ?>> tableColumns = tableView.getColumns();
             int reportColumns = tableColumns.size() - 1;    // CSV report excludes the last column (an icon)
-            CSVEntryConverter<FailedTradesListItem> headerConverter = item -> {
+            Function<FailedTradesListItem, String[]> headerConverter = item -> {
                 String[] columns = new String[reportColumns];
                 for (int i = 0; i < columns.length; i++)
                     columns[i] = ((AutoTooltipLabel) tableColumns.get(i).getGraphic()).getText();
                 return columns;
             };
-            CSVEntryConverter<FailedTradesListItem> contentConverter = item -> {
+            Function<FailedTradesListItem, String[]> contentConverter = item -> {
                 String[] columns = new String[reportColumns];
                 columns[0] = item.getTrade().getId();
                 columns[1] = item.getDateAsString();
@@ -329,6 +345,8 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
                                 super.updateItem(item, empty);
                                 if (item != null && !empty) {
                                     field = new HyperlinkWithIcon(item.getTrade().getShortId());
+                                    field.hideIcon();
+                                    Accessibility.setName(field, Accessibility.spellOut(item.getTrade().getShortId()));
                                     field.setOnAction(event -> tradeDetailsWindow.show(item.getTrade()));
                                     field.setTooltip(new Tooltip(Res.get("tooltip.openPopupForDetails")));
                                     setGraphic(field);
@@ -483,7 +501,7 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
                                 super.updateItem(item, empty);
                                 if (item != null) {
                                     AutoTooltipLabel directionLabel = new AutoTooltipLabel(item.getDirectionLabel());
-                                    if (item.isPrivateOffer()) GUIUtil.addPrivateOfferLockIcon(directionLabel);
+                                    if (item.isPrivateOffer()) GUIUtil.addCompactPrivateOfferLockIcon(directionLabel);
                                     setGraphic(directionLabel);
                                 } else
                                     setGraphic(null);
@@ -506,11 +524,12 @@ public class FailedTradesView extends ActivatableViewAndModel<VBox, FailedTrades
                             public void updateItem(FailedTradesListItem newItem, boolean empty) {
                                 super.updateItem(newItem, empty);
                                 if (!empty && newItem != null && newItem.getTrade().isDepositsPublished()) {
-                                    Label icon = FormBuilder.getIcon(AwesomeIcon.UNDO);
+                                    Label icon = FormBuilder.getIcon(FontAwesomeIcon.UNDO);
                                     JFXButton iconButton = new JFXButton("", icon);
                                     iconButton.setStyle("-fx-cursor: hand;");
                                     iconButton.getStyleClass().add("hidden-icon-button");
                                     iconButton.setTooltip(new Tooltip(Res.get("portfolio.failed.revertToPending")));
+                                    Accessibility.nameFromTooltip(iconButton);
                                     iconButton.setOnAction(e -> onRevertTrade(newItem.getTrade()));
                                     setGraphic(iconButton);
                                 } else {

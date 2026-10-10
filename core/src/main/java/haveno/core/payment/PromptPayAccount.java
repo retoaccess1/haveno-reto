@@ -18,6 +18,8 @@
 package haveno.core.payment;
 
 import haveno.core.api.model.PaymentAccountFormField;
+import haveno.core.locale.Country;
+import haveno.core.locale.CountryUtil;
 import haveno.core.locale.TraditionalCurrency;
 import haveno.core.locale.TradeCurrency;
 import haveno.core.payment.payload.PaymentAccountPayload;
@@ -27,11 +29,18 @@ import lombok.EqualsAndHashCode;
 import lombok.NonNull;
 
 import java.util.List;
+import javax.annotation.Nullable;
 
 @EqualsAndHashCode(callSuper = true)
 public final class PromptPayAccount extends PaymentAccount {
 
     public static final List<TradeCurrency> SUPPORTED_CURRENCIES = List.of(new TraditionalCurrency("THB"));
+
+    private static final List<PaymentAccountFormField.FieldId> INPUT_FIELD_IDS = List.of(
+            PaymentAccountFormField.FieldId.PROMPT_PAY_ID,
+            PaymentAccountFormField.FieldId.ACCOUNT_NAME,
+            PaymentAccountFormField.FieldId.SALT
+    );
 
     public PromptPayAccount() {
         super(PaymentMethod.PROMPT_PAY);
@@ -49,8 +58,14 @@ public final class PromptPayAccount extends PaymentAccount {
     }
 
     @Override
+    @Nullable
+    public List<Country> getSupportedCountries() {
+        return List.of(CountryUtil.findCountryByCode("TH").get());
+    }
+
+    @Override
     public @NonNull List<PaymentAccountFormField.FieldId> getInputFieldIds() {
-        throw new RuntimeException("Not implemented");
+        return INPUT_FIELD_IDS;
     }
 
     public void setPromptPayId(String promptPayId) {

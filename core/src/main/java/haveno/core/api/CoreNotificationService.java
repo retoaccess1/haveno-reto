@@ -1,6 +1,7 @@
 package haveno.core.api;
 
 import com.google.inject.Singleton;
+import haveno.core.alert.Alert;
 import haveno.core.api.model.TradeInfo;
 import haveno.core.support.messages.ChatMessage;
 import haveno.core.trade.BuyerTrade;
@@ -73,11 +74,19 @@ public class CoreNotificationService {
     }
 
     public void sendChatNotification(ChatMessage chatMessage) {
-        HavenoUtils.playChimeSound();
+        HavenoUtils.playChatSound();
         sendNotification(NotificationMessage.newBuilder()
                 .setType(NotificationType.CHAT_MESSAGE)
                 .setTimestamp(System.currentTimeMillis())
                 .setChatMessage(chatMessage.toProtoNetworkEnvelope().getChatMessage())
+                .build());
+    }
+
+    public void sendAlertNotification(Alert alert) {
+        sendNotification(NotificationMessage.newBuilder()
+                .setType(NotificationType.ALERT)
+                .setTimestamp(System.currentTimeMillis())
+                .setAlert(alert.toProtoMessage().getAlert())
                 .build());
     }
 

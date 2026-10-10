@@ -20,10 +20,10 @@ package haveno.desktop.main.shared;
 import haveno.desktop.components.AutoTooltipButton;
 import haveno.desktop.components.AutoTooltipLabel;
 import haveno.desktop.components.HavenoTextArea;
-import haveno.desktop.components.BusyAnimation;
 import haveno.desktop.components.TableGroupHeadline;
 import haveno.desktop.main.overlays.notifications.Notification;
 import haveno.desktop.main.overlays.popups.Popup;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.DisplayUtils;
 import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.Layout;
@@ -31,50 +31,63 @@ import haveno.core.locale.Res;
 import haveno.core.support.SupportManager;
 import haveno.core.support.SupportSession;
 import haveno.core.support.dispute.Attachment;
+import haveno.core.support.dispute.DisputeSession;
 import haveno.core.support.messages.ChatMessage;
 
 import haveno.network.p2p.network.Connection;
 
-import haveno.common.Timer;
 import haveno.common.UserThread;
 import haveno.common.util.Utilities;
 
 import com.google.common.io.ByteStreams;
 
-import de.jensd.fx.fontawesome.AwesomeDude;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import haveno.desktop.util.GlyphsDude;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
-import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIconView;
+import javafx.application.Platform;
+import javafx.beans.InvalidationListener;
+import javafx.beans.Observable;
+import javafx.beans.WeakInvalidationListener;
+import javafx.beans.binding.Bindings;
+import javafx.beans.binding.DoubleBinding;
 import javafx.stage.FileChooser;
 
+import javafx.css.PseudoClass;
 import javafx.scene.Node;
 import javafx.scene.control.Button;
+import javafx.scene.control.IndexedCell;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.Tooltip;
-import javafx.scene.image.ImageView;
+import javafx.scene.control.skin.VirtualFlow;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
+import javafx.scene.text.Text;
 import javafx.scene.text.TextAlignment;
 
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.fxmisc.easybind.EasyBind;
 import org.fxmisc.easybind.Subscription;
 
 import javafx.beans.property.ReadOnlyDoubleProperty;
-import javafx.beans.value.ChangeListener;
 
+import javafx.event.Event;
 import javafx.event.EventHandler;
 
+import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.SortedList;
@@ -94,7 +107,6 @@ import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -105,14 +117,17 @@ import javax.annotation.Nullable;
 @Slf4j
 public class ChatView extends AnchorPane {
 
+    private static final PseudoClass INPUT_VISIBLE_PSEUDO_CLASS = PseudoClass.getPseudoClass("input-visible");
+
     // UI
     private TextArea inputTextArea;
     private Button sendButton;
     private ListView<ChatMessage> messageListView;
-    private Label sendMsgInfoLabel;
-    private BusyAnimation sendMsgBusyAnimation;
     private TableGroupHeadline tableGroupHeadline;
     private VBox messagesInputBox;
+    private Button newMessagesButton;
+    private HBox newMessagesBox;
+    private boolean stickToBottom, userScrolled;
 
     // Options
     @Getter
@@ -125,13 +140,11 @@ public class ChatView extends AnchorPane {
     boolean displayHeader;
 
     // Communication stuff, to be renamed to something more generic
-    private ChatMessage chatMessage;
+    private static final ObservableList<ChatMessage> sendingMessages = FXCollections.observableArrayList(); // shared so a reopened chat window still shows sending
     private ObservableList<ChatMessage> chatMessages;
     private ListChangeListener<ChatMessage> disputeDirectMessageListListener;
     private Subscription inputTextAreaTextSubscription;
     private final List<Attachment> tempAttachments = new ArrayList<>();
-    private ChangeListener<Boolean> storedInMailboxPropertyListener, acknowledgedPropertyListener;
-    private ChangeListener<String> sendMessageErrorPropertyListener;
 
     private EventHandler<KeyEvent> keyEventEventHandler;
     private SupportManager supportManager;
@@ -146,7 +159,11 @@ public class ChatView extends AnchorPane {
     }
 
     public void initialize() {
-        disputeDirectMessageListListener = c -> scrollToBottom();
+        // follow new messages at the bottom, otherwise offer a button to jump to them
+        disputeDirectMessageListListener = c -> UserThread.execute(() -> {
+            if (stickToBottom && !userScrolled) scrollToLastMessage();
+            else if (newMessagesButton != null) newMessagesButton.setVisible(true);
+        });
 
         keyEventEventHandler = event -> {
             if (Utilities.isAltOrCtrlPressed(KeyCode.ENTER, event)) {
@@ -195,8 +212,45 @@ public class ChatView extends AnchorPane {
         messageListView = new ListView<>(sortedList);
         messageListView.setId("message-list-view");
 
+        // cell heights settle over several layouts, so keep the newest message at the bottom while the user is there
+        stickToBottom = false;
+        userScrolled = false;
+        EventHandler<Event> onUserScroll = e -> userScrolled = true;
+        messageListView.addEventFilter(ScrollEvent.SCROLL, onUserScroll);
+        messageListView.addEventFilter(MouseEvent.MOUSE_PRESSED, onUserScroll);
+        messageListView.addEventFilter(MouseEvent.MOUSE_DRAGGED, onUserScroll);
+        messageListView.addEventFilter(MouseEvent.MOUSE_RELEASED, onUserScroll);
+        messageListView.addEventFilter(KeyEvent.KEY_PRESSED, onUserScroll);
+        Runnable stickToBottomListener = () -> {
+            if (messageListView.getItems().isEmpty() || !(messageListView.lookup(".virtual-flow") instanceof VirtualFlow<?> flow)) return;
+            if (userScrolled || !stickToBottom) {
+                userScrolled = false;
+                stickToBottom = isScrolledToBottom(flow);
+                if (stickToBottom) newMessagesButton.setVisible(false);
+            } else if (flow.getPosition() < 1) {
+                scrollToBottom(flow, messageListView.getItems().size() - 1);
+            }
+        };
+        messageListView.sceneProperty().addListener((observable, oldScene, newScene) -> {
+            if (oldScene != null) oldScene.removePostLayoutPulseListener(stickToBottomListener);
+            if (newScene != null) newScene.addPostLayoutPulseListener(stickToBottomListener);
+        });
+
+        newMessagesButton = new AutoTooltipButton(Res.get("support.newMessages"));
+        Text newMessagesIcon = GlyphsDude.createIcon(FontAwesomeIcon.ARROW_DOWN, "11");
+        newMessagesIcon.fillProperty().bind(newMessagesButton.textFillProperty());
+        newMessagesButton.setGraphic(newMessagesIcon);
+        newMessagesButton.getStyleClass().add("chat-new-messages-button");
+        newMessagesButton.setVisible(false);
+        newMessagesButton.setOnAction(e -> scrollToBottom());
+        newMessagesBox = new HBox(newMessagesButton);
+        newMessagesBox.setAlignment(Pos.CENTER);
+        newMessagesBox.setPickOnBounds(false); // pass clicks beside the button through to the list
+        AnchorPane.setLeftAnchor(newMessagesBox, 0d);
+        AnchorPane.setRightAnchor(newMessagesBox, 0d);
+
         messageListView.setMinHeight(150);
-        AnchorPane.setTopAnchor(messageListView, 30d);
+        AnchorPane.setTopAnchor(messageListView, displayHeader ? 30d : 0d);
         AnchorPane.setRightAnchor(messageListView, 0d);
         AnchorPane.setLeftAnchor(messageListView, 0d);
 
@@ -224,13 +278,6 @@ public class ChatView extends AnchorPane {
         uploadButton.setStyle("-fx-pref-width: 125; -fx-min-width: 110; -fx-padding: 3 3 3 3;");
         clipboardButton.setStyle("-fx-pref-width: 125; -fx-min-width: 110; -fx-padding: 3 3 3 3;");
 
-        sendMsgInfoLabel = new AutoTooltipLabel();
-        sendMsgInfoLabel.setVisible(false);
-        sendMsgInfoLabel.setManaged(false);
-        sendMsgInfoLabel.setPadding(new Insets(5, 0, 0, 0));
-
-        sendMsgBusyAnimation = new BusyAnimation(false);
-
         if (displayHeader)
             this.getChildren().add(tableGroupHeadline);
 
@@ -238,48 +285,52 @@ public class ChatView extends AnchorPane {
             HBox buttonBox = new HBox();
             buttonBox.setSpacing(10);
             if (allowAttachments)
-                buttonBox.getChildren().addAll(sendButton, uploadButton, clipboardButton, sendMsgBusyAnimation, sendMsgInfoLabel);
-            else
-                buttonBox.getChildren().addAll(sendButton, sendMsgBusyAnimation, sendMsgInfoLabel);
-
-            if (extraButton != null) {
-                Pane spacer = new Pane();
-                HBox.setHgrow(spacer, Priority.ALWAYS);
-                buttonBox.getChildren().addAll(spacer, extraButton);
-            }
+                buttonBox.getChildren().addAll(uploadButton, clipboardButton);
+            if (extraButton != null)
+                buttonBox.getChildren().add(extraButton);
+            Pane spacer = new Pane();
+            HBox.setHgrow(spacer, Priority.ALWAYS);
+            buttonBox.getChildren().addAll(spacer, sendButton);
 
             messagesInputBox = new VBox();
             messagesInputBox.setSpacing(10);
             messagesInputBox.getChildren().addAll(inputTextArea, buttonBox);
             VBox.setVgrow(buttonBox, Priority.ALWAYS);
 
-            AnchorPane.setRightAnchor(messagesInputBox, 0d);
-            AnchorPane.setBottomAnchor(messagesInputBox, 5d);
-            AnchorPane.setLeftAnchor(messagesInputBox, 0d);
+            AnchorPane.setRightAnchor(messagesInputBox, displayHeader ? 0d : 10d);
+            AnchorPane.setBottomAnchor(messagesInputBox, displayHeader ? 5d : 15d);
+            AnchorPane.setLeftAnchor(messagesInputBox, displayHeader ? 0d : 10d);
 
-            AnchorPane.setBottomAnchor(messageListView, 120d);
+            setMessageListBottomAnchor(displayHeader ? 125d : 135d);
+            messageListView.pseudoClassStateChanged(INPUT_VISIBLE_PSEUDO_CLASS, true);
 
-            this.getChildren().addAll(messageListView, messagesInputBox);
+            this.getChildren().addAll(messageListView, newMessagesBox, messagesInputBox);
         } else {
-            AnchorPane.setBottomAnchor(messageListView, 0d);
-            this.getChildren().add(messageListView);
+            setMessageListBottomAnchor(0d);
+            this.getChildren().addAll(messageListView, newMessagesBox);
         }
 
         messageListView.setCellFactory(new Callback<>() {
             @Override
             public ListCell<ChatMessage> call(ListView<ChatMessage> list) {
                 return new ListCell<>() {
-                    ChangeListener<Boolean> sendMsgBusyAnimationListener;
+                    ChatMessage stateMessage;
+                    InvalidationListener msgStateListener = o -> UserThread.execute(() -> {
+                        if (stateMessage != null) updateMsgState(stateMessage);
+                    });
+                    WeakInvalidationListener weakMsgStateListener = new WeakInvalidationListener(msgStateListener);
                     Pane bg = new Pane();
-                    ImageView arrow = new ImageView();
+                    Region arrow = new Region();
+                    AnchorPane bubblePane = new AnchorPane(bg, arrow);
                     Label headerLabel = new AutoTooltipLabel();
-                    Label messageLabel = new AutoTooltipLabel();
+                    TextArea messageTextArea = new TextArea();
                     Label copyLabel = new Label();
                     HBox attachmentsBox = new HBox();
                     AnchorPane messageAnchorPane = new AnchorPane();
                     Label statusIcon = new Label();
                     Label statusInfoLabel = new Label();
                     HBox statusHBox = new HBox();
+                    Tooltip statusTooltip = new Tooltip();
                     double arrowWidth = 15d;
                     double attachmentsBoxHeight = 20d;
                     double border = 10d;
@@ -289,45 +340,77 @@ public class ChatView extends AnchorPane {
 
                     {
                         bg.setMinHeight(30);
-                        messageLabel.setWrapText(true);
+                        arrow.getStyleClass().add("chat-bubble-arrow");
+                        headerLabel.getStyleClass().add("message-header");
+                        messageTextArea.setEditable(false);
+                        messageTextArea.setFocusTraversable(false);
+                        messageTextArea.setWrapText(true);
+                        messageTextArea.setMinHeight(0);
+                        messageTextArea.setPrefRowCount(1);
+                        messageTextArea.getStyleClass().add("selectable-label");
+                        // clear the selection when focus moves within the window, keep it across window switches
+                        messageTextArea.focusedProperty().addListener((observable, wasFocused, isFocused) -> {
+                            if (!isFocused && messageTextArea.getScene() != null && messageTextArea.getScene().getFocusOwner() != messageTextArea)
+                                messageTextArea.deselect();
+                        });
+                        // size to wrapped text without adding listeners whenever a cell rejoins the scene
+                        messageTextArea.skinProperty().addListener((observable, oldSkin, newSkin) -> {
+                            if (newSkin == null) return;
+                            messageTextArea.applyCss();
+                            Node text = messageTextArea.lookup(".text");
+                            if (text == null) return;
+                            messageTextArea.prefHeightProperty().bind(Bindings.createDoubleBinding(
+                                    () -> text.getBoundsInLocal().getHeight()
+                                            + messageTextArea.snappedTopInset() + messageTextArea.snappedBottomInset(),
+                                    text.boundsInLocalProperty()));
+                            text.boundsInLocalProperty().addListener(o -> Platform.runLater(messageTextArea::requestLayout));
+                        });
                         headerLabel.setTextAlignment(TextAlignment.CENTER);
                         attachmentsBox.setSpacing(5);
-                        statusIcon.getStyleClass().add("small-text");
-                        statusInfoLabel.getStyleClass().add("small-text");
-                        statusInfoLabel.setPadding(new Insets(3, 0, 0, 0));
+                        statusIcon.getStyleClass().addAll("small-text", "status-icon");
+                        statusInfoLabel.getStyleClass().addAll("small-text", "status-icon");
                         copyLabel.setTooltip(new Tooltip(Res.get("shared.copyToClipboard")));
+                        Accessibility.asButton(copyLabel, Res.get("shared.copyToClipboard"));
                         statusHBox.setSpacing(5);
+                        statusHBox.setAlignment(Pos.CENTER_LEFT);
+                        // the status row may extend past the bubble, capped like the bubble
+                        statusHBox.maxWidthProperty().bind(messageListView.widthProperty().multiply(0.75));
+                        Tooltip.install(statusHBox, statusTooltip);
+                        sendingMessages.addListener(weakMsgStateListener);
                         statusHBox.getChildren().addAll(statusIcon, statusInfoLabel);
-                        messageAnchorPane.getChildren().addAll(bg, arrow, headerLabel, messageLabel, copyLabel, attachmentsBox, statusHBox);
+                        AnchorPane.setTopAnchor(bubblePane, 0d);
+                        AnchorPane.setRightAnchor(bubblePane, 0d);
+                        AnchorPane.setBottomAnchor(bubblePane, 0d);
+                        AnchorPane.setLeftAnchor(bubblePane, 0d);
+                        messageAnchorPane.getChildren().addAll(bubblePane, headerLabel, messageTextArea, copyLabel, attachmentsBox, statusHBox);
+                        messageAnchorPane.setMaxWidth(Region.USE_PREF_SIZE);
+                        messageAnchorPane.setMinWidth(Region.USE_PREF_SIZE); // keep the status row from widening the bubble
                     }
 
                     @Override
                     protected void updateItem(ChatMessage message, boolean empty) {
                         UserThread.execute(() -> {
+                            if (message != getItem()) messageTextArea.deselect();
                             super.updateItem(message, empty);
+                            observeMsgState(null);
                             if (message != null && !empty) {
                                 copyLabel.setOnMouseClicked(e -> {
-                                    Utilities.copyToClipboard(messageLabel.getText());
+                                    Utilities.copyToClipboard(messageTextArea.getText());
                                     Tooltip tp = new Tooltip(Res.get("shared.copiedToClipboard"));
                                     Node node = (Node) e.getSource();
                                     UserThread.runAfter(() -> tp.hide(), 1);
                                     tp.show(node, e.getScreenX() + Layout.PADDING, e.getScreenY() + Layout.PADDING);
                                 });
-                                messageLabel.setOnMouseClicked(event -> {
-                                    if (2 > event.getClickCount()) {
-                                        return;
-                                    }
-                                    GUIUtil.showSelectableTextModal(headerLabel.getText(), messageLabel.getText());
-                                });
     
-                                if (!messageAnchorPane.prefWidthProperty().isBound())
-                                    messageAnchorPane.prefWidthProperty()
-                                            .bind(messageListView.widthProperty().subtract(padding + GUIUtil.getScrollbarWidth(messageListView)));
+                                boolean senderIsTrader = message.isSenderIsTrader();
+                                boolean isMyMsg = supportSession.isClient() == senderIsTrader;
+                                messageAnchorPane.prefWidthProperty().bind(bubbleWidth(message.getMessage(), message.isSystemMessage()));
+                                setAlignment(isMyMsg && !message.isSystemMessage() ? Pos.CENTER_RIGHT : Pos.CENTER_LEFT);
     
                                 AnchorPane.clearConstraints(bg);
                                 AnchorPane.clearConstraints(headerLabel);
                                 AnchorPane.clearConstraints(arrow);
-                                AnchorPane.clearConstraints(messageLabel);
+                                AnchorPane.clearConstraints(messageTextArea);
                                 AnchorPane.clearConstraints(copyLabel);
                                 AnchorPane.clearConstraints(statusHBox);
                                 AnchorPane.clearConstraints(attachmentsBox);
@@ -336,59 +419,38 @@ public class ChatView extends AnchorPane {
                                 AnchorPane.setBottomAnchor(bg, bottomBorder);
                                 AnchorPane.setTopAnchor(headerLabel, 0d);
                                 AnchorPane.setBottomAnchor(arrow, bottomBorder + 5d);
-                                AnchorPane.setTopAnchor(messageLabel, 25d);
+                                AnchorPane.setTopAnchor(messageTextArea, 25d);
                                 AnchorPane.setTopAnchor(copyLabel, 25d);
                                 AnchorPane.setBottomAnchor(attachmentsBox, bottomBorder + 10);
-    
-                                boolean senderIsTrader = message.isSenderIsTrader();
-                                boolean isMyMsg = supportSession.isClient() == senderIsTrader;
     
                                 arrow.setVisible(!message.isSystemMessage());
                                 arrow.setManaged(!message.isSystemMessage());
                                 statusHBox.setVisible(false);
     
-                                headerLabel.getStyleClass().removeAll("message-header", "my-message-header", "success-text",
-                                        "highlight-static");
-                                messageLabel.getStyleClass().removeAll("my-message", "message");
+                                messageTextArea.getStyleClass().removeAll("my-message", "message");
                                 copyLabel.getStyleClass().removeAll("my-message", "message");
+                                bubblePane.getStyleClass().remove("chat-bubble-raised");
+                                if (!message.isSystemMessage()) bubblePane.getStyleClass().add("chat-bubble-raised");
     
                                 if (message.isSystemMessage()) {
-                                    headerLabel.getStyleClass().addAll("message-header", "success-text");
                                     bg.setId("message-bubble-green");
-                                    messageLabel.getStyleClass().add("my-message");
-                                    copyLabel.getStyleClass().add("my-message");
-                                    message.addWeakMessageStateListener(() -> UserThread.execute(() -> updateMsgState(message)));
+                                    messageTextArea.getStyleClass().add("message");
+                                    copyLabel.getStyleClass().add("message");
+                                    observeMsgState(message);
                                     updateMsgState(message);
                                 } else if (isMyMsg) {
-                                    headerLabel.getStyleClass().add("my-message-header");
                                     bg.setId("message-bubble-blue");
-                                    messageLabel.getStyleClass().add("my-message");
+                                    messageTextArea.getStyleClass().add("my-message");
                                     copyLabel.getStyleClass().add("my-message");
-                                    if (supportSession.isClient())
-                                        arrow.setId("bubble_arrow_blue_left");
-                                    else
-                                        arrow.setId("bubble_arrow_blue_right");
+                                    arrow.setId("bubble_arrow_blue_right");
     
-                                    if (sendMsgBusyAnimationListener != null)
-                                        sendMsgBusyAnimation.isRunningProperty().removeListener(sendMsgBusyAnimationListener);
-    
-                                    sendMsgBusyAnimationListener = (observable, oldValue, newValue) -> {
-                                        if (!newValue)
-                                            UserThread.execute(() -> updateMsgState(message));
-                                    };
-    
-                                    sendMsgBusyAnimation.isRunningProperty().addListener(sendMsgBusyAnimationListener);
-                                    message.addWeakMessageStateListener(() -> UserThread.execute(() -> updateMsgState(message)));
+                                    observeMsgState(message);
                                     updateMsgState(message);
                                 } else {
-                                    headerLabel.getStyleClass().add("message-header");
                                     bg.setId("message-bubble-grey");
-                                    messageLabel.getStyleClass().add("message");
+                                    messageTextArea.getStyleClass().add("message");
                                     copyLabel.getStyleClass().add("message");
-                                    if (supportSession.isClient())
-                                        arrow.setId("bubble_arrow_grey_right");
-                                    else
-                                        arrow.setId("bubble_arrow_grey_left");
+                                    arrow.setId("bubble_arrow_grey_left");
                                 }
     
                                 if (message.isSystemMessage()) {
@@ -396,47 +458,47 @@ public class ChatView extends AnchorPane {
                                     AnchorPane.setRightAnchor(headerLabel, padding);
                                     AnchorPane.setLeftAnchor(bg, border);
                                     AnchorPane.setRightAnchor(bg, border);
-                                    AnchorPane.setLeftAnchor(messageLabel, padding);
-                                    AnchorPane.setRightAnchor(messageLabel, msgLabelPaddingRight);
+                                    AnchorPane.setLeftAnchor(messageTextArea, padding);
+                                    AnchorPane.setRightAnchor(messageTextArea, msgLabelPaddingRight);
                                     AnchorPane.setRightAnchor(copyLabel, padding);
                                     AnchorPane.setLeftAnchor(attachmentsBox, padding);
                                     AnchorPane.setRightAnchor(attachmentsBox, padding);
                                     AnchorPane.setLeftAnchor(statusHBox, padding);
-                                } else if (senderIsTrader) {
+                                } else if (!isMyMsg) {
                                     AnchorPane.setLeftAnchor(headerLabel, padding + arrowWidth);
                                     AnchorPane.setLeftAnchor(bg, border + arrowWidth);
                                     AnchorPane.setRightAnchor(bg, border);
                                     AnchorPane.setLeftAnchor(arrow, border);
-                                    AnchorPane.setLeftAnchor(messageLabel, padding + arrowWidth);
-                                    AnchorPane.setRightAnchor(messageLabel, msgLabelPaddingRight);
+                                    AnchorPane.setLeftAnchor(messageTextArea, padding + arrowWidth);
+                                    AnchorPane.setRightAnchor(messageTextArea, msgLabelPaddingRight);
                                     AnchorPane.setRightAnchor(copyLabel, padding);
                                     AnchorPane.setLeftAnchor(attachmentsBox, padding + arrowWidth);
                                     AnchorPane.setRightAnchor(attachmentsBox, padding);
-                                    AnchorPane.setRightAnchor(statusHBox, padding);
+                                    AnchorPane.setLeftAnchor(statusHBox, padding + arrowWidth);
                                 } else {
                                     AnchorPane.setRightAnchor(headerLabel, padding + arrowWidth);
                                     AnchorPane.setRightAnchor(bg, border + arrowWidth);
                                     AnchorPane.setLeftAnchor(bg, border);
                                     AnchorPane.setRightAnchor(arrow, border);
-                                    AnchorPane.setLeftAnchor(messageLabel, padding);
-                                    AnchorPane.setRightAnchor(messageLabel, msgLabelPaddingRight + arrowWidth);
+                                    AnchorPane.setLeftAnchor(messageTextArea, padding);
+                                    AnchorPane.setRightAnchor(messageTextArea, msgLabelPaddingRight + arrowWidth);
                                     AnchorPane.setRightAnchor(copyLabel, padding + arrowWidth);
                                     AnchorPane.setLeftAnchor(attachmentsBox, padding);
                                     AnchorPane.setRightAnchor(attachmentsBox, padding + arrowWidth);
-                                    AnchorPane.setLeftAnchor(statusHBox, padding);
+                                    AnchorPane.setRightAnchor(statusHBox, padding + arrowWidth);
                                 }
-                                AnchorPane.setBottomAnchor(statusHBox, 7d);
+                                AnchorPane.setBottomAnchor(statusHBox, 6d);
                                 String metaData = DisplayUtils.formatDateTime(new Date(message.getDate()));
                                 if (!message.isSystemMessage())
                                     metaData = (isMyMsg ? "Sent " : "Received ") + metaData
                                             + (isMyMsg ? "" : " from " + counterpartyName);
                                 headerLabel.setText(metaData);
-                                messageLabel.setText(message.getMessage());
+                                messageTextArea.setText(message.getMessage());
                                 attachmentsBox.getChildren().clear();
                                 if (allowAttachments &&
                                         message.getAttachments() != null &&
                                         message.getAttachments().size() > 0) {
-                                    AnchorPane.setBottomAnchor(messageLabel, bottomBorder + attachmentsBoxHeight + 10);
+                                    AnchorPane.setBottomAnchor(messageTextArea, bottomBorder + attachmentsBoxHeight + 10);
                                     attachmentsBox.getChildren().add(new AutoTooltipLabel(Res.get("support.attachments") + " ") {{
                                         setPadding(new Insets(0, 0, 3, 0));
                                         if (isMyMsg)
@@ -446,69 +508,105 @@ public class ChatView extends AnchorPane {
                                     }});
                                     message.getAttachments().forEach(attachment -> {
                                         Label icon = new Label();
-                                        setPadding(new Insets(0, 0, 3, 0));
                                         if (isMyMsg)
                                             icon.getStyleClass().add("attachment-icon");
                                         else
                                             icon.getStyleClass().add("attachment-icon-black");
     
-                                        AwesomeDude.setIcon(icon, AwesomeIcon.FILE_TEXT);
+                                        GlyphsDude.setIcon(icon, FontAwesomeIcon.FILE_TEXT);
                                         icon.setPadding(new Insets(-2, 0, 0, 0));
                                         icon.setTooltip(new Tooltip(attachment.getFileName()));
                                         icon.setOnMouseClicked(event -> onOpenAttachment(attachment));
+                                        Accessibility.asButton(icon, attachment.getFileName());
                                         attachmentsBox.getChildren().add(icon);
                                     });
                                 } else {
-                                    AnchorPane.setBottomAnchor(messageLabel, bottomBorder + 10);
+                                    AnchorPane.setBottomAnchor(messageTextArea, bottomBorder + 10);
                                 }
     
                                 // Need to set it here otherwise style is not correct
                                 copyLabel.getStyleClass().addAll("icon", "copy-icon-disputes");
-                                MaterialDesignIconView copyIcon = new MaterialDesignIconView(MaterialDesignIcon.CONTENT_COPY, "16.0");
+                                Text copyIcon = GlyphsDude.createIcon(MaterialDesignIcon.CONTENT_COPY, "16.0");
                                 copyLabel.setGraphic(copyIcon);
     
                                 // TODO There are still some cell rendering issues on updates
                                 setGraphic(messageAnchorPane);
+                                setAccessibleText(headerLabel.getText() + ". " + messageTextArea.getText());
                             } else {
-                                if (sendMsgBusyAnimation != null && sendMsgBusyAnimationListener != null)
-                                    sendMsgBusyAnimation.isRunningProperty().removeListener(sendMsgBusyAnimationListener);
     
                                 messageAnchorPane.prefWidthProperty().unbind();
     
                                 copyLabel.setOnMouseClicked(null);
-                                messageLabel.setOnMouseClicked(null);
+                                messageTextArea.clear();
                                 setGraphic(null);
+                                setAccessibleText(null);
                             }
                         });
                     }
 
+                    // observe state of the cell's current message only, since cells are reused
+                    private void observeMsgState(ChatMessage message) {
+                        if (stateMessage != null) msgStateProperties(stateMessage).forEach(p -> p.removeListener(weakMsgStateListener));
+                        stateMessage = message;
+                        if (message != null) msgStateProperties(message).forEach(p -> p.addListener(weakMsgStateListener));
+                    }
+
+                    private List<Observable> msgStateProperties(ChatMessage message) {
+                        return List.of(message.arrivedProperty(), message.storedInMailboxProperty(),
+                                message.acknowledgedProperty(), message.ackErrorProperty(), message.sendMessageErrorProperty());
+                    }
+
+                    // fit the bubble to its content up to a share of the list width; system messages span it
+                    private DoubleBinding bubbleWidth(String text, boolean fullWidth) {
+                        return Bindings.createDoubleBinding(() -> {
+                            double available = messageListView.getWidth() - padding - GUIUtil.getScrollbarWidth(messageListView);
+                            if (fullWidth) return available;
+                            Text measure = new Text(text);
+                            measure.setFont(messageTextArea.getFont());
+                            double content = Math.max(Math.ceil(measure.getLayoutBounds().getWidth()) + 2 + padding + msgLabelPaddingRight,
+                                    headerLabel.prefWidth(-1) + 2 * padding);
+                            content = Math.max(content, attachmentsBox.prefWidth(-1) + 2 * padding);
+                            return Math.min(available * 0.75, content + arrowWidth);
+                        }, messageListView.widthProperty(), messageTextArea.fontProperty(), headerLabel.textProperty(),
+                                headerLabel.fontProperty(), attachmentsBox.getChildren());
+                    }
+
                     private void updateMsgState(ChatMessage message) {
                         boolean visible;
-                        AwesomeIcon icon = null;
+                        FontAwesomeIcon icon = null;
                         String text = null;
-                        statusIcon.getStyleClass().add("status-icon");
-                        statusInfoLabel.getStyleClass().add("status-icon");
-                        statusHBox.setOpacity(1);
+                        statusIcon.getStyleClass().removeAll("error-text");
+                        statusInfoLabel.getStyleClass().removeAll("error-text");
                         log.debug("updateMsgState msg-{}, ack={}, arrived={}", message.getMessage(),
                                 message.acknowledgedProperty().get(), message.arrivedProperty().get());
                         if (message.acknowledgedProperty().get()) {
                             visible = true;
-                            icon = AwesomeIcon.OK_SIGN;
+                            icon = FontAwesomeIcon.CHECK_CIRCLE;
                             text = Res.get("support.acknowledged");
-                        } else if (message.storedInMailboxProperty().get()) {
-                            visible = true;
-                            icon = AwesomeIcon.ENVELOPE;
-                            text = Res.get("support.savedInMailbox");
                         } else if (message.ackErrorProperty().get() != null) {
                             visible = true;
-                            icon = AwesomeIcon.EXCLAMATION_SIGN;
+                            icon = FontAwesomeIcon.EXCLAMATION_CIRCLE;
                             text = Res.get("support.error", message.ackErrorProperty().get());
                             statusIcon.getStyleClass().add("error-text");
                             statusInfoLabel.getStyleClass().add("error-text");
+                        } else if (message.sendMessageErrorProperty().get() != null) {
+                            visible = true;
+                            icon = FontAwesomeIcon.EXCLAMATION_CIRCLE;
+                            text = Res.get("support.sendMessageError", message.sendMessageErrorProperty().get());
+                            statusIcon.getStyleClass().add("error-text");
+                            statusInfoLabel.getStyleClass().add("error-text");
+                        } else if (message.storedInMailboxProperty().get()) {
+                            visible = true;
+                            icon = FontAwesomeIcon.ENVELOPE;
+                            text = Res.get("support.savedInMailbox");
                         } else if (message.arrivedProperty().get()) {
                             visible = true;
-                            icon = AwesomeIcon.MAIL_REPLY;
+                            icon = FontAwesomeIcon.MAIL_REPLY;
                             text = Res.get("support.transient");
+                        } else if (sendingMessages.contains(message)) {
+                            visible = true;
+                            icon = FontAwesomeIcon.CLOCK_ALT;
+                            text = Res.get("support.sendingMessage");
                         } else {
                             visible = false;
                             log.debug("updateMsgState called but no msg state available. message={}", message);
@@ -516,9 +614,10 @@ public class ChatView extends AnchorPane {
 
                         statusHBox.setVisible(visible);
                         if (visible) {
-                            AwesomeDude.setIcon(statusIcon, icon, "14");
-                            statusIcon.setTooltip(new Tooltip(text));
-                            statusInfoLabel.setText(text);
+                            GlyphsDude.setIcon(statusIcon, icon, "14");
+                            // keep the row to one line, e.g. for multiline network errors
+                            statusTooltip.setText(text);
+                            statusInfoLabel.setText(text.lines().findFirst().orElse(""));
                         }
                     }
                 };
@@ -573,7 +672,7 @@ public class ChatView extends AnchorPane {
                             new Popup().warning(Res.get("support.maxSize", maxSizeInKB)).show();
                         } else {
                             tempAttachments.add(new Attachment(result.getName(), filesAsBytes));
-                            inputTextArea.setText(inputTextArea.getText() + "\n[" + Res.get("support.attachment") + " " + result.getName() + "]");
+                            appendAttachmentTag(result.getName());
                         }
                     } catch (java.io.IOException e) {
                         log.error(ExceptionUtils.getStackTrace(e));
@@ -599,11 +698,17 @@ public class ChatView extends AnchorPane {
                 new Popup().warning(Res.get("support.attachmentTooLarge", (size / 1024), maxSizeInKB)).show();
             } else {
                 tempAttachments.add(new Attachment(name, filesAsBytes));
-                inputTextArea.setText(inputTextArea.getText() + "\n[" + Res.get("support.attachment") + " " + name + "]");
+                appendAttachmentTag(name);
             }
         } catch (Exception e) {
             log.error(ExceptionUtils.getStackTrace(e));
         }
+    }
+
+    // append the attachment tag to the input text area, without a leading newline when empty
+    private void appendAttachmentTag(String name) {
+        String text = inputTextArea.getText();
+        inputTextArea.setText((text.isEmpty() ? "" : text + "\n") + "[" + Res.get("support.attachment") + " " + name + "]");
     }
 
     private void copyChatMessagesToClipboard(Button sourceBtn) {
@@ -643,56 +748,35 @@ public class ChatView extends AnchorPane {
     }
 
     private void onSendMessage(String inputText) {
-        if (chatMessage != null) {
-            chatMessage.acknowledgedProperty().removeListener(acknowledgedPropertyListener);
-            chatMessage.storedInMailboxProperty().removeListener(storedInMailboxPropertyListener);
-            chatMessage.sendMessageErrorProperty().removeListener(sendMessageErrorPropertyListener);
-        }
-
-        chatMessage = sendDisputeDirectMessage(inputText, new ArrayList<>(tempAttachments));
+        ChatMessage message = sendDisputeDirectMessage(inputText, new ArrayList<>(tempAttachments));
         tempAttachments.clear();
         scrollToBottom();
-
-        inputTextArea.setDisable(true);
         inputTextArea.clear();
+        inputTextArea.requestFocus();
+        if (message == null) return;
 
-        chatMessage.startAckTimer();
-
-        Timer timer = UserThread.runAfter(() -> {
-            sendMsgInfoLabel.setVisible(true);
-            sendMsgInfoLabel.setManaged(true);
-            sendMsgInfoLabel.setText(Res.get("support.sendingMessage"));
-
-            sendMsgBusyAnimation.play();
-        }, 500, TimeUnit.MILLISECONDS);
-
-        acknowledgedPropertyListener = (observable, oldValue, newValue) -> {
-            if (newValue) {
-                sendMsgInfoLabel.setVisible(false);
-                hideSendMsgInfo(timer);
+        // show as sending until confirmed, saved to the mailbox, or failed
+        message.startAckTimer();
+        sendingMessages.add(message);
+        List<Observable> sendStates = List.of(message.acknowledgedProperty(), message.storedInMailboxProperty(),
+                message.ackErrorProperty(), message.sendMessageErrorProperty());
+        InvalidationListener sendDoneListener = new InvalidationListener() {
+            @Override
+            public void invalidated(Observable observable) {
+                if (!isSendingDone(message)) return;
+                UserThread.execute(() -> {
+                    sendStates.forEach(state -> state.removeListener(this));
+                    sendingMessages.remove(message);
+                });
             }
         };
-        storedInMailboxPropertyListener = (observable, oldValue, newValue) -> {
-            if (newValue) {
-                sendMsgInfoLabel.setVisible(true);
-                sendMsgInfoLabel.setManaged(true);
-                sendMsgInfoLabel.setText(Res.get("support.receiverNotOnline"));
-                hideSendMsgInfo(timer);
-            }
-        };
-        sendMessageErrorPropertyListener = (observable, oldValue, newValue) -> {
-            if (newValue != null) {
-                sendMsgInfoLabel.setVisible(true);
-                sendMsgInfoLabel.setManaged(true);
-                sendMsgInfoLabel.setText(Res.get("support.sendMessageError", newValue));
-                hideSendMsgInfo(timer);
-            }
-        };
-        if (chatMessage != null) {
-            chatMessage.acknowledgedProperty().addListener(acknowledgedPropertyListener);
-            chatMessage.storedInMailboxProperty().addListener(storedInMailboxPropertyListener);
-            chatMessage.sendMessageErrorProperty().addListener(sendMessageErrorPropertyListener);
-        }
+        sendStates.forEach(state -> state.addListener(sendDoneListener));
+        sendDoneListener.invalidated(null); // the send can finish before the listener is added
+    }
+
+    private boolean isSendingDone(ChatMessage message) {
+        return message.acknowledgedProperty().get() || message.storedInMailboxProperty().get() ||
+                message.ackErrorProperty().get() != null || message.sendMessageErrorProperty().get() != null;
     }
 
     private ChatMessage sendDisputeDirectMessage(String text, ArrayList<Attachment> attachments) {
@@ -706,7 +790,13 @@ public class ChatView extends AnchorPane {
                     supportManager.getMyAddress(),
                     attachments
             );
-            supportManager.addAndPersistChatMessage(message);
+            // add to the session's dispute directly, since multiple disputes can exist for a trade
+            if (supportSession instanceof DisputeSession && ((DisputeSession) supportSession).getDispute() != null) {
+                ((DisputeSession) supportSession).getDispute().addAndPersistChatMessage(message);
+                supportManager.requestPersistence();
+            } else {
+                supportManager.addAndPersistChatMessage(message);
+            }
             return supportManager.sendChatMessage(message);
         }).orElse(null);
     }
@@ -715,31 +805,45 @@ public class ChatView extends AnchorPane {
     // Helpers
     ///////////////////////////////////////////////////////////////////////////////////////////
 
-    private void hideSendMsgInfo(Timer timer) {
-        timer.stop();
-        inputTextArea.setDisable(false);
-
-        UserThread.runAfter(() -> {
-            sendMsgInfoLabel.setVisible(false);
-            sendMsgInfoLabel.setManaged(false);
-        }, 5);
-        sendMsgBusyAnimation.stop();
+    public void scrollToBottom() {
+        stickToBottom = true;
+        UserThread.execute(this::scrollToLastMessage);
     }
 
-    public void scrollToBottom() {
-        UserThread.execute(() -> {
-            if (messageListView != null && !messageListView.getItems().isEmpty()) {
-                int lastIndex = messageListView.getItems().size();
-                messageListView.scrollTo(lastIndex);
-            }
-        });
+    private void scrollToLastMessage() {
+        if (newMessagesButton != null) newMessagesButton.setVisible(false);
+        if (messageListView != null && !messageListView.getItems().isEmpty()) {
+            int lastIndex = messageListView.getItems().size();
+            messageListView.scrollTo(lastIndex);
+        }
+    }
+
+    // align the last cell's bottom with the viewport once it is laid out, a no-op when the content fits
+    private <T extends IndexedCell> void scrollToBottom(VirtualFlow<T> flow, int lastIndex) {
+        T lastCell = flow.getVisibleCell(lastIndex);
+        if (lastCell != null) flow.scrollToBottom(lastCell);
+        else if (flow.getLastVisibleCell() != null) messageListView.scrollTo(lastIndex);
+    }
+
+    // whether the last message is laid out and ends within the viewport
+    private boolean isScrolledToBottom(VirtualFlow<?> flow) {
+        IndexedCell<?> lastCell = flow.getVisibleCell(messageListView.getItems().size() - 1);
+        return lastCell != null && flow.sceneToLocal(lastCell.localToScene(lastCell.getLayoutBounds())).getMaxY() <= flow.getHeight() + 1;
+    }
+
+    // keep the new messages button just above the list's bottom edge
+    private void setMessageListBottomAnchor(double bottom) {
+        AnchorPane.setBottomAnchor(messageListView, bottom);
+        AnchorPane.setBottomAnchor(newMessagesBox, bottom + 12);
     }
 
     public void setInputBoxVisible(boolean visible) {
         if (messagesInputBox != null) {
             messagesInputBox.setVisible(visible);
             messagesInputBox.setManaged(visible);
-            AnchorPane.setBottomAnchor(messageListView, visible ? 120d : 0d);
+            double inputBoxHeight = displayHeader ? 125d : 135d;
+            setMessageListBottomAnchor(visible ? inputBoxHeight : 0d);
+            messageListView.pseudoClassStateChanged(INPUT_VISIBLE_PSEUDO_CLASS, visible);
         }
     }
 
@@ -764,13 +868,6 @@ public class ChatView extends AnchorPane {
     private void removeListenersOnSessionChange() {
         if (chatMessages != null && disputeDirectMessageListListener != null)
             chatMessages.removeListener(disputeDirectMessageListListener);
-
-        if (chatMessage != null) {
-            if (acknowledgedPropertyListener != null)
-                chatMessage.arrivedProperty().removeListener(acknowledgedPropertyListener);
-            if (storedInMailboxPropertyListener != null)
-                chatMessage.storedInMailboxProperty().removeListener(storedInMailboxPropertyListener);
-        }
 
         if (messageListView != null)
             messageListView.prefWidthProperty().unbind();

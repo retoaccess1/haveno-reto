@@ -170,6 +170,44 @@ For each arbitrator:
 
 The arbitrator is now registered and ready to accept requests for dispute resolution.
 
+If a trade's multisig wallet has extra funds, use a custom dispute award to
+allocate its full balance. Cooperative payouts and preset awards reject a
+surplus above the dust limit. The API custom award now uses the current wallet
+balance, as the desktop does; review the counterparty's remainder when a deposit
+is missing or extra funds arrived, and wait for new deposits to unlock.
+
+Daemon instances require a non-empty API password. Set `HAVENO_API_PASSWORD` to a
+strong secret before running [run-arbitrator-daemon.sh](../scripts/deployment/run-arbitrator-daemon.sh).
+
+The gRPC API binds to `127.0.0.1` by default. Use the Tor hidden service or an
+SSH tunnel for remote access. Set `--apiBindAddress` only to an interface that
+untrusted networks cannot reach, such as a container network behind a proxy.
+The API grants full wallet access, including seed export and withdrawals. Its
+password is separate from the account password.
+
+Five failed API authentication attempts in one minute temporarily block all
+authentication, including correct passwords, until an attempt expires from the
+window. The limit is shared across callers because Tor connections arrive through
+loopback. Successful calls do not consume it, and `--disableRateLimits` does not
+disable it.
+
+To publish the API over Tor, use `--apiHiddenService=true`. Bundled Tor waits until
+login so persisted bridge settings are loaded; the local API remains available to
+unlock the account. For remote unlock after a restart, also set
+`--apiHiddenServiceBeforeLogin=true`. This explicitly allows startup Tor settings
+or defaults before encrypted bridge preferences are available. The resulting Tor
+instance is shared with P2P: unlocking does not restart it to apply bridge preferences.
+The API onion address is unchanged by this option.
+
+If bridges are needed before login, supply a complete configuration through
+`--torrcFile` with owner-only file permissions. Use space-separated directives,
+including `UseBridges 1` and `Bridge <bridge line>`. The bundled parser retains only
+the last occurrence of repeated directives, so supply one `Bridge` line. Missing,
+unreadable, or unsupported configuration fails Tor startup instead of using defaults.
+Alternatively, [configure an external Tor](external-tor-usage.md) with
+`--torControlPort`; its API hidden service can start before login without the extra
+flag because its network settings are independent of encrypted preferences.
+
 > [!note]
 > * Arbitrators must use a local Monero node with unrestricted RPC in order to submit and flush transactions from the pool.
 > * Arbitrators should remain online as much as possible in order to balance trades and avoid clients spending time trying to contact offline arbitrators. A VPS or dedicated machine running 24/7 is highly recommended.
@@ -217,7 +255,8 @@ For example, if upstream Haveno is at 1.3.0, a fork may increment the third digi
 Update your fork's version number in the following locations:
 
 - [Version.java](https://github.com/haveno-dex/haveno/blob/4eb98ffdd0a40cbe75ad2e8a376cacc815959bbc/common/src/main/java/haveno/common/app/Version.java#L35): The `VERSION` constant.
-- [build.gradle](https://github.com/haveno-dex/haveno/blob/4eb98ffdd0a40cbe75ad2e8a376cacc815959bbc/build.gradle#L619): The `version` attribute under `:desktop`.
+- [gradle/libs.versions.toml](../gradle/libs.versions.toml): The `haveno-desktop` version.
+- [SeedNodeMain.java](../seednode/src/main/java/haveno/seednode/SeedNodeMain.java): The `VERSION` constant.
 - [exchange.haveno.Haveno.metainfo.xml](https://github.com/haveno-dex/haveno/blob/4eb98ffdd0a40cbe75ad2e8a376cacc815959bbc/desktop/package/linux/exchange.haveno.Haveno.metainfo.xml#L63): The `release` attribute.
 - [Info.plist](https://github.com/haveno-dex/haveno/blob/4eb98ffdd0a40cbe75ad2e8a376cacc815959bbc/desktop/package/macosx/Info.plist#L7): The `CFBundleVersion` and `CFBundleShortVersionString` attributes.
 
@@ -279,10 +318,28 @@ Then follow these instructions: https://github.com/haveno-dex/haveno/blob/master
 
 ## Send alerts to update the application
 
-<b>Upload updated installers for download</b>
+Publish alerts from an upgraded client so they include the metadata signature.
+Upgraded clients ignore legacy alerts until they are republished; older clients
+can still read alerts published by upgraded clients. The signature binds the
+message, update flags, version, publisher key, and extra data.
 
-* In https://<domain>/downloads/<version>/, upload the installer files: Haveno-<version>.jar.txt, signingkey.asc, Haveno-<version>.dmg, Haveno-<version>.dmg.asc, and files for Linux and Windows.
-* In https://<domain>/pubkey/, upload pub key files, e.g. F379A1C6.asc.
+<b>Enable in-app update verification (one-time, forks only)</b>
+
+The base Haveno repo pins no release signers, so the in-app updater performs no verification and directs users to download and verify manually. A fork enables verification by pinning its own signing key. `<FINGERPRINT>` below is the signer's full 40 hex character primary-key fingerprint, uppercase and without spaces (see `gpg --fingerprint`, e.g. `1DC3C8C4316A698AC494039CF5B84436F379A1C6`).
+
+1. Bundle the public key with the app:
+   `gpg --armor --export <FINGERPRINT> > desktop/src/main/resources/keys/<FINGERPRINT>.asc`
+2. Pin the fingerprint: add `<FINGERPRINT>` to `PINNED_SIGNING_KEY_FINGERPRINTS` in [HavenoInstaller.java](https://github.com/haveno-dex/haveno/blob/master/desktop/src/main/java/haveno/desktop/main/overlays/windows/downloadupdate/HavenoInstaller.java) (see [keys/README.md](https://github.com/haveno-dex/haveno/blob/master/desktop/src/main/resources/keys/README.md)).
+
+The bundled key is the trust anchor: the app only accepts an installer whose signature was made by a pinned key, so a compromised download host cannot substitute its own key, signature, and installer.
+
+<b>Upload updated installers for download (per release)</b>
+
+Sign each installer with the pinned key and upload the following to `https://<domain>/downloads/<version>/`:
+* the installers: `Haveno-<version>.dmg` (macOS), plus the `.deb`/`.rpm` (Linux) and `.exe` (Windows) files.
+* a detached signature for each installer, e.g. `gpg --detach-sign --armor Haveno-<version>.dmg` produces `Haveno-<version>.dmg.asc`.
+* `signingkey.asc` containing the signer's full fingerprint, matching a pinned key: `echo <FINGERPRINT> > signingkey.asc`.
+* `Haveno-<version>.jar.txt`, the hash of the bundled jar.
 
 <b>Set the mandatory minimum version for trading (optional)</b>
 

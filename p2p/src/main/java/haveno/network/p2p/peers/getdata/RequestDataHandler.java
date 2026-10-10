@@ -69,7 +69,7 @@ class RequestDataHandler implements MessageListener {
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     public interface Listener {
-        void onComplete(boolean wasTruncated);
+        void onComplete(boolean wasTruncated, int numNewItems);
 
         @SuppressWarnings("UnusedParameters")
         void onFault(String errorMessage, @SuppressWarnings("SameParameterValue") @Nullable Connection connection);
@@ -86,6 +86,7 @@ class RequestDataHandler implements MessageListener {
     private final Listener listener;
     private Timer timeoutTimer;
     private final int nonce = new Random().nextInt();
+    private final long creationTs = System.currentTimeMillis();
     private boolean stopped;
 
 
@@ -107,6 +108,12 @@ class RequestDataHandler implements MessageListener {
         cleanup();
     }
 
+    // A handler older than its own timeout should have resolved already, so we consider it stale
+    // (e.g. its timeout timer died in OS standby or the underlying connect is wedged).
+    boolean isStale() {
+        return System.currentTimeMillis() - creationTs > TIMEOUT * 1000;
+    }
+
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // API
@@ -115,6 +122,12 @@ class RequestDataHandler implements MessageListener {
     void requestData(NodeAddress nodeAddress, boolean isPreliminaryDataRequest) {
         peersNodeAddress = nodeAddress;
         if (!stopped) {
+            // Recheck candidates retained from an earlier request.
+            if (peerManager.isPeerUnavailable(nodeAddress)) {
+                cleanup();
+                listener.onFault("Peer is unavailable for data requests: " + nodeAddress, null);
+                return;
+            }
             GetDataRequest getDataRequest;
 
             if (isPreliminaryDataRequest)
@@ -127,6 +140,7 @@ class RequestDataHandler implements MessageListener {
                             if (!stopped) {
                                 String errorMessage = "A timeout occurred at sending getDataRequest:" + getDataRequest +
                                         " on nodeAddress:" + nodeAddress;
+                                log.info("Sending {} to peer {} timed out", getDataRequestType, nodeAddress);
                                 log.debug(errorMessage + " / RequestDataHandler=" + RequestDataHandler.this);
                                 handleFault(errorMessage, nodeAddress, CloseConnectionReason.SEND_MSG_TIMEOUT);
                             } else {
@@ -162,6 +176,7 @@ class RequestDataHandler implements MessageListener {
                                     " failed. That is expected if the peer is offline.\n\t" +
                                     "getDataRequest=" + getDataRequest + "." +
                                     "\n\tException=" + throwable.getMessage();
+                            log.info("Sending {} to peer {} failed: {}", getDataRequestType, nodeAddress, throwable.getMessage());
                             handleFault(errorMessage, nodeAddress, CloseConnectionReason.SEND_MSG_FAILURE);
                         } else {
                             log.trace("We have stopped already. We ignore that networkNode.sendMessage.onFailure call. " +
@@ -198,11 +213,11 @@ class RequestDataHandler implements MessageListener {
                             return;
                         }
 
-                        dataStorage.processGetDataResponse(getDataResponse,
+                        int numNewItems = dataStorage.processGetDataResponse(getDataResponse,
                                 connection.getPeersNodeAddressOptional().get());
 
                         cleanup();
-                        listener.onComplete(getDataResponse.isWasTruncated());
+                        listener.onComplete(getDataResponse.isWasTruncated(), numNewItems);
                     } else {
                         log.warn("Nonce not matching. That can happen rarely if we get a response after a canceled " +
                                         "handshake (timeout causes connection close but peer might have sent a msg before " +
@@ -273,7 +288,7 @@ class RequestDataHandler implements MessageListener {
                              NodeAddress nodeAddress,
                              CloseConnectionReason closeConnectionReason) {
         cleanup();
-        log.info(errorMessage);
+        log.debug(errorMessage);
         //peerManager.shutDownConnection(nodeAddress, closeConnectionReason);
         peerManager.handleConnectionFault(nodeAddress);
         listener.onFault(errorMessage, null);

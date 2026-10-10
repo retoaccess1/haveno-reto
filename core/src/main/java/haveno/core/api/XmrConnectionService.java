@@ -24,6 +24,8 @@ import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.common.config.BaseCurrencyNetwork;
 import haveno.common.config.Config;
+import haveno.common.crypto.Hash;
+import haveno.common.util.Utilities;
 import monero.common.NetworkUtils;
 import haveno.core.locale.Res;
 import haveno.core.trade.HavenoUtils;
@@ -34,6 +36,7 @@ import haveno.core.xmr.nodes.XmrNodes.XmrNode;
 import haveno.core.xmr.nodes.XmrNodesSetupPreferences;
 import haveno.core.xmr.setup.DownloadListener;
 import haveno.core.xmr.setup.WalletsSetup;
+import haveno.core.xmr.wallet.XmrWalletBase;
 import haveno.network.Socks5ProxyProvider;
 import haveno.network.p2p.P2PService;
 import haveno.network.p2p.P2PServiceListener;
@@ -49,11 +52,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletionService;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.commons.lang3.exception.ExceptionUtils;
 
@@ -92,6 +97,7 @@ public final class XmrConnectionService {
     private static final boolean USE_BOOTSTRAP_HEIGHT = false;
     private static final long STAGGER_MS = 1500; // stagger connection checks
     private static final String LAST_INFO_KEY = "lastInfo";
+    private static final String LAST_ERROR_KEY = "lastError";
     private static int numConsecutiveErrors = 0;
 
     public enum XmrConnectionFallbackType {
@@ -147,8 +153,14 @@ public final class XmrConnectionService {
     private static final int EXCLUDE_CONNECTION_SECONDS = 180;
     private static final int MAX_SWITCH_REQUESTS_PER_MINUTE = 2;
     private static final int SKIP_SWITCH_WITHIN_MS = 20000;
+    private static final int SKIP_SWITCH_AFTER_SYNC_PROGRESS_MS = 30000;
+    private static final int MAX_SKIP_SWITCH_PERIOD_MS = 60000;
+    private static final int SKIP_SWITCH_STREAK_RESET_MS = 300000; // denials further apart start a new streak; must cover the slowest sync timeout retry cadence
     private int numRequestsLastMinute;
     private long lastSwitchTimestamp;
+    private final Map<XmrWalletBase, Long> walletSyncProgressTimestamps = new ConcurrentHashMap<>();
+    private long firstSkippedSwitchTimestamp;
+    private long lastSkippedSwitchTimestamp;
     private Set<MoneroRpcConnection> excludedConnections = new HashSet<>();
     private static final long FALLBACK_INVOCATION_PERIOD_MS = 1000 * 30 * 1; // offer to fallback up to once every 30s
     private boolean fallbackApplied;
@@ -189,6 +201,10 @@ public final class XmrConnectionService {
                         initialize();
                     } catch (Exception e) {
                         log.warn("Error initializing connection service, error={}\n", e.getMessage(), e);
+                        UserThread.execute(() -> {
+                            connectionServiceErrorMsg.set(e.getMessage());
+                            HavenoUtils.setTopError(Res.get("popup.warning.moneroConnection", e.getMessage())); // polling never starts, so surface fatal error
+                        });
                     }
                 });
             }
@@ -227,9 +243,23 @@ public final class XmrConnectionService {
     }
 
     public String getProxyUri() {
+        return getProxyUri(null);
+    }
+
+    // when stream isolation is enabled, a deterministic SOCKS5 credential per isolation id
+    // gives each wallet its own Tor circuit (IsolateSOCKSAuth) without churning circuits
+    public String getProxyUri(String isolationId) {
         if (socks5ProxyProvider.getSocks5Proxy() == null) return null;
         String host = socks5ProxyProvider.getSocks5Proxy().getInetAddress().getHostAddress();
-        return NetworkUtils.formatHostAndPort(host, socks5ProxyProvider.getSocks5Proxy().getPort());
+        String hostAndPort = NetworkUtils.formatHostAndPort(host, socks5ProxyProvider.getSocks5Proxy().getPort());
+        if (isolationId == null || !config.xmrStreamIsolation) return "socks5://" + hostAndPort; // monero defaults to socks4a, which cannot reach ipv6
+        String credential = Utilities.encodeToHex(Hash.getSha256Hash(isolationId)).substring(0, 16);
+        return "socks5://" + credential + ":" + credential + "@" + hostAndPort;
+    }
+
+    // apply the daemon proxy to a wallet's connection, isolating its Tor circuit by wallet name
+    public void applyWalletProxyUri(MoneroRpcConnection connection, String walletName, boolean applyProxyUri) {
+        connection.setProxyUri(applyProxyUri ? getProxyUri(walletName) : null);
     }
 
     public void addConnectionListener(XmrConnectionListener listener) {
@@ -254,7 +284,7 @@ public final class XmrConnectionService {
 
     private void addConnection(MoneroRpcConnection connection, boolean addToEncryptedList) {
         accountService.checkAccountOpen();
-        applySslPolicy(connection);
+        applySslPolicy(connection, false);
         synchronized (connections) {
             if (getConnection(connection.getUri()) != null) throw new IllegalArgumentException("Connection already exists with URI: " + connection.getUri());
             connections.add(connection);
@@ -325,6 +355,7 @@ public final class XmrConnectionService {
         if (connection == null) {
             log.warn("Setting monerod connection to null", new Throwable("Stack trace"));
         }
+        applySslPolicy(connection, true);
 
         // update internals if applicable
         boolean isInitializing = monerod == null && connection != null;
@@ -335,7 +366,6 @@ public final class XmrConnectionService {
                     isConnected = false;
                     connectionList.setCurrentConnectionUri(null);
                 } else {
-                    applySslPolicy(connection);
                     monerod = new MoneroDaemonRpc(connection);
                     isConnected = connection.isConnected();
                     synchronized (connections) {
@@ -517,12 +547,30 @@ public final class XmrConnectionService {
         return bestConnection;
     }
 
-    public synchronized boolean requestConnectionSwitch() {
-        return requestConnectionSwitch(null);
+    public void reportWalletSyncProgress(XmrWalletBase wallet) {
+        walletSyncProgressTimestamps.put(wallet, System.currentTimeMillis());
+        walletSyncProgressTimestamps.values().removeIf(timestamp -> System.currentTimeMillis() - timestamp > SKIP_SWITCH_STREAK_RESET_MS); // evict stale entries so finished wallets are released
     }
 
-    public synchronized boolean requestConnectionSwitch(MoneroRpcConnection sourceConnection) {
-        log.warn("Requesting connection switch to next best monerod, source monerod={}, proxyUri={}", sourceConnection == null ? null : sourceConnection.getUri(), sourceConnection == null ? null : sourceConnection.getProxyUri());
+    // returns whether a wallet other than the requester is actively syncing with progress reported within the given period
+    private boolean hasOtherWalletSyncProgressWithin(XmrWalletBase requester, long periodMs) {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<XmrWalletBase, Long> entry : walletSyncProgressTimestamps.entrySet()) {
+            if (entry.getKey() != requester && entry.getKey().isSyncingWithProgress() && now - entry.getValue() < periodMs) return true;
+        }
+        return false;
+    }
+
+    public synchronized boolean requestConnectionSwitch() {
+        return requestConnectionSwitch(null, null);
+    }
+
+    public synchronized boolean requestConnectionSwitch(MoneroRpcConnection sourceConnection, XmrWalletBase requester) {
+        return requestConnectionSwitch(sourceConnection, requester, false);
+    }
+
+    public synchronized boolean requestConnectionSwitch(MoneroRpcConnection sourceConnection, XmrWalletBase requester, boolean skipCooldown) {
+        log.warn("Requesting connection switch to next best monerod, source monerod={}, proxyUri={}, skipCooldown={}", sourceConnection == null ? null : sourceConnection.getUri(), sourceConnection == null ? null : sourceConnection.getProxyUri(), skipCooldown);
         if (Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_LOCAL) {
             log.warn("Requesting connection switch on testnet", new RuntimeException("Stack trace"));
         }
@@ -545,17 +593,32 @@ public final class XmrConnectionService {
             return false;
         }
 
-        // skip if last switch was too recent
-        boolean skipSwitch = System.currentTimeMillis() - lastSwitchTimestamp < SKIP_SWITCH_WITHIN_MS;
-        if (skipSwitch) {
-            log.warn("Skipping switch to next best Monero connection because last switch was less than {} seconds ago", SKIP_SWITCH_WITHIN_MS / 1000);
-            return false;
+        // skip if another wallet is mid-sync with recent progress, unless requests were denied too long, since switching would restart its sync
+        if (hasOtherWalletSyncProgressWithin(requester, SKIP_SWITCH_AFTER_SYNC_PROGRESS_MS)) {
+            long now = System.currentTimeMillis();
+            if (firstSkippedSwitchTimestamp == 0 || now - lastSkippedSwitchTimestamp > SKIP_SWITCH_STREAK_RESET_MS) firstSkippedSwitchTimestamp = now; // start new denial streak
+            lastSkippedSwitchTimestamp = now;
+            if (now - firstSkippedSwitchTimestamp < MAX_SKIP_SWITCH_PERIOD_MS) {
+                log.warn("Skipping switch to next best Monero connection because another wallet is syncing with progress within the last {} seconds", SKIP_SWITCH_AFTER_SYNC_PROGRESS_MS / 1000);
+                return false;
+            }
+            log.warn("Switching to next best Monero connection despite recent wallet sync progress because requests were denied for over {} seconds", MAX_SKIP_SWITCH_PERIOD_MS / 1000);
         }
 
-        // skip if too many requests in the last minute
-        if (numRequestsLastMinute > MAX_SWITCH_REQUESTS_PER_MINUTE) {
-            log.warn("Skipping switch to next best Monero connection because more than {} requests were made in the last minute", MAX_SWITCH_REQUESTS_PER_MINUTE);
-            return false;
+        // throttle switch frequency only after the wallet service is initialized, so startup sync retries can rotate nodes freely
+        if (HavenoUtils.isWalletInitialized()) {
+
+            // skip if last switch was too recent
+            if (!skipCooldown && System.currentTimeMillis() - lastSwitchTimestamp < SKIP_SWITCH_WITHIN_MS) {
+                log.warn("Skipping switch to next best Monero connection because last switch was less than {} seconds ago", SKIP_SWITCH_WITHIN_MS / 1000);
+                return false;
+            }
+
+            // skip if too many requests in the last minute
+            if (numRequestsLastMinute > MAX_SWITCH_REQUESTS_PER_MINUTE) {
+                log.warn("Skipping switch to next best Monero connection because more than {} requests were made in the last minute", MAX_SWITCH_REQUESTS_PER_MINUTE);
+                return false;
+            }
         }
 
         // increment request count
@@ -581,6 +644,7 @@ public final class XmrConnectionService {
 
         // switch to best connection
         lastSwitchTimestamp = System.currentTimeMillis();
+        firstSkippedSwitchTimestamp = 0;
         setConnection(bestConnection, getCachedDaemonInfo(bestConnection));
         return true;
     }
@@ -600,7 +664,11 @@ public final class XmrConnectionService {
     }
 
     public boolean isTrustedDaemon() {
-        return isConnectionLocalHost(); // TODO: allow user to set daemon as trusted?
+        return isTrustedDaemon(getConnection());
+    }
+
+    public boolean isTrustedDaemon(MoneroRpcConnection connection) {
+        return isConnectionLocalHost(connection); // TODO: allow user to set daemon as trusted?
     }
 
     public boolean isProxyApplied() {
@@ -690,6 +758,10 @@ public final class XmrConnectionService {
         return downloadListener.percentageProperty();
     }
 
+    public ReadOnlyLongProperty blocksRemainingProperty() {
+        return downloadListener.blocksRemainingProperty();
+    }
+
     public int getMinBroadcastConnections() {
         return MIN_BROADCAST_CONNECTIONS;
     }
@@ -727,23 +799,34 @@ public final class XmrConnectionService {
     }
 
     public List<MoneroTx> getTxs(List<String> txHashes) {
-        synchronized (txCache) {
 
-            // fetch txs
-            if (getMonerod() == null) verifyConnection(); // will throw
-            List<MoneroTx> txs = getMonerod().getTxs(txHashes, true);
-
-            // store to cache
-            for (MoneroTx tx : txs) txCache.put(tx.getHash(), Optional.of(tx));
-
-            // schedule txs to be removed from cache
-            UserThread.runAfter(() -> {
-                synchronized (txCache) {
-                    for (MoneroTx tx : txs) txCache.remove(tx.getHash());
-                }
-            }, getRefreshPeriodMs() / 1000);
-            return txs;
+        // fetch txs outside the cache lock so cache reads are not blocked
+        MoneroDaemonRpc monerod = getMonerod();
+        if (monerod == null) {
+            verifyConnection(); // will throw if disconnected
+            monerod = getMonerod();
+            if (monerod == null) throw new RuntimeException("No connection to Monero node");
         }
+        List<MoneroTx> txs;
+        ReentrantLock daemonLock = HavenoUtils.acquireDaemonLock();
+        try {
+            txs = monerod.getTxs(txHashes, true);
+        } finally {
+            HavenoUtils.releaseDaemonLock(daemonLock);
+        }
+
+        // store to cache
+        synchronized (txCache) {
+            for (MoneroTx tx : txs) txCache.put(tx.getHash(), Optional.of(tx));
+        }
+
+        // schedule txs to be removed from cache
+        UserThread.runAfter(() -> {
+            synchronized (txCache) {
+                for (MoneroTx tx : txs) txCache.remove(tx.getHash());
+            }
+        }, getRefreshPeriodMs() / 1000);
+        return txs;
     }
 
     public MoneroTx getTxWithCache(String txHash) {
@@ -752,22 +835,23 @@ public final class XmrConnectionService {
     }
 
     public List<MoneroTx> getTxsWithCache(List<String> txHashes) {
-        synchronized (txCache) {
-            try {
-                // get cached txs
-                List<MoneroTx> cachedTxs = new ArrayList<MoneroTx>();
-                List<String> uncachedTxHashes = new ArrayList<String>();
+        try {
+
+            // get cached txs
+            List<MoneroTx> cachedTxs = new ArrayList<MoneroTx>();
+            List<String> uncachedTxHashes = new ArrayList<String>();
+            synchronized (txCache) {
                 for (int i = 0; i < txHashes.size(); i++) {
                     if (txCache.containsKey(txHashes.get(i))) cachedTxs.add(txCache.get(txHashes.get(i)).orElse(null));
                     else uncachedTxHashes.add(txHashes.get(i));
                 }
-
-                // return txs from cache if available, otherwise fetch
-                return uncachedTxHashes.isEmpty() ? cachedTxs : getTxs(txHashes);
-            } catch (Exception e) {
-                if (!isShutDownStarted) throw e;
-                return null;
             }
+
+            // return txs from cache if available, otherwise fetch
+            return uncachedTxHashes.isEmpty() ? cachedTxs : getTxs(txHashes);
+        } catch (Exception e) {
+            if (!isShutDownStarted) throw e;
+            return null;
         }
     }
 
@@ -787,6 +871,7 @@ public final class XmrConnectionService {
             connection.setOnline(getNumOutgoingConnections(info) != 0);
             connection.setAuthenticated(true);
             connection.setAttribute(LAST_INFO_KEY, info);
+            connection.setAttribute(LAST_ERROR_KEY, null);
         } catch (Exception e) {
             connection.setOnline(false);
             if (e instanceof MoneroRpcError) {
@@ -799,6 +884,7 @@ public final class XmrConnectionService {
                 connection.setAuthenticated(null);
             }
             connection.setAttribute(LAST_INFO_KEY, null);
+            connection.setAttribute(LAST_ERROR_KEY, e);
         }
         if (Boolean.TRUE.equals(connection.isOnline())) {
             connection.setResponseTime(System.currentTimeMillis() - startTime);
@@ -819,6 +905,10 @@ public final class XmrConnectionService {
         return (MoneroDaemonInfo) connection.getAttribute(LAST_INFO_KEY);
     }
 
+    protected static Exception getCachedDaemonError(MoneroRpcConnection connection) {
+        return (Exception) connection.getAttribute(LAST_ERROR_KEY);
+    }
+
     protected static boolean isSyncedWithinTolerance(MoneroDaemonInfo info) {
         Long targetHeight = getTargetHeight(info);
         if (targetHeight == null) return false;
@@ -837,26 +927,18 @@ public final class XmrConnectionService {
         return connection != null && NetworkUtils.isLocalHost(connection.getUri());
     }
 
-    /**
-     * Apply TLS verification policy to a Monero daemon connection.
-     *
-     * A Monero node never holds the user's keys and its data is validated by the wallet, so
-     * a malicious node cannot steal funds; TLS verification adds little here. It also can't be
-     * enforced in practice, since monerod's default serves a self-signed certificate that no
-     * certificate authority can validate. We therefore disable verification, but warn once and
-     * recommend Tor when connecting to a remote clearnet node over HTTPS.
-     *
-     * @param connection the connection to configure (no-op if null)
-     */
-    private void applySslPolicy(MoneroRpcConnection connection) {
+    // Disable TLS verification: a node never holds the user's keys, its data is validated by the wallet, and monerod's
+    // default self-signed cert cannot be CA-validated. Warn and recommend Tor if warnIfInsecure and remote clearnet HTTPS.
+    private void applySslPolicy(MoneroRpcConnection connection, boolean warnIfInsecure) {
         if (connection == null) return;
         connection.setSslVerify(false);
+        if (!warnIfInsecure) return;
         String uri = connection.getUri();
         boolean isRemoteHttps = uri != null && uri.toLowerCase().startsWith("https:") && !connection.isOnion() && !NetworkUtils.isLocalHost(uri);
         if (isRemoteHttps) {
             synchronized (warnedInsecureConnections) {
                 if (warnedInsecureConnections.add(uri)) {
-                    log.warn("Connecting to remote Monero node {} over HTTPS without verifying its TLS certificate. " +
+                    log.warn("Using remote Monero node {} over HTTPS without verifying its TLS certificate. " +
                             "Prefer a Tor onion node, or a node you run or trust, for better privacy.", uri);
                 }
             }
@@ -890,7 +972,7 @@ public final class XmrConnectionService {
             keyImagePoller.poll(); // TODO: keep or remove first poll?s
         }).start();
 
-        // listen for account to be opened or password changed
+        // listen for account to be opened
         if (!isInitialized) {
             accountService.addListener(new AccountServiceListener() {
 
@@ -903,12 +985,6 @@ public final class XmrConnectionService {
                         log.error("Error initializing connection service after account opened, error={}\n", e.getMessage(), e);
                         throw new RuntimeException(e);
                     }
-                }
-
-                @Override
-                public void onPasswordChanged(String oldPassword, String newPassword) {
-                    log.info(getClass() + ".onPasswordChanged({}, {}) called", oldPassword == null ? null : "***", newPassword == null ? null : "***");
-                    connectionList.changePassword(oldPassword, newPassword);
                 }
             });
         }
@@ -1130,6 +1206,10 @@ public final class XmrConnectionService {
     private void doPollMonerod(MoneroDaemonInfo applyInfo) {
         synchronized (pollLock) {
             if (isShutDownStarted) return;
+
+            // skip fetching info while main wallet syncs so it has uninterfered access to monerod
+            if (applyInfo == null && HavenoUtils.xmrWalletService != null && HavenoUtils.xmrWalletService.isSyncingWithProgress()) return;
+
             pollInProgress = true;
             try {
 
@@ -1144,7 +1224,11 @@ public final class XmrConnectionService {
                     if (applyInfo == null) {
                         checkConnection(connection);
                         MoneroDaemonInfo info = getCachedDaemonInfo(connection);
-                        if (info == null) throw new RuntimeException("Could not get latest info from the Monero node.");
+                        if (info == null) {
+                            Exception cause = getCachedDaemonError(connection);
+                            String detail = cause == null ? "." : ": " + (cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage());
+                            throw new RuntimeException("Could not get latest info from the Monero node" + detail, cause);
+                        }
                         lastInfo = info;
                     } else {
                         lastInfo = applyInfo;
@@ -1223,7 +1307,8 @@ public final class XmrConnectionService {
                 chainHeight.set(getHeight());
 
                 // save if blockchain is syncing locally
-                boolean blockchainSyncingLocally = isConnectionLocalHost() && lastInfo.getHeight().equals(lastInfo.getHeightWithoutBootstrap()) || (lastInfo.getTargetHeight().equals(0l) && lastInfo.getHeightWithoutBootstrap().equals(0l)); // blockchain is syncing if height equals height without bootstrap, or target height and height without bootstrap both equal 0
+                Long heightWithoutBootstrap = lastInfo.getHeightWithoutBootstrap(); // null on monerod without bootstrap daemon support
+                boolean blockchainSyncingLocally = isConnectionLocalHost() && (heightWithoutBootstrap == null || lastInfo.getHeight().equals(heightWithoutBootstrap) || (lastInfo.getTargetHeight().equals(0l) && heightWithoutBootstrap.equals(0l))); // blockchain is syncing if height equals height without bootstrap, or target height and height without bootstrap both equal 0
                 preferences.getXmrNodeSettings().setSyncBlockchain(blockchainSyncingLocally); // TODO: this isn't saved until all services initialized
 
                 // throttle warnings if monerod not synced

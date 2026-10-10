@@ -189,7 +189,7 @@ class TakeOfferViewModel extends ActivatableWithDataModel<TakeOfferDataModel> im
 
         updateSpinnerInfo();
 
-        isTradeFeeVisible.setValue(false);
+        applyTakerFee();
     }
 
     @Override
@@ -221,8 +221,6 @@ class TakeOfferViewModel extends ActivatableWithDataModel<TakeOfferDataModel> im
         marketPriceMargin = FormattingUtils.formatToPercent(offer.getMarketPriceMarginPct());
         paymentLabel = Res.get("takeOffer.fundsBox.paymentLabel", offer.getShortId());
 
-        checkNotNull(dataModel.getAddressEntry(), "dataModel.getAddressEntry() must not be null");
-
         errorMessage.set(offer.getErrorMessage());
 
         xmrValidator.setMaxValue(offer.getAmount());
@@ -240,16 +238,13 @@ class TakeOfferViewModel extends ActivatableWithDataModel<TakeOfferDataModel> im
         takeOfferResultHandler = resultHandler;
         takeOfferRequested = true;
         showTransactionPublishedScreen.set(false);
-        dataModel.onTakeOffer(trade -> {
+        dataModel.onTakeOffer(trade -> UserThread.execute(() -> {
             this.trade = trade;
             takeOfferCompleted.set(true);
             trade.stateProperty().addListener(tradeStateListener);
             applyTradeState();
             applyTradeErrorMessage(trade.getErrorMessage());
-            takeOfferCompleted.set(true);
-        }, errMessage -> {
-            applyTradeErrorMessage(errMessage);
-        });
+        }), errMessage -> UserThread.execute(() -> applyTradeErrorMessage(errMessage)));
 
         updateButtonDisableState();
         updateSpinnerInfo();
@@ -479,12 +474,12 @@ class TakeOfferViewModel extends ActivatableWithDataModel<TakeOfferDataModel> im
                     }
                 }
             }
+            if (takeOfferResultHandler != null)
+                takeOfferResultHandler.run();
+
             this.errorMessage.set(errorMessage + appendMsg);
 
             updateSpinnerInfo();
-
-            if (takeOfferResultHandler != null)
-                takeOfferResultHandler.run();
         } else {
             this.errorMessage.set(null);
         }
@@ -572,6 +567,7 @@ class TakeOfferViewModel extends ActivatableWithDataModel<TakeOfferDataModel> im
             @Override
             public void onDisconnect(CloseConnectionReason closeConnectionReason, Connection connection) {
                 if (trade == null) return; // ignore if trade initializing
+                if (closeConnectionReason.isIntended && closeConnectionReason != CloseConnectionReason.CLOSE_REQUESTED_BY_PEER) return; // ignore our own closes, which are followed by a reconnect
                 if (connection.getPeersNodeAddressOptional().isPresent() &&
                         connection.getPeersNodeAddressOptional().get().equals(offer.getMakerNodeAddress())) {
                     offerWarning.set(Res.get("takeOffer.warning.connectionToPeerLost"));

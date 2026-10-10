@@ -23,8 +23,8 @@ import com.google.inject.name.Named;
 import com.jfoenix.controls.JFXButton;
 import com.jfoenix.controls.JFXTextField;
 
+import haveno.desktop.util.GlyphsDude;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
-import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIconView;
 import haveno.common.UserThread;
 import haveno.common.crypto.KeyRing;
 import haveno.common.util.Tuple2;
@@ -35,6 +35,7 @@ import haveno.core.locale.Res;
 import haveno.core.monetary.Price;
 import haveno.core.offer.Offer;
 import haveno.core.offer.OfferDirection;
+import haveno.core.offer.OfferUtil;
 import haveno.core.offer.OpenOffer;
 import haveno.core.payment.PaymentAccount;
 import haveno.core.payment.payload.PaymentMethod;
@@ -48,9 +49,12 @@ import haveno.core.util.coin.CoinFormatter;
 import haveno.desktop.Navigation;
 import haveno.desktop.components.AutoTooltipButton;
 import haveno.desktop.components.BusyAnimation;
+import haveno.desktop.components.TextFieldWithCopyIcon;
+import haveno.desktop.main.offer.OfferViewModelUtil;
 import haveno.desktop.main.overlays.Overlay;
 import haveno.desktop.main.overlays.editor.PasswordPopup;
 import haveno.desktop.main.overlays.popups.Popup;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.DisplayUtils;
 import static haveno.desktop.util.FormBuilder.addButtonAfterGroup;
 import static haveno.desktop.util.FormBuilder.addButtonBusyAnimationLabelAfterGroup;
@@ -65,11 +69,11 @@ import haveno.desktop.util.Layout;
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
+import javafx.geometry.Bounds;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.geometry.VPos;
-import javafx.scene.Node;
 import javafx.scene.control.Button;
 import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.Label;
@@ -82,6 +86,7 @@ import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
+import javafx.scene.text.Text;
 
 import org.fxmisc.easybind.EasyBind;
 import org.fxmisc.easybind.Subscription;
@@ -92,6 +97,7 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
     protected static final Logger log = LoggerFactory.getLogger(OfferDetailsWindow.class);
 
     private final CoinFormatter formatter;
+    private final OfferUtil offerUtil;
     private final User user;
     private final KeyRing keyRing;
     private final Navigation navigation;
@@ -111,11 +117,13 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
 
     @Inject
     public OfferDetailsWindow(@Named(FormattingUtils.BTC_FORMATTER_KEY) CoinFormatter formatter,
+                              OfferUtil offerUtil,
                               User user,
                               KeyRing keyRing,
                               Navigation navigation,
                               TradeManager tradeManager) {
         this.formatter = formatter;
+        this.offerUtil = offerUtil;
         this.user = user;
         this.keyRing = keyRing;
         this.navigation = navigation;
@@ -343,19 +351,24 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
         OpenOffer myOpenOffer = HavenoUtils.openOfferManager.getOpenOffer(offer.getId()).orElse(null);
         String offerChallenge = myOpenOffer == null ? null : myOpenOffer.getChallenge();
 
+        boolean showTradeFee = placeOfferHandlerOptional.isPresent() || takeOfferHandlerOptional.isPresent();
+
         rows = 3;
         if (countryCode != null)
             rows++;
         if (!isF2F)
+            rows++;
+        if (showTradeFee)
             rows++;
         if (reservedAmount != null)
             rows++;
         if (offerChallenge != null)
             rows++;
 
-        addTitledGroupBg(gridPane, ++rowIndex, rows, Res.get("shared.details"), Layout.COMPACT_GROUP_DISTANCE);
-        addConfirmationLabelTextFieldWithCopyIcon(gridPane, rowIndex, Res.get("shared.offerId"), offer.getId(),
-                Layout.TWICE_FIRST_ROW_AND_COMPACT_GROUP_DISTANCE);
+        addTitledGroupBg(gridPane, ++rowIndex, rows, Res.get("shared.details"), Layout.DETAILS_WINDOW_GROUP_DISTANCE);
+        Tuple2<Label, TextFieldWithCopyIcon> offerIdTuple = addConfirmationLabelTextFieldWithCopyIcon(gridPane, rowIndex,
+                Res.get("shared.offerId"), offer.getId(), Layout.TWICE_FIRST_ROW_AND_DETAILS_WINDOW_GROUP_DISTANCE);
+        Accessibility.setHelp(offerIdTuple.second, Accessibility.spellOut(offer.getId()));
         addSeparator(gridPane, ++rowIndex);
         addConfirmationLabelTextFieldWithCopyIcon(gridPane, ++rowIndex, Res.get("offerDetailsWindow.makersOnion"),
                 offer.getMakerNodeAddress().getFullAddress());
@@ -371,6 +384,15 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
                 " " +
                 HavenoUtils.formatXmr(takeOfferHandlerOptional.isPresent() ? offer.getOfferPayload().getSellerSecurityDepositForTradeAmount(tradeAmount) : offer.getOfferPayload().getMaxSellerSecurityDeposit(), true);
         addConfirmationLabelLabel(gridPane, ++rowIndex, Res.get("shared.securityDeposit"), value);
+
+        if (showTradeFee) {
+            boolean isTaker = takeOfferHandlerOptional.isPresent();
+            BigInteger feeBasisAmount = isTaker ? tradeAmount : offer.getAmount();
+            BigInteger tradeFee = HavenoUtils.multiply(feeBasisAmount, isTaker ? offer.getTakerFeePct() : offer.getMakerFeePct());
+            addSeparator(gridPane, ++rowIndex);
+            addConfirmationLabelLabel(gridPane, ++rowIndex, Res.get("createOffer.tradeFee.descriptionXMROnly"),
+                    OfferViewModelUtil.getTradeFeeWithFiatEquivalentAndPercentage(offerUtil, tradeFee, feeBasisAmount, formatter));
+        }
 
         if (reservedAmount != null) {
             addSeparator(gridPane, ++rowIndex);
@@ -388,7 +410,7 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
 
             // add label
             Label label = addLabel(gridPane, ++rowIndex, Res.get("offerDetailsWindow.challenge"), 0);
-            label.getStyleClass().addAll("confirmation-label", "regular-text-color");
+            label.getStyleClass().add("confirmation-label");
             GridPane.setHalignment(label, HPos.LEFT);
             GridPane.setValignment(label, VPos.TOP);
 
@@ -408,21 +430,20 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
             Label copyLabel = new Label();
             copyLabel.getStyleClass().addAll("icon");
             copyLabel.setTooltip(new Tooltip(Res.get("shared.copyToClipboard")));
-            MaterialDesignIconView copyIcon = new MaterialDesignIconView(MaterialDesignIcon.CONTENT_COPY, "1.2em");
+            Text copyIcon = GlyphsDude.createIcon(MaterialDesignIcon.CONTENT_COPY, "1.2em");
             copyIcon.setFill(Color.WHITE);
             copyLabel.setGraphic(copyIcon);
             JFXButton copyButton = new JFXButton(Res.get("offerDetailsWindow.challenge.copy"), copyLabel);
             copyButton.setContentDisplay(ContentDisplay.LEFT);
             copyButton.setGraphicTextGap(8);
-            copyButton.setOnMouseClicked(e -> {
+            copyButton.setOnAction(e -> { // onAction so keyboard activation copies too
                 Utilities.copyToClipboard(offerChallenge);
                 Tooltip tp = new Tooltip(Res.get("shared.copiedToClipboard"));
-                Node node = (Node) e.getSource();
+                Bounds bounds = copyButton.localToScreen(copyButton.getBoundsInLocal());
                 UserThread.runAfter(() -> tp.hide(), 1);
-                tp.show(node, e.getScreenX() + Layout.PADDING, e.getScreenY() + Layout.PADDING);
+                tp.show(copyButton, bounds.getCenterX() + Layout.PADDING, bounds.getCenterY() + Layout.PADDING);
             });
             copyButton.setId("copy-button-thin");
-            copyButton.setFocusTraversable(false);
             vbox.getChildren().addAll(centerLabel, copyButton);
 
             // add vbox to grid pane in next column
@@ -432,18 +453,18 @@ public class OfferDetailsWindow extends Overlay<OfferDetailsWindow> {
         }
 
         if (placeOfferHandlerOptional.isPresent()) {
-            addTitledGroupBg(gridPane, ++rowIndex, 1, Res.get("offerDetailsWindow.commitment"), Layout.COMPACT_GROUP_DISTANCE);
+            addTitledGroupBg(gridPane, ++rowIndex, 1, Res.get("offerDetailsWindow.commitment"), Layout.DETAILS_WINDOW_GROUP_DISTANCE);
             final Tuple2<Label, Label> labelLabelTuple2 = addConfirmationLabelLabel(gridPane, rowIndex, Res.get("offerDetailsWindow.agree"), Res.get("createOffer.tac"),
-                    Layout.TWICE_FIRST_ROW_AND_COMPACT_GROUP_DISTANCE);
+                    Layout.TWICE_FIRST_ROW_AND_DETAILS_WINDOW_GROUP_DISTANCE);
             labelLabelTuple2.second.setWrapText(true);
             labelLabelTuple2.second.setMinHeight(Region.USE_PREF_SIZE);
             GridPane.setVgrow(labelLabelTuple2.second, Priority.ALWAYS);
 
             addConfirmAndCancelButtons(true);
         } else if (takeOfferHandlerOptional.isPresent()) {
-            addTitledGroupBg(gridPane, ++rowIndex, 1, Res.get("shared.contract"), Layout.COMPACT_GROUP_DISTANCE);
+            addTitledGroupBg(gridPane, ++rowIndex, 1, Res.get("shared.contract"), Layout.DETAILS_WINDOW_GROUP_DISTANCE);
             final Tuple2<Label, Label> labelLabelTuple2 = addConfirmationLabelLabel(gridPane, rowIndex, Res.get("offerDetailsWindow.tac"), Res.get("takeOffer.tac"),
-                    Layout.TWICE_FIRST_ROW_AND_COMPACT_GROUP_DISTANCE);
+                    Layout.TWICE_FIRST_ROW_AND_DETAILS_WINDOW_GROUP_DISTANCE);
             labelLabelTuple2.second.setWrapText(true);
 
             addConfirmAndCancelButtons(false);

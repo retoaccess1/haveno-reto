@@ -42,7 +42,6 @@ import haveno.common.proto.persistable.PersistablePayload;
 import haveno.common.util.Utilities;
 import haveno.core.api.model.PaymentAccountForm;
 import haveno.core.api.model.PaymentAccountFormField;
-import haveno.core.locale.BankUtil;
 import haveno.core.locale.Country;
 import haveno.core.locale.CountryUtil;
 import haveno.core.locale.CurrencyUtil;
@@ -56,6 +55,8 @@ import haveno.core.payment.validation.EmailOrMobileNrValidator;
 import haveno.core.payment.validation.EmailValidator;
 import haveno.core.payment.validation.IBANValidator;
 import haveno.core.payment.validation.LengthValidator;
+import haveno.core.payment.validation.PromptPayValidator;
+import haveno.core.util.validation.RegexValidator;
 import haveno.core.proto.CoreProtoResolver;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.util.validation.InputValidator;
@@ -344,6 +345,11 @@ public abstract class PaymentAccount implements PersistablePayload {
     @NonNull
     public abstract List<TradeCurrency> getSupportedCurrencies();
 
+    @Nullable
+    public List<Country> getSupportedCountries() {
+        return CountryUtil.getAllCountries(); // support all countries by default
+    }
+
     // ---------------------------- SERIALIZATION -----------------------------
 
     public String toJson() {
@@ -367,7 +373,6 @@ public abstract class PaymentAccount implements PersistablePayload {
         }
 
         jsonMap.put("accountName", getAccountName());
-        jsonMap.put("accountId", getId());
         if (paymentAccountPayload != null) jsonMap.put("salt", getSaltAsHex());
         return gson.toJson(jsonMap);
     }
@@ -408,24 +413,73 @@ public abstract class PaymentAccount implements PersistablePayload {
 
         // build form
         PaymentAccountForm form = new PaymentAccountForm(PaymentAccountForm.FormId.valueOf(paymentMethod.getId()));
+        List<Country> countries = getSupportedCountries();
+        if (countries == null || countries.isEmpty()) countries = CountryUtil.getAllCountries();
         for (PaymentAccountFormField.FieldId fieldId : getInputFieldIds()) {
             PaymentAccountFormField field = getEmptyFormField(fieldId);
+            field.setRequired(isFormFieldRequired(fieldId, null));
+            if (!field.getRequired() && getInputFieldIds().contains(PaymentAccountFormField.FieldId.COUNTRY)) {
+                field.setRequiredForCountries(countries.stream()
+                        .filter(country -> isFormFieldRequired(fieldId, country.code))
+                        .map(country -> country.code)
+                        .collect(Collectors.toList()));
+            }
             field.setValue((String) jsonMap.get(HavenoUtils.toCamelCase(field.getId().toString())));
             form.getFields().add(field);
         }
         return form;
     }
 
+    // a null country asks whether the field is required unconditionally
+    protected boolean isFormFieldRequired(PaymentAccountFormField.FieldId fieldId, @Nullable String countryCode) {
+        switch (fieldId) {
+        case ACCOUNT_OWNER:
+        case EXTRA_INFO:
+        case REQUIREMENTS:
+        case SALT:
+        case SPECIAL_INSTRUCTIONS:
+        case STATE:
+            return false;
+        default:
+            return true;
+        }
+    }
+
+    public void validateForm(PaymentAccountForm form) {
+        Map<PaymentAccountFormField.FieldId, String> values = new HashMap<>();
+        for (PaymentAccountFormField field : form.getFields()) {
+            if (!getInputFieldIds().contains(field.getId())) throw new IllegalArgumentException("Unexpected form field: " + field.getId());
+            if (values.containsKey(field.getId())) throw new IllegalArgumentException("Duplicate form field: " + field.getId());
+            values.put(field.getId(), field.getValue() == null ? "" : field.getValue());
+        }
+
+        // validate every declared field, including omitted fields and their dependencies
+        PaymentAccountForm completeForm = new PaymentAccountForm(form.getId());
+        for (PaymentAccountFormField.FieldId fieldId : getInputFieldIds()) {
+            PaymentAccountFormField field = new PaymentAccountFormField(fieldId);
+            field.setValue(values.getOrDefault(fieldId, ""));
+            completeForm.addField(field);
+        }
+        for (PaymentAccountFormField field : completeForm.getFields()) {
+            validateFormField(completeForm, field.getId(), field.getValue());
+        }
+    }
+
     public void validateFormField(PaymentAccountForm form, PaymentAccountFormField.FieldId fieldId, String value) {
         switch (fieldId) {
         case ACCEPTED_COUNTRY_CODES: {
             List<String> countryCodes = PaymentAccount.commaDelimitedCodesToList.apply(value);
+            if (countryCodes.isEmpty()) throw new IllegalArgumentException("Must accept at least one country");
             List<String> supportedCountryCodes = CountryUtil.getCountryCodes(((CountryBasedPaymentAccount) this).getSupportedCountries());
             for (String countryCode : countryCodes) {
                 if (!supportedCountryCodes.contains(countryCode)) throw new IllegalArgumentException("Country is not supported by " + getPaymentMethod().getId() + ": " + value);
             }
             break;
         }
+        case ACCEPTED_BANKS:
+            // comma-delimited list of accepted bank names; require at least one
+            if (commaDelimitedValuesToList.apply(value).isEmpty()) throw new IllegalArgumentException(Res.get("payment.accepted.banks") + ": " + value);
+            break;
         case ACCOUNT_ID:
             processValidationResult(new InputValidator().validate(value));
             break;
@@ -436,7 +490,7 @@ public abstract class PaymentAccount implements PersistablePayload {
             processValidationResult(new LengthValidator(2, 100).validate(value));
             break;
         case ACCOUNT_OWNER:
-            processValidationResult(new LengthValidator(2, 100).validate(value));
+            if (value != null && !value.isEmpty()) processValidationResult(new LengthValidator(2, 100).validate(value));
             break;
         case ACCOUNT_TYPE:
             processValidationResult(new LengthValidator(2, 100).validate(value));
@@ -504,17 +558,23 @@ public abstract class PaymentAccount implements PersistablePayload {
         case CONTACT:
             processValidationResult(new InputValidator().validate(value));
             break;
-        case COUNTRY:
-            if (this instanceof CountryBasedPaymentAccount) {
-                List<Country> supportedCountries = ((CountryBasedPaymentAccount) this).getSupportedCountries();
-                if (supportedCountries != null && !supportedCountries.isEmpty()) {
-                    List<String> supportedCountryCodes = CountryUtil.getCountryCodes(supportedCountries);
-                    if (!supportedCountryCodes.contains(value)) throw new IllegalArgumentException("Country is not supported by " + getPaymentMethod().getId() + ": " + value);
-                    return;
-                }
+        case COUNTRY: {
+            List<Country> supportedCountries = getSupportedCountries();
+            if (supportedCountries != null && !supportedCountries.isEmpty()) {
+                List<String> supportedCountryCodes = CountryUtil.getCountryCodes(supportedCountries);
+                if (!supportedCountryCodes.contains(value)) throw new IllegalArgumentException("Country is not supported by " + getPaymentMethod().getId() + ": " + value);
+                return;
             }
             if (!CountryUtil.findCountryByCode(value).isPresent()) throw new IllegalArgumentException("Invalid country code: " + value);
             break;
+        }
+        case CLABE: {
+            RegexValidator clabeValidator = new RegexValidator(); // Mexican CLABE: 18 digits (https://en.wikipedia.org/wiki/CLABE)
+            clabeValidator.setPattern("[0-9]{18}");
+            clabeValidator.setErrorMessage(Res.get("payment.clabe.validation"));
+            processValidationResult(clabeValidator.validate(value));
+            break;
+        }
         case EMAIL:
             processValidationResult(new EmailValidator().validate(value));
             break;
@@ -524,6 +584,7 @@ public abstract class PaymentAccount implements PersistablePayload {
         case EXTRA_INFO:
             break;
         case HOLDER_ADDRESS:
+            if (isFormFieldRequired(fieldId, null)) processValidationResult(new InputValidator().validate(value));
             processValidationResult(new LengthValidator(0, 100).validate(value));
             break;
         case HOLDER_EMAIL:
@@ -536,13 +597,19 @@ public abstract class PaymentAccount implements PersistablePayload {
         case IBAN:
             processValidationResult(new IBANValidator().validate(value));
             break;
-        case IFSC:
-            throw new IllegalArgumentException("Not implemented");
+        case IFSC: {
+            RegexValidator ifscValidator = new RegexValidator(); // https://en.wikipedia.org/wiki/Indian_Financial_System_Code
+            ifscValidator.setPattern("[A-Z]{4}0[0-9]{6}");
+            ifscValidator.setErrorMessage(Res.get("payment.ifsc.validation"));
+            processValidationResult(ifscValidator.validate(value));
+            break;
+        }
         case INTERMEDIARY_COUNTRY_CODE:
             if (!CountryUtil.findCountryByCode(value).isPresent()) throw new IllegalArgumentException("Invalid country code: " + value);
             break;
         case MOBILE_NR:
-            throw new IllegalArgumentException("Not implemented");
+            processValidationResult(new InputValidator().validate(value));
+            break;
         case NATIONAL_ACCOUNT_ID:
             throw new IllegalArgumentException("Not implemented");
         case PAYID:
@@ -555,7 +622,8 @@ public abstract class PaymentAccount implements PersistablePayload {
             processValidationResult(new InputValidator().validate(value));
             break;
         case PROMPT_PAY_ID:
-            throw new IllegalArgumentException("Not implemented");
+            processValidationResult(new PromptPayValidator().validate(value));
+            break;
         case QUESTION:
             throw new IllegalArgumentException("Not implemented");
         case REQUIREMENTS:
@@ -567,15 +635,7 @@ public abstract class PaymentAccount implements PersistablePayload {
             processValidationResult(new BranchIdValidator("GB").validate(value));
             break;
         case SPECIAL_INSTRUCTIONS:
-            break;
         case STATE:
-            String countryCode = form.getValue(PaymentAccountFormField.FieldId.COUNTRY);
-            boolean isStateRequired = BankUtil.isStateRequired(countryCode);
-            if (value == null || value.isEmpty()) {
-                if (isStateRequired) throw new IllegalArgumentException("Must provide state for country " + countryCode);
-            } else {
-                if (!isStateRequired) throw new IllegalArgumentException("Must not provide state for country " + countryCode);
-            }
             break;
         case TRADE_CURRENCIES:
             processValidationResult(new InputValidator().validate(value));
@@ -595,6 +655,9 @@ public abstract class PaymentAccount implements PersistablePayload {
         case ADDRESS:
             processValidationResult(new LengthValidator(10, 150).validate(value)); // TODO: validate crypto address
             break;
+        case VIRTUAL_PAYMENT_ADDRESS:
+            processValidationResult(new InputValidator().validate(value));
+            break;
         default:
             throw new RuntimeException("Unhandled form field: " + fieldId);
         }
@@ -612,6 +675,11 @@ public abstract class PaymentAccount implements PersistablePayload {
             List<Country> supportedCountries = ((CountryBasedPaymentAccount) this).getSupportedCountries();
             field.setSupportedCountries(supportedCountries);
             field.setComponent(supportedCountries.size() == 1 ? PaymentAccountFormField.Component.SELECT_ONE : PaymentAccountFormField.Component.SELECT_MULTIPLE);
+            break;
+        case ACCEPTED_BANKS:
+            // comma-delimited list of accepted bank names
+            field.setComponent(PaymentAccountFormField.Component.TEXT);
+            field.setLabel(Res.get("payment.accepted.banks"));
             break;
         case ACCOUNT_ID:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
@@ -665,10 +733,13 @@ public abstract class PaymentAccount implements PersistablePayload {
             throw new IllegalArgumentException("Not implemented");
         case BANK_CODE:
             throw new IllegalArgumentException("Not implemented");
-        case BANK_COUNTRY_CODE:
+        case BANK_COUNTRY_CODE: {
             field.setComponent(PaymentAccountFormField.Component.SELECT_ONE);
             field.setLabel(Res.get("payment.bank.country"));
+            List<Country> countries = getSupportedCountries();
+            if (countries != null && !countries.isEmpty()) field.setSupportedCountries(countries);
             break;
+        }
         case BANK_ID:
             throw new IllegalArgumentException("Not implemented");
         case BANK_NAME:
@@ -710,13 +781,21 @@ public abstract class PaymentAccount implements PersistablePayload {
         case CITY:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
             field.setLabel(Res.get("payment.account.city"));
+            break;
         case CONTACT:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
             field.setLabel(Res.get("payment.payByMail.contact"));
-        case COUNTRY:
+            break;
+        case COUNTRY: {
             field.setComponent(PaymentAccountFormField.Component.SELECT_ONE);
             field.setLabel(Res.get("shared.country"));
-            if (this instanceof CountryBasedPaymentAccount) field.setSupportedCountries(((CountryBasedPaymentAccount) this).getSupportedCountries());
+            List<Country> countries = getSupportedCountries();
+            if (countries != null && !countries.isEmpty()) field.setSupportedCountries(countries);
+            break;
+        }
+        case CLABE:
+            field.setComponent(PaymentAccountFormField.Component.TEXT);
+            field.setLabel(Res.get("payment.clabe"));
             break;
         case EMAIL:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
@@ -750,7 +829,9 @@ public abstract class PaymentAccount implements PersistablePayload {
             field.setLabel("IBAN");
             break;
         case IFSC:
-            throw new IllegalArgumentException("Not implemented");
+            field.setComponent(PaymentAccountFormField.Component.TEXT);
+            field.setLabel(Res.get("payment.ifsc"));
+            break;
         case INTERMEDIARY_ADDRESS:
             field.setComponent(PaymentAccountFormField.Component.TEXTAREA);
             field.setLabel(Res.get("payment.swift.address.intermediary"));
@@ -759,10 +840,13 @@ public abstract class PaymentAccount implements PersistablePayload {
             field.setComponent(PaymentAccountFormField.Component.TEXT);
             field.setLabel(Res.get("payment.swift.branch.intermediary"));
             break;
-        case INTERMEDIARY_COUNTRY_CODE:
+        case INTERMEDIARY_COUNTRY_CODE: {
             field.setComponent(PaymentAccountFormField.Component.SELECT_ONE);
             field.setLabel(Res.get("payment.swift.country.intermediary"));
+            List<Country> countries = getSupportedCountries();
+            if (countries != null && !countries.isEmpty()) field.setSupportedCountries(countries);
             break;
+        }
         case INTERMEDIARY_NAME:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
             field.setLabel(Res.get("payment.swift.name.intermediary"));
@@ -790,7 +874,9 @@ public abstract class PaymentAccount implements PersistablePayload {
             field.setLabel(Res.get("payment.postal.address"));
             break;
         case PROMPT_PAY_ID:
-            throw new IllegalArgumentException("Not implemented");
+            field.setComponent(PaymentAccountFormField.Component.TEXT);
+            field.setLabel(Res.get("payment.promptPay.promptPayId"));
+            break;
         case QUESTION:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
             field.setLabel(Res.get("payment.secret"));
@@ -812,7 +898,6 @@ public abstract class PaymentAccount implements PersistablePayload {
         case STATE:
             field.setComponent(PaymentAccountFormField.Component.TEXT);
             field.setLabel(Res.get("payment.account.state"));
-            field.setRequiredForCountries(CountryUtil.getCountryCodes(BankUtil.getAllStateRequiredCountries()));
             break;
         case TRADE_CURRENCIES:
             field.setComponent(PaymentAccountFormField.Component.SELECT_MULTIPLE);
@@ -844,6 +929,10 @@ public abstract class PaymentAccount implements PersistablePayload {
             field.setMinLength(10);
             field.setMaxLength(150);
             break;
+        case VIRTUAL_PAYMENT_ADDRESS:
+            field.setComponent(PaymentAccountFormField.Component.TEXT);
+            field.setLabel(Res.get("payment.upi.virtualPaymentAddress"));
+            break;
         default:
             throw new RuntimeException("Unhandled form field: " + field);
         }
@@ -859,5 +948,11 @@ public abstract class PaymentAccount implements PersistablePayload {
             return singletonList(s.trim().toUpperCase());
         else
             return new ArrayList<>();
+    };
+
+    // like commaDelimitedCodesToList but preserves case (e.g. for free-text values such as bank names)
+    public static final Function<String, List<String>> commaDelimitedValuesToList = (s) -> {
+        if (s == null || s.trim().isEmpty()) return new ArrayList<>();
+        return stream(s.split(",")).map(String::trim).filter(v -> !v.isEmpty()).collect(toList());
     };
 }

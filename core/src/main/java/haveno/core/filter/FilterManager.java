@@ -18,6 +18,7 @@
 package haveno.core.filter;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.inject.Inject;
 import com.google.inject.name.Named;
 import haveno.common.app.DevEnv;
@@ -46,6 +47,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.concurrent.TimeUnit;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -76,6 +78,8 @@ public class FilterManager {
     public interface Listener {
         void onFilterAdded(Filter filter);
     }
+
+    private static final long MAX_FILTER_DATE_DRIFT = TimeUnit.HOURS.toMillis(2);
 
     private final P2PService p2PService;
     private final KeyRing keyRing;
@@ -288,6 +292,9 @@ public class FilterManager {
     }
 
     public void addDevFilter(Filter filterWithoutSig, String privKeyString) {
+        if (!arePersistedNodeListsValid(filterWithoutSig)) {
+            throw new IllegalArgumentException("Filter contains node list values unsafe to persist to the config file");
+        }
         setFilterSigningKey(privKeyString);
         String signatureAsBase64 = getSignature(filterWithoutSig);
         Filter filterWithSig = Filter.cloneWithSig(filterWithoutSig, signatureAsBase64);
@@ -306,6 +313,11 @@ public class FilterManager {
     }
 
     public void removeInvalidFilters(Filter filter, String privKeyString) {
+        if (filter.getOwnerPubKey() == null) {
+            log.info("The invalid filter has no owner pub key, so we cannot remove it from the network. signerPubKeyAsHex={}", filter.getSignerPubKeyAsHex());
+            return;
+        }
+
         // We can only remove the filter if it's our own filter
         if (Arrays.equals(filter.getOwnerPubKey().getEncoded(), keyRing.getSignatureKeyPair().getPublic().getEncoded())) {
             log.info("Remove invalid filter {}", filter);
@@ -457,12 +469,22 @@ public class FilterManager {
                                 Method method = paymentAccountPayload.getClass().getMethod(paymentAccountFilter.getGetMethodName());
                                 // We invoke getter methods (no args), e.g. getHolderName
                                 String valueFromInvoke = (String) method.invoke(paymentAccountPayload);
-                                return valueFromInvoke.equalsIgnoreCase(paymentAccountFilter.getValue());
+                                // compare without formatting characters so cosmetic variants (dashes, spaces, etc.) cannot evade a ban
+                                String bannedValue = normalizeBannedValue(paymentAccountFilter.getValue());
+                                return !bannedValue.isEmpty() && bannedValue.equalsIgnoreCase(normalizeBannedValue(valueFromInvoke));
                             } catch (Throwable e) {
                                 log.error(e.getMessage());
                                 return false;
                             }
                         });
+    }
+
+    @VisibleForTesting
+    static String normalizeBannedValue(String value) {
+        // strip all formatting from numeric identifiers (e.g. account and phone numbers), but only whitespace from
+        // others, since punctuation is significant in emails and usernames
+        String stripped = value.replaceAll("[^\\p{L}\\p{N}]", "");
+        return stripped.matches("\\p{N}+") ? stripped : value.replaceAll("\\s", "");
     }
 
     public boolean isWitnessSignerPubKeyBanned(String witnessSignerPubKeyAsHex) {
@@ -490,6 +512,18 @@ public class FilterManager {
         }
         if (!isSignatureValid(newFilter)) {
             log.warn("verifySignature failed. Filter={}", newFilter);
+            return;
+        }
+
+        // Reject filters dated too far in the future, else they cannot be superseded by a legitimately dated filter.
+        if (newFilter.getCreationDate() - System.currentTimeMillis() > MAX_FILTER_DATE_DRIFT) {
+            log.warn("Filter from network creation date is too far in the future. creationDate={}", new Date(newFilter.getCreationDate()));
+            return;
+        }
+
+        // Reject filters whose node lists contain values unsafe to persist to the config file.
+        if (!arePersistedNodeListsValid(newFilter)) {
+            log.warn("Filter from network contains invalid persisted node list values. signerPubKeyAsHex={}", newFilter.getSignerPubKeyAsHex());
             return;
         }
 
@@ -580,6 +614,28 @@ public class FilterManager {
             configFileEditor.setOption(optionName, String.join(",", bannedNodes));
         else
             configFileEditor.clearOption(optionName);
+    }
+
+    // Node lists are persisted to the config file, so reject values that could inject or corrupt config options.
+    private boolean arePersistedNodeListsValid(Filter filter) {
+        return isSafeConfigValueList(filter.getSeedNodes()) &&
+                isSafeConfigValueList(filter.getXmrNodes()) &&
+                isSafeConfigValueList(filter.getPriceRelayNodes());
+    }
+
+    private boolean isSafeConfigValueList(List<String> values) {
+        return values == null || values.stream().allMatch(this::isSafeConfigValue);
+    }
+
+    private boolean isSafeConfigValue(String value) {
+        if (value == null || value.isBlank() || !value.equals(value.trim()) ||
+                value.indexOf(',') >= 0 || value.indexOf('=') >= 0) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isISOControl(value.charAt(i))) return false;
+        }
+        return true;
     }
 
     private boolean isValidDevPrivilegeKey(String privKeyString) {

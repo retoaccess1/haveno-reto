@@ -19,38 +19,34 @@ package haveno.desktop.app;
 
 import haveno.common.UserThread;
 import haveno.common.app.AppModule;
+import haveno.common.app.DevEnv;
 import haveno.common.app.Version;
 import haveno.common.crypto.IncorrectPasswordException;
+import haveno.common.util.Utilities;
 import haveno.core.app.AvoidStandbyModeService;
 import haveno.core.app.HavenoExecutable;
 import haveno.core.locale.Res;
+import haveno.core.locale.TradeCurrency;
+import haveno.core.user.CookieKey;
+import haveno.core.user.Preferences;
+import haveno.core.user.StartupSettings;
+import haveno.core.xmr.nodes.XmrNodes;
 import haveno.desktop.common.UITimer;
 import haveno.desktop.common.view.guice.InjectorViewFactory;
 import haveno.desktop.setup.DesktopPersistedDataHost;
-import haveno.desktop.util.ImageUtil;
 import javafx.application.Application;
 import javafx.application.Platform;
-import javafx.geometry.Pos;
-import javafx.scene.control.ButtonBar;
-import javafx.scene.control.ButtonType;
-import javafx.scene.control.Dialog;
-import javafx.scene.control.Label;
-import javafx.scene.control.PasswordField;
-import javafx.scene.image.ImageView;
-import javafx.scene.layout.VBox;
-import javafx.scene.paint.Color;
-import javafx.stage.Stage;
-import javafx.stage.Window;
 import lombok.extern.slf4j.Slf4j;
 
-import java.util.Optional;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CompletionException;
 
 @Slf4j
 public class HavenoAppMain extends HavenoExecutable {
 
     private HavenoApp application;
+    private StartupWizard.Result startupWizardResult;
 
     public HavenoAppMain() {
         super("Haveno Desktop", "haveno-desktop", HavenoExecutable.DEFAULT_APP_NAME, Version.VERSION);
@@ -63,6 +59,12 @@ public class HavenoAppMain extends HavenoExecutable {
         // realMain method:
         Thread.currentThread().setContextClassLoader(HavenoAppMain.class.getClassLoader());
 
+        // recovery must bypass normal account, wallet and persistence startup
+        if (args.length > 0 && PasswordRecoveryLauncher.OPTION.equals(args[0])) {
+            if (Utilities.isLinux()) System.setProperty("prism.lcdtext", "false");
+            Application.launch(PasswordRecoveryApp.class, Arrays.copyOfRange(args, 1, args.length));
+            return;
+        }
         new HavenoAppMain().execute(args);
     }
 
@@ -83,6 +85,13 @@ public class HavenoAppMain extends HavenoExecutable {
 
     @Override
     protected void launchApplication() {
+        // select the renderer before JavaFX initializes, while encrypted preferences are still unavailable
+        if (System.getProperty("prism.order") == null &&
+                StartupSettings.read(config.appDataDir).getAsOptionalBoolean(CookieKey.USE_SOFTWARE_RENDERING).orElse(false)) {
+            System.setProperty("prism.order", "sw");
+        }
+        log.info("JavaFX rendering pipeline order: {}", System.getProperty("prism.order", "default"));
+
         HavenoApp.setAppLaunchedHandler(application -> {
             HavenoAppMain.this.application = (HavenoApp) application;
             // Map to user thread!
@@ -127,7 +136,31 @@ public class HavenoAppMain extends HavenoExecutable {
 
     @Override
     protected void readAllPersisted(Runnable completeHandler) {
-        super.readAllPersisted(DesktopPersistedDataHost.getPersistedDataHosts(injector), completeHandler);
+        super.readAllPersisted(DesktopPersistedDataHost.getPersistedDataHosts(injector), () -> {
+            applyStartupWizardResult();
+            completeHandler.run();
+        });
+    }
+
+    // record the choices from the startup wizard once preferences are loaded
+    private void applyStartupWizardResult() {
+        if (startupWizardResult == null) return;
+        Preferences preferences = injector.getInstance(Preferences.class);
+        TradeCurrency currency = startupWizardResult.getPreferredTradeCurrency();
+        if (currency != null) {
+            preferences.setPreferredTradeCurrency(currency);
+            preferences.setOfferBookChartScreenCurrencyCode(currency.getCode());
+            preferences.setTradeChartsScreenCurrencyCode(currency.getCode());
+        }
+        // applied before the connection service initializes, so default nodes are never contacted
+        String customNodes = startupWizardResult.getCustomMoneroNodes();
+        if (customNodes != null) {
+            preferences.setMoneroNodes(customNodes);
+            preferences.setMoneroNodesOptionOrdinal(XmrNodes.MoneroNodesOption.CUSTOM.ordinal());
+        }
+        if (startupWizardResult.getUseTorForXmr() != null) preferences.setUseTorForXmrOrdinal(startupWizardResult.getUseTorForXmr().ordinal());
+        // last: force-persists the preferences, making all wizard choices durable before startup continues
+        preferences.setTacAcceptedVersion(Version.TAC_VERSION);
     }
 
     @Override
@@ -139,7 +172,7 @@ public class HavenoAppMain extends HavenoExecutable {
     protected void startApplication() {
         // We need to be in user thread! We mapped at launchApplication already.  Once
         // the UI is ready we get onApplicationStarted called and start the setup there.
-        application.startApplication(this::onApplicationStarted);
+        if (!application.isShutDownRequested()) application.startApplication(this::onApplicationStarted);
     }
 
     @Override
@@ -155,96 +188,84 @@ public class HavenoAppMain extends HavenoExecutable {
     @Override
     protected CompletableFuture<Boolean> loginAccount() {
 
-        // attempt default login
-        CompletableFuture<Boolean> result = super.loginAccount();
-        try {
-            if (result.get()) return result;
-        } catch (InterruptedException | ExecutionException e) {
-            throw new IllegalStateException(e);
-        }
+        // first run: gather the user's choices with the startup wizard before creating the account
+        if (!accountService.accountExists() && !DevEnv.isDevMode()) return runStartupWizard();
 
-        // login using dialog
-        CompletableFuture<Boolean> dialogResult = new CompletableFuture<>();
+        CompletableFuture<Boolean> loginResult = new CompletableFuture<>();
         Platform.setImplicitExit(false);
-        Platform.runLater(() -> {
-
-            // show password dialog until account open
-            String errorMessage = null;
-            while (!accountService.isAccountOpen()) {
-
-                // create the password dialog
-                PasswordDialog passwordDialog = new PasswordDialog(errorMessage);
-
-                // wait for user to enter password
-                Optional<String> passwordResult = passwordDialog.showAndWait();
-                if (passwordResult.isPresent()) {
-                    try {
-                        accountService.openAccount(passwordResult.get());
-                        dialogResult.complete(accountService.isAccountOpen());
-                    } catch (IncorrectPasswordException e) {
-                        errorMessage = "Incorrect password";
+        // account keys must be unlocked before persistence is read
+        CompletableFuture.supplyAsync(() -> super.loginAccount().join(),
+                task -> new Thread(task, "AccountLogin").start()).whenComplete((opened, failure) -> UserThread.execute(() -> {
+                    if (application.isShutDownRequested() || isShutDownStarted) return;
+                    if (failure != null) {
+                        Throwable cause = failure instanceof CompletionException
+                                ? failure.getCause() : failure;
+                        log.error("Error opening account", cause);
+                        // completing exceptionally starts shutdown, which can wait for services
+                        application.showLoginFailure(cause, () -> new Thread(
+                                () -> loginResult.completeExceptionally(cause), "Account-login-failure-shutdown").start());
+                    } else if (opened) {
+                        loginResult.complete(true);
+                    } else {
+                        showPasswordScreen(loginResult);
                     }
-                } else {
-                    // if the user cancelled the dialog, complete the passwordFuture exceptionally
-                    dialogResult.completeExceptionally(new Exception("Password dialog cancelled"));
-                    break;
-                }
-            }
-        });
-        return dialogResult;
+                }));
+        return loginResult;
     }
 
-    private class PasswordDialog extends Dialog<String> {
+    private void showPasswordScreen(CompletableFuture<Boolean> loginResult) {
+        application.showPasswordScreen(
 
-        public PasswordDialog(String errorMessage) {
-            setTitle("Enter Password");
-            setHeaderText("Please enter your Haveno password:");
-
-            // Create the password field
-            PasswordField passwordField = new PasswordField();
-            passwordField.setPromptText("Password");
-
-            // Create the error message field
-            Label errorMessageField = new Label(errorMessage);
-            errorMessageField.setTextFill(Color.color(1, 0, 0));
-
-            // Create the version field
-            Label versionField = new Label(Res.get("mainView.footer.version", Version.VERSION));
-
-            // Set the dialog content
-            VBox vbox = new VBox(10);
-            ImageView logoImageView = new ImageView(ImageUtil.getImageByPath("logo_splash_light_mode.png"));
-            logoImageView.setFitWidth(342);
-            logoImageView.setPreserveRatio(true);
-            vbox.getChildren().addAll(logoImageView, passwordField, errorMessageField, versionField);
-            vbox.setAlignment(Pos.TOP_CENTER);
-            getDialogPane().setContent(vbox);
-
-            // Add OK and Cancel buttons
-            ButtonType okButton = new ButtonType("OK", ButtonBar.ButtonData.OK_DONE);
-            ButtonType cancelButton = new ButtonType("Cancel", ButtonBar.ButtonData.CANCEL_CLOSE);
-            getDialogPane().getButtonTypes().addAll(okButton, cancelButton);
-
-            // Convert the result to a string when the OK button is clicked
-            setResultConverter(buttonType -> {
-                if (buttonType == okButton) {
-                    return passwordField.getText();
-                } else {
-                    new Thread(() -> HavenoApp.getShutDownHandler().run()).start();
-                    return null;
-                }
-            });
-
-            // Focus the password field when dialog is shown
-            Window window = getDialogPane().getScene().getWindow();
-            if (window instanceof Stage) {
-                Stage dialogStage = (Stage) window;
-                dialogStage.focusedProperty().addListener((observable, oldValue, newValue) -> {
-                    if (newValue) {
-                        passwordField.requestFocus();
+                // verify off the JavaFX thread (openAccount decrypts the keys) and report the outcome
+                (password, resultHandler) -> new Thread(() -> {
+                    try {
+                        accountService.openAccount(password);
+                        if (accountService.isAccountOpen()) {
+                            UserThread.execute(() -> {
+                                if (!application.isShutDownRequested()) loginResult.complete(true);
+                            });
+                            resultHandler.accept(null);
+                        } else {
+                            resultHandler.accept(Res.get("password.startup.wrongPw"));
+                        }
+                    } catch (IncorrectPasswordException e) {
+                        resultHandler.accept(Res.get("password.startup.wrongPw"));
+                    } catch (Throwable t) {
+                        log.error("Error opening account", t);
+                        resultHandler.accept(t.getMessage() != null ? t.getMessage() : t.toString());
                     }
+                }, "PasswordLogin").start(),
+
+                // called if the user chooses to quit instead of logging in
+                () -> {
+                    log.warn("Password entry cancelled, shutting down");
+                    new Thread(() -> HavenoApp.getShutDownHandler().run()).start();
                 });
-            }
-        }
+    }
+
+    private CompletableFuture<Boolean> runStartupWizard() {
+        CompletableFuture<Boolean> loginResult = new CompletableFuture<>();
+        Platform.setImplicitExit(false);
+        UserThread.execute(() -> application.showStartupWizard(
+
+                // create the account off the JavaFX thread (generating the keys is slow)
+                result -> new Thread(() -> {
+                    try {
+                        if (result.getWalletSeed() != null) accountService.setWalletImportDetails(result.getWalletSeed(), result.getWalletRestoreHeight(), result.getWalletRestoreDate());
+                        accountService.createAccount(result.getPassword());
+                        startupWizardResult = result;
+                        UserThread.execute(() -> loginResult.complete(accountService.isAccountOpen()));
+                    } catch (Throwable t) {
+                        log.error("Error creating account", t);
+                        UserThread.execute(() -> loginResult.completeExceptionally(t));
+                    }
+                }, "CreateAccount").start(),
+
+                // called if the user chooses to quit instead of completing the setup
+                () -> {
+                    log.warn("Startup wizard cancelled, shutting down");
+                    new Thread(() -> HavenoApp.getShutDownHandler().run()).start();
+                }));
+        return loginResult;
     }
 }

@@ -21,7 +21,9 @@ import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import haveno.core.api.XmrConnectionService;
 import haveno.core.api.CoreNotificationService;
+import haveno.core.trade.HavenoUtils;
 import haveno.core.xmr.wallet.XmrWalletService;
+import haveno.common.UserThread;
 import haveno.network.p2p.BootstrapListener;
 import haveno.network.p2p.P2PService;
 import javafx.beans.property.BooleanProperty;
@@ -59,11 +61,37 @@ public class AppStartupState {
         p2PService.addP2PServiceListener(new BootstrapListener() {
             @Override
             public void onDataReceived() {
-                updatedDataReceived.set(true);
+                onP2pBootstrapComplete();
+            }
+
+            @Override
+            public void onUpdatedDataReceived() {
+                onP2pBootstrapComplete();
+            }
+
+            // P2PNetworkSetup reports the network initialized on no-seed-node and no-peers too, not just on
+            // data received; handle those or updatedDataReceived stays false and seedless daemons never initialize.
+            @Override
+            public void onNoSeedNodeAvailable() {
+                onP2pBootstrapComplete();
+            }
+
+            @Override
+            public void onNoPeersAvailable() {
+                onP2pBootstrapComplete();
+            }
+
+            private void onP2pBootstrapComplete() {
+                UserThread.execute(() -> updatedDataReceived.set(true));
             }
         });
 
         xmrConnectionService.downloadPercentageProperty().addListener((observable, oldValue, newValue) -> {
+            if (xmrConnectionService.isDownloadComplete())
+                isBlockDownloadComplete.set(true);
+        });
+
+        xmrConnectionService.numUpdatesProperty().addListener((observable, oldValue, newValue) -> {
             if (xmrConnectionService.isDownloadComplete())
                 isBlockDownloadComplete.set(true);
         });
@@ -89,12 +117,13 @@ public class AppStartupState {
                     } else if (!wasWalletSynced()) {
                         walletAndNetworkReady.set(false);
                     }
-                    return a && c && e;
+                    return a && b && c && e;
                 });
         p2pNetworkAndWalletInitialized.subscribe((observable, oldValue, newValue) -> {
             if (newValue) {
                 applicationFullyInitialized.set(true);
                 notificationService.sendAppInitializedNotification();
+                HavenoUtils.playDeferredSounds();
                 log.info("Application fully initialized");
             } else {
                 applicationFullyInitialized.set(false);
@@ -105,7 +134,7 @@ public class AppStartupState {
     }
 
     public void onDomainServicesInitialized() {
-        allDomainServicesInitialized.set(true);
+        UserThread.execute(() -> allDomainServicesInitialized.set(true));
     }
 
 

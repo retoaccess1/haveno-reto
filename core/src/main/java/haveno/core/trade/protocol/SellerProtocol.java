@@ -46,6 +46,7 @@ import haveno.core.trade.protocol.tasks.SellerSendPaymentReceivedMessageToBuyer;
 import haveno.core.trade.protocol.tasks.SendDepositsConfirmedMessageToArbitrator;
 import haveno.core.trade.protocol.tasks.SendDepositsConfirmedMessageToBuyer;
 import haveno.core.trade.protocol.tasks.TradeTask;
+import haveno.core.trade.protocol.tasks.VerifyPeersAccountAgeWitness;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -123,6 +124,9 @@ public class SellerProtocol extends DisputeProtocol {
                             .preCondition(trade.confirmPermitted()))
                             .setup(tasks(
                                     ApplyFilter.class,
+                                    // re-verify the buyer's account witness before payout; the check after
+                                    // processing PaymentSentMessage does not block the state advance
+                                    VerifyPeersAccountAgeWitness.class,
                                     SellerPreparePaymentReceivedMessage.class,
                                     SellerSendPaymentReceivedMessageToBuyer.class,
                                     SellerSendPaymentReceivedMessageToArbitrator.class)
@@ -138,7 +142,7 @@ public class SellerProtocol extends DisputeProtocol {
                                     log.warn("Error confirming payment received, reverting state to {}, error={}", Trade.State.BUYER_SENT_PAYMENT_SENT_MSG, errorMessage);
                                     trade.resetToPaymentSentState();
                                 }
-                                handleTaskRunnerFault(event, errorMessage);
+                                handleTaskRunnerFault(null, null, event.name(), errorMessage, null, false); // the caller reports the error and can retry, so skip setting a trade error
                             })))
                             .executeTasks(true);
                 } catch (Exception e) {

@@ -20,16 +20,20 @@ package haveno.desktop.util;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import haveno.common.UserThread;
+import haveno.common.util.Utilities;
 import haveno.core.user.Preferences;
 import javafx.animation.FadeTransition;
 import javafx.animation.Interpolator;
 import javafx.animation.KeyFrame;
 import javafx.animation.KeyValue;
 import javafx.animation.Timeline;
+import javafx.beans.property.DoubleProperty;
 import javafx.event.ActionEvent;
 import javafx.event.EventHandler;
 import javafx.scene.Node;
+import javafx.scene.effect.BoxBlur;
 import javafx.scene.effect.ColorAdjust;
+import javafx.scene.effect.Effect;
 import javafx.scene.effect.GaussianBlur;
 import javafx.scene.layout.Pane;
 import javafx.util.Duration;
@@ -100,18 +104,42 @@ public class Transitions {
     }
 
     public void blur(Node node, int duration, double brightness, boolean removeNode, double blurRadius) {
-        if (removeEffectTimeLine != null)
+        if (removeEffectTimeLine != null) {
             removeEffectTimeLine.stop();
+            removeEffectTimeLine = null;
+        }
 
         node.setMouseTransparent(true);
-        GaussianBlur blur = new GaussianBlur(0.0);
-        Timeline timeline = new Timeline();
-        KeyValue kv1 = new KeyValue(blur.radiusProperty(), blurRadius);
-        KeyFrame kf1 = new KeyFrame(Duration.millis(getDuration(duration)), kv1);
         ColorAdjust darken = new ColorAdjust();
-        darken.setBrightness(0.0);
-        blur.setInput(darken);
-        KeyValue kv2 = new KeyValue(darken.brightnessProperty(), CssTheme.isDarkTheme() ? brightness * -0.13 : brightness);
+        Effect blur;
+        DoubleProperty radius;
+        if (Utilities.isLinux()) {
+            // three box passes approximate the Gaussian without its costly software convolution
+            BoxBlur boxBlur = new BoxBlur(0, 0, 3);
+            boxBlur.heightProperty().bind(boxBlur.widthProperty());
+            boxBlur.setInput(darken);
+            radius = boxBlur.widthProperty();
+            blurRadius *= 2.0 / 3.0;
+            blur = boxBlur;
+        } else {
+            GaussianBlur gaussianBlur = new GaussianBlur(0);
+            gaussianBlur.setInput(darken);
+            radius = gaussianBlur.radiusProperty();
+            blur = gaussianBlur;
+        }
+        double targetBrightness = CssTheme.isDarkTheme() ? brightness * -0.13 : brightness;
+        if (!preferences.isUseAnimations()) {
+            radius.set(blurRadius);
+            darken.setBrightness(targetBrightness);
+            node.setEffect(blur);
+            if (removeNode) UserThread.execute(() -> ((Pane) (node.getParent())).getChildren().remove(node));
+            return;
+        }
+
+        Timeline timeline = new Timeline();
+        KeyValue kv1 = new KeyValue(radius, blurRadius);
+        KeyFrame kf1 = new KeyFrame(Duration.millis(getDuration(duration)), kv1);
+        KeyValue kv2 = new KeyValue(darken.brightnessProperty(), targetBrightness);
         KeyFrame kf2 = new KeyFrame(Duration.millis(getDuration(duration)), kv2);
         timeline.getKeyFrames().addAll(kf1, kf2);
         node.setEffect(blur);
@@ -132,14 +160,30 @@ public class Transitions {
     private void removeEffect(Node node, int duration) {
         if (node != null) {
             node.setMouseTransparent(false);
+            if (removeEffectTimeLine != null) {
+                removeEffectTimeLine.stop();
+                removeEffectTimeLine = null;
+            }
+            if (!preferences.isUseAnimations()) {
+                node.setEffect(null);
+                return;
+            }
             removeEffectTimeLine = new Timeline();
-            GaussianBlur blur = (GaussianBlur) node.getEffect();
+            Effect blur = node.getEffect();
             if (blur != null) {
-                KeyValue kv1 = new KeyValue(blur.radiusProperty(), 0.0);
+                DoubleProperty radius;
+                ColorAdjust darken;
+                if (blur instanceof BoxBlur) {
+                    radius = ((BoxBlur) blur).widthProperty();
+                    darken = (ColorAdjust) ((BoxBlur) blur).getInput();
+                } else {
+                    radius = ((GaussianBlur) blur).radiusProperty();
+                    darken = (ColorAdjust) ((GaussianBlur) blur).getInput();
+                }
+                KeyValue kv1 = new KeyValue(radius, 0.0);
                 KeyFrame kf1 = new KeyFrame(Duration.millis(getDuration(duration)), kv1);
                 removeEffectTimeLine.getKeyFrames().add(kf1);
 
-                ColorAdjust darken = (ColorAdjust) blur.getInput();
                 KeyValue kv2 = new KeyValue(darken.brightnessProperty(), 0.0);
                 KeyFrame kf2 = new KeyFrame(Duration.millis(getDuration(duration)), kv2);
                 removeEffectTimeLine.getKeyFrames().add(kf2);

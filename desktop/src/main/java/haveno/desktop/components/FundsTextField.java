@@ -20,6 +20,7 @@ package haveno.desktop.components;
 import haveno.common.UserThread;
 import haveno.common.util.Utilities;
 import haveno.core.locale.Res;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.Layout;
 import javafx.beans.binding.Bindings;
@@ -45,7 +46,12 @@ public class FundsTextField extends InfoTextField {
     public FundsTextField() {
         super();
         textField.textProperty().unbind();
-        textField.textProperty().bind(Bindings.concat(textProperty())); // TODO: removed `, " ", fundsStructure` for haveno to fix "Funds needed: .123 XMR (null)" bug
+        // append the funds structure only once both parts are known, avoiding a "(null)" placeholder
+        textField.textProperty().bind(Bindings.createStringBinding(
+                () -> textProperty().get() == null || fundsStructure.get() == null
+                        ? textProperty().get()
+                        : textProperty().get() + " " + fundsStructure.get(),
+                textProperty(), fundsStructure));
 
         Label copyLabel = new Label();
         copyLabel.setLayoutY(Layout.FLOATING_ICON_Y);
@@ -71,6 +77,8 @@ public class FundsTextField extends InfoTextField {
                 tp.show(node, e.getScreenX() + Layout.PADDING, e.getScreenY() + Layout.PADDING);
             }
         });
+
+        Accessibility.asButton(copyLabel, Res.get("shared.copyToClipboard"));
 
         AnchorPane.setRightAnchor(copyLabel, 30.0);
         AnchorPane.setRightAnchor(infoIcon, 62.0);

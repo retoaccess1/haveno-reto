@@ -17,6 +17,7 @@
 
 package haveno.core.user;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
@@ -153,6 +154,15 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         this.xmrNodesFromOptions = xmrNodesFromOptions;
         this.xmrNodes = xmrNodes;
 
+        // css theme is stored globally and unencrypted so it can be applied before login without a theme flash
+        Integer cssThemeFromSettings = readCssThemeFromSettings();
+        if (cssThemeFromSettings != null) applyCssTheme(cssThemeFromSettings);
+
+        // restore the language before login, while the encrypted preferences are still unavailable
+        String userLanguageFromSettings = readUserLanguageFromSettings();
+        if (userLanguageFromSettings != null && !userLanguageFromSettings.isEmpty())
+            GlobalSettings.setLocale(new Locale(userLanguageFromSettings, GlobalSettings.getLocale().getCountry()));
+
         useAnimationsProperty.addListener((ov) -> {
             prefPayload.setUseAnimations(useAnimationsProperty.get());
             GlobalSettings.setUseAnimations(prefPayload.isUseAnimations());
@@ -161,7 +171,7 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
 
         cssThemeProperty.addListener((ov) -> {
             prefPayload.setCssTheme(cssThemeProperty.get());
-            requestPersistence();
+            writeCssThemeToSettings(cssThemeProperty.get());
         });
 
         useStandbyModeProperty.addListener((ov) -> {
@@ -223,12 +233,20 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
             prefPayload.setBsqAverageTrimThreshold(0.05);
         }
 
+        // Reset invalid limits saved by older versions to the most restrictive value.
+        double maxPriceDistanceInPercent = prefPayload.getMaxPriceDistanceInPercent();
+        if (!(maxPriceDistanceInPercent >= 0 && maxPriceDistanceInPercent <= 1)) {
+            prefPayload.setMaxPriceDistanceInPercent(0);
+        }
+
         setupPreferences();
     }
 
     private void initNewPreferences() {
         prefPayload = new PreferencesPayload();
-        prefPayload.setUserLanguage(GlobalSettings.getLocale().getLanguage());
+        String userLanguageFromSettings = readUserLanguageFromSettings();
+        prefPayload.setUserLanguage(userLanguageFromSettings != null && !userLanguageFromSettings.isEmpty() ?
+                userLanguageFromSettings : GlobalSettings.getLocale().getLanguage());
         prefPayload.setUserCountry(CountryUtil.getDefaultCountry());
         GlobalSettings.setLocale(new Locale(prefPayload.getUserLanguage(), prefPayload.getUserCountry().code));
 
@@ -255,8 +273,8 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
 
         prefPayload.setOfferBookChartScreenCurrencyCode(preferredTradeCurrency.getCode());
         prefPayload.setTradeChartsScreenCurrencyCode(preferredTradeCurrency.getCode());
-        prefPayload.setBuyScreenCurrencyCode(preferredTradeCurrency.getCode());
-        prefPayload.setSellScreenCurrencyCode(preferredTradeCurrency.getCode());
+        prefPayload.setBuyScreenFiatCurrencyCode(preferredTradeCurrency.getCode());
+        prefPayload.setSellScreenFiatCurrencyCode(preferredTradeCurrency.getCode());
         GlobalSettings.setDefaultTradeCurrency(preferredTradeCurrency);
         setupPreferences();
     }
@@ -272,7 +290,15 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         useAnimationsProperty.set(prefPayload.isUseAnimations());
         useStandbyModeProperty.set(prefPayload.isUseStandbyMode());
         useSoundForNotificationsProperty.set(prefPayload.isUseSoundForNotifications());
-        cssThemeProperty.set(prefPayload.getCssTheme());
+
+        // read the css theme from the unencrypted store, migrating from the encrypted payload on first run
+        Integer cssThemeFromSettings = readCssThemeFromSettings();
+        int cssTheme = cssThemeFromSettings != null ? cssThemeFromSettings : prefPayload.getCssTheme();
+        applyCssTheme(cssTheme);
+        writeCssThemeToSettings(cssTheme);
+
+        // mirror the loaded language for the next login, including migration from existing preferences
+        writeUserLanguageToSettings(prefPayload.getUserLanguage());
 
 
         // if no valid Monero block explorer is set, select the 1st valid Monero block explorer
@@ -288,6 +314,9 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         // Override settings with options if set
         if (config.useTorForXmrOptionSetExplicitly)
             setUseTorForXmr(config.useTorForXmr);
+
+        if (config.useNativeXmrWalletOptionSetExplicitly)
+            setUseNativeXmrWallet(config.useNativeXmrWallet);
 
         // switch to public nodes if no provided nodes available
         boolean isFixedConnection = !"".equals(config.xmrNode) && (!NetworkUtils.isLocalHost(config.xmrNode) || !config.ignoreLocalXmrNode);
@@ -374,6 +403,53 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         this.cssThemeProperty.set(useDarkMode ? 1 : 0);
     }
 
+    ///////////////////////////////////////////////////////////////////////////////////////////
+    // UI settings are kept in the unencrypted StartupSettings store so they can be applied before login
+    ///////////////////////////////////////////////////////////////////////////////////////////
+
+    public boolean isUseSoftwareRendering() {
+        return config != null && StartupSettings.read(config.appDataDir)
+                .getAsOptionalBoolean(CookieKey.USE_SOFTWARE_RENDERING).orElse(false);
+    }
+
+    public boolean setUseSoftwareRendering(boolean useSoftwareRendering) {
+        if (config == null) return false;
+        Cookie updates = new Cookie();
+        updates.putAsBoolean(CookieKey.USE_SOFTWARE_RENDERING, useSoftwareRendering);
+        return StartupSettings.write(config.appDataDir, updates);
+    }
+
+    private void applyCssTheme(int cssTheme) {
+        prefPayload.setCssTheme(cssTheme);
+        cssThemeProperty.set(cssTheme);
+    }
+
+    private Integer readCssThemeFromSettings() {
+        if (config == null) return null; // config is stubbed as null in some tests
+        return StartupSettings.read(config.appDataDir).getAsOptionalBoolean(CookieKey.CSS_THEME)
+                .map(useDarkMode -> useDarkMode ? 1 : 0)
+                .orElse(null);
+    }
+
+    private void writeCssThemeToSettings(int cssTheme) {
+        if (config == null) return; // config is stubbed as null in some tests
+        Cookie updates = new Cookie();
+        updates.putAsBoolean(CookieKey.CSS_THEME, cssTheme == 1);
+        StartupSettings.write(config.appDataDir, updates);
+    }
+
+    private String readUserLanguageFromSettings() {
+        if (config == null) return null; // config is stubbed as null in some tests
+        return StartupSettings.read(config.appDataDir).get(CookieKey.USER_LANGUAGE);
+    }
+
+    private void writeUserLanguageToSettings(String userLanguage) {
+        if (config == null || userLanguage == null) return;
+        Cookie updates = new Cookie();
+        updates.put(CookieKey.USER_LANGUAGE, userLanguage);
+        StartupSettings.write(config.appDataDir, updates);
+    }
+
     public void addTraditionalCurrency(TraditionalCurrency tradeCurrency) {
         if (!traditionalCurrenciesAsObservable.contains(tradeCurrency))
             traditionalCurrenciesAsObservable.add(tradeCurrency);
@@ -423,6 +499,12 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
     public void setTacAcceptedV120(boolean tacAccepted) {
         prefPayload.setTacAcceptedV120(tacAccepted);
         requestPersistence();
+    }
+
+    public void setTacAcceptedVersion(int tacAcceptedVersion) {
+        prefPayload.setTacAcceptedVersion(tacAcceptedVersion);
+        // accepted during startup, before deferred writes are permitted, so persist immediately
+        persistenceManager.forcePersistNow();
     }
 
     public void setBsqAverageTrimThreshold(double bsqAverageTrimThreshold) {
@@ -478,6 +560,7 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         prefPayload.setUserLanguage(userLanguageCode);
         if (prefPayload.getUserCountry() != null && prefPayload.getUserLanguage() != null)
             GlobalSettings.setLocale(new Locale(prefPayload.getUserLanguage(), prefPayload.getUserCountry().code));
+        writeUserLanguageToSettings(userLanguageCode);
         requestPersistence();
     }
 
@@ -517,12 +600,19 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         requestPersistence();
     }
 
+    public void setUseNativeXmrWallet(boolean useNativeXmrWallet) {
+        prefPayload.setUseNativeXmrWallet(useNativeXmrWallet);
+        requestPersistence();
+    }
+
     public void setShowOwnOffersInOfferBook(boolean showOwnOffersInOfferBook) {
         prefPayload.setShowOwnOffersInOfferBook(showOwnOffersInOfferBook);
         requestPersistence();
     }
 
     public void setMaxPriceDistanceInPercent(double maxPriceDistanceInPercent) {
+        checkArgument(maxPriceDistanceInPercent >= 0 && maxPriceDistanceInPercent <= 1,
+                "Maximum price deviation must be between 0% and 100%");
         prefPayload.setMaxPriceDistanceInPercent(maxPriceDistanceInPercent);
         requestPersistence();
     }
@@ -552,33 +642,78 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         requestPersistence();
     }
 
-    public void setBuyScreenCurrencyCode(String buyScreenCurrencyCode) {
-        prefPayload.setBuyScreenCurrencyCode(buyScreenCurrencyCode);
+    public void setBuyScreenFiatCurrencyCode(String buyScreenFiatCurrencyCode) {
+        prefPayload.setBuyScreenFiatCurrencyCode(buyScreenFiatCurrencyCode);
         requestPersistence();
     }
 
-    public void setSellScreenCurrencyCode(String sellScreenCurrencyCode) {
-        prefPayload.setSellScreenCurrencyCode(sellScreenCurrencyCode);
+    public void setSellScreenFiatCurrencyCode(String sellScreenFiatCurrencyCode) {
+        prefPayload.setSellScreenFiatCurrencyCode(sellScreenFiatCurrencyCode);
         requestPersistence();
     }
 
-    public void setBuyScreenCryptoCurrencyCode(String buyScreenCurrencyCode) {
-        prefPayload.setBuyScreenCryptoCurrencyCode(buyScreenCurrencyCode);
+    public void setBuyScreenCryptoCurrencyCode(String buyScreenCryptoCurrencyCode) {
+        prefPayload.setBuyScreenCryptoCurrencyCode(buyScreenCryptoCurrencyCode);
         requestPersistence();
     }
 
-    public void setSellScreenCryptoCurrencyCode(String sellScreenCurrencyCode) {
-        prefPayload.setSellScreenCryptoCurrencyCode(sellScreenCurrencyCode);
+    public void setSellScreenCryptoCurrencyCode(String sellScreenCryptoCurrencyCode) {
+        prefPayload.setSellScreenCryptoCurrencyCode(sellScreenCryptoCurrencyCode);
         requestPersistence();
     }
 
-    public void setBuyScreenOtherCurrencyCode(String buyScreenCurrencyCode) {
-        prefPayload.setBuyScreenOtherCurrencyCode(buyScreenCurrencyCode);
+    public void setBuyScreenOtherCurrencyCode(String buyScreenOtherCurrencyCode) {
+        prefPayload.setBuyScreenOtherCurrencyCode(buyScreenOtherCurrencyCode);
         requestPersistence();
     }
 
-    public void setSellScreenOtherCurrencyCode(String sellScreenCurrencyCode) {
-        prefPayload.setSellScreenOtherCurrencyCode(sellScreenCurrencyCode);
+    public void setSellScreenOtherCurrencyCode(String sellScreenOtherCurrencyCode) {
+        prefPayload.setSellScreenOtherCurrencyCode(sellScreenOtherCurrencyCode);
+        requestPersistence();
+    }
+
+    public void setBuyScreenFiatPaymentMethodId(String buyScreenFiatPaymentMethodId) {
+        prefPayload.setBuyScreenFiatPaymentMethodId(buyScreenFiatPaymentMethodId);
+        requestPersistence();
+    }
+
+    public void setSellScreenFiatPaymentMethodId(String sellScreenFiatPaymentMethodId) {
+        prefPayload.setSellScreenFiatPaymentMethodId(sellScreenFiatPaymentMethodId);
+        requestPersistence();
+    }
+
+    public void setBuyScreenCryptoPaymentMethodId(String buyScreenCryptoPaymentMethodId) {
+        prefPayload.setBuyScreenCryptoPaymentMethodId(buyScreenCryptoPaymentMethodId);
+        requestPersistence();
+    }
+
+    public void setSellScreenCryptoPaymentMethodId(String sellScreenCryptoPaymentMethodId) {
+        prefPayload.setSellScreenCryptoPaymentMethodId(sellScreenCryptoPaymentMethodId);
+        requestPersistence();
+    }
+
+    public void setBuyScreenOtherPaymentMethodId(String buyScreenOtherPaymentMethodId) {
+        prefPayload.setBuyScreenOtherPaymentMethodId(buyScreenOtherPaymentMethodId);
+        requestPersistence();
+    }
+
+    public void setSellScreenOtherPaymentMethodId(String sellScreenOtherPaymentMethodId) {
+        prefPayload.setSellScreenOtherPaymentMethodId(sellScreenOtherPaymentMethodId);
+        requestPersistence();
+    }
+
+    public void setBuyScreenOfferBookSubTabIndex(int buyScreenOfferBookSubTabIndex) {
+        prefPayload.setBuyScreenOfferBookSubTabIndex(buyScreenOfferBookSubTabIndex);
+        requestPersistence();
+    }
+
+    public void setSellScreenOfferBookSubTabIndex(int sellScreenOfferBookSubTabIndex) {
+        prefPayload.setSellScreenOfferBookSubTabIndex(sellScreenOfferBookSubTabIndex);
+        requestPersistence();
+    }
+
+    public void setMarketSelectedTabIndex(int marketSelectedTabIndex) {
+        prefPayload.setMarketSelectedTabIndex(marketSelectedTabIndex);
         requestPersistence();
     }
 
@@ -776,6 +911,11 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         requestPersistence();
     }
 
+    public void setDepositAddressesExpanded(boolean value) {
+        prefPayload.setDepositAddressesExpanded(value);
+        requestPersistence();
+    }
+
     public void setNotifyOnPreRelease(boolean value) {
         prefPayload.setNotifyOnPreRelease(value);
         requestPersistence();
@@ -854,6 +994,10 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         return prefPayload.isSplitOfferOutput();
     }
 
+    public boolean isDepositAddressesExpanded() {
+        return prefPayload.isDepositAddressesExpanded();
+    }
+
     public double getSecurityDepositAsPercent(PaymentAccount paymentAccount) {
         double value = PaymentAccountUtil.isCryptoCurrencyAccount(paymentAccount) ?
                 prefPayload.getSecurityDepositAsPercentForCrypto() : prefPayload.getSecurityDepositAsPercent();
@@ -906,13 +1050,15 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
     private interface ExcludesDelegateMethods {
         void setTacAccepted(boolean tacAccepted);
 
+        void setUseNativeXmrWallet(boolean useNativeXmrWallet);
+
         void setUseAnimations(boolean useAnimations);
 
         void setCssTheme(int cssTheme);
 
-        void setUserLanguage(@NotNull String userLanguageCode);
+        void setUserLanguage(String userLanguageCode);
 
-        void setUserCountry(@NotNull Country userCountry);
+        void setUserCountry(Country userCountry);
 
         void setPreferredTradeCurrency(TradeCurrency preferredTradeCurrency);
 
@@ -932,15 +1078,33 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
 
         void setOfferBookChartScreenCurrencyCode(String offerBookChartScreenCurrencyCode);
 
-        void setBuyScreenCurrencyCode(String buyScreenCurrencyCode);
+        void setBuyScreenFiatCurrencyCode(String buyScreenFiatCurrencyCode);
 
-        void setSellScreenCurrencyCode(String sellScreenCurrencyCode);
+        void setSellScreenFiatCurrencyCode(String sellScreenFiatCurrencyCode);
 
         void setIgnoreTradersList(List<String> ignoreTradersList);
 
         void setDirectoryChooserPath(String directoryChooserPath);
 
         void setTradeChartsScreenCurrencyCode(String tradeChartsScreenCurrencyCode);
+
+        void setBuyScreenFiatPaymentMethodId(String buyScreenFiatPaymentMethodId);
+
+        void setSellScreenFiatPaymentMethodId(String sellScreenFiatPaymentMethodId);
+
+        void setBuyScreenCryptoPaymentMethodId(String buyScreenCryptoPaymentMethodId);
+
+        void setSellScreenCryptoPaymentMethodId(String sellScreenCryptoPaymentMethodId);
+
+        void setBuyScreenOtherPaymentMethodId(String buyScreenOtherPaymentMethodId);
+
+        void setSellScreenOtherPaymentMethodId(String sellScreenOtherPaymentMethodId);
+
+        void setBuyScreenOfferBookSubTabIndex(int buyScreenOfferBookSubTabIndex);
+
+        void setSellScreenOfferBookSubTabIndex(int sellScreenOfferBookSubTabIndex);
+
+        void setMarketSelectedTabIndex(int marketSelectedTabIndex);
 
         void setTradeStatisticsTickUnitIndex(int tradeStatisticsTickUnitIndex);
 
@@ -1023,6 +1187,8 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         int getBlockNotifyPort();
 
         void setTacAcceptedV120(boolean tacAccepted);
+
+        void setTacAcceptedVersion(int tacAcceptedVersion);
 
         void setBsqAverageTrimThreshold(double bsqAverageTrimThreshold);
 

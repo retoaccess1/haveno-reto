@@ -75,8 +75,8 @@ public class ProcessInitTradeRequest extends TradeTask {
                 // check trade price
                 try {
                     long tradePrice = request.getTradePrice();
-                    offer.verifyTradePrice(tradePrice);
-                    trade.setPrice(tradePrice);
+                    offer.verifyTradePrice(tradePrice, true);
+                    processModel.getTradeManager().setTradePrice(trade, tradePrice);
                 } catch (TradePriceOutOfToleranceException e) {
                     failed(e.getMessage());
                     return;
@@ -100,7 +100,7 @@ public class ProcessInitTradeRequest extends TradeTask {
 
                     // arbitrator sets the final trade price, verifying the maker's and taker's price is within tolerance
                     try {
-                        offer.verifyTradePrice(request.getTradePrice());
+                        offer.verifyTradePrice(request.getTradePrice(), true);
                         trade.setPrice(offer.getPrice().getValue());
                     } catch (TradePriceOutOfToleranceException e) {
                         failed(e.getMessage());
@@ -129,7 +129,7 @@ public class ProcessInitTradeRequest extends TradeTask {
 
                 // adopt the arbitrator's final trade price if within tolerance
                 try {
-                    offer.verifyTradePrice(request.getTradePrice());
+                    offer.verifyTradePrice(request.getTradePrice(), true);
                     trade.setPrice(request.getTradePrice());
                 } catch (TradePriceOutOfToleranceException e) {
                     failed(e.getMessage());
@@ -166,6 +166,9 @@ public class ProcessInitTradeRequest extends TradeTask {
 
             // check peer's current date
             processModel.getAccountAgeWitnessService().verifyPeersCurrentDate(new Date(sender.getCurrentDate()));
+
+            // defense-in-depth: maker, taker, and arbitrator must be distinct identities
+            trade.verifyPeerIdentitiesDiffer();
 
             // persist trade
             trade.addInitProgressStep();

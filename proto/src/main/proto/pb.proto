@@ -65,7 +65,7 @@ message NetworkEnvelope {
         MediatedPayoutTxSignatureMessage mediated_payout_tx_signature_message = 37;
         MediatedPayoutTxPublishedMessage mediated_payout_tx_published_message = 38;
 
-        FileTransferPart file_transfer_part = 39;
+        FileTransferPart file_transfer_part = 39 [deprecated = true]; // handling removed; kept to reserve the wire format
     }
 }
 
@@ -102,7 +102,7 @@ message GetUpdatedDataRequest {
     string version = 4;
 }
 
-message FileTransferPart {
+message FileTransferPart { // Deprecated; kept to reserve the old wire format.
     NodeAddress sender_node_address = 1;
     string uid = 2;
     string trade_id = 3;
@@ -339,6 +339,8 @@ message PaymentReceivedMessage {
     PaymentSentMessage payment_sent_message = 10;
     bytes seller_signature = 11;
     string payout_tx_id = 12;
+    // Signer chain proving the seller is a valid signer; excluded from the seller signature, validated on receipt.
+    repeated SignedWitness signer_chain = 13;
 }
 
 message MediatedPayoutTxPublishedMessage {
@@ -887,6 +889,18 @@ message PaymentAccountPayload {
         CashAtAtmAccountPayload cash_at_atm_account_payload = 40;
         PayPalAccountPayload paypal_account_payload = 41;
         PaysafeAccountPayload paysafe_account_payload = 42;
+        TwintAccountPayload twint_account_payload = 43;
+        NipAccountPayload nip_account_payload = 44;
+        PagoMovilAccountPayload pago_movil_account_payload = 45;
+        QrisAccountPayload qris_account_payload = 46;
+        PaparaAccountPayload papara_account_payload = 47;
+        RaastAccountPayload raast_account_payload = 48;
+        PayNowAccountPayload paynow_account_payload = 49;
+        WeroAccountPayload wero_account_payload = 50;
+        FpsAccountPayload fps_account_payload = 51;
+        DuitNowAccountPayload duitnow_account_payload = 52;
+        MbWayAccountPayload mb_way_account_payload = 53;
+        PayPayAccountPayload paypay_account_payload = 54;
     }
 }
 
@@ -929,6 +943,18 @@ message CountryBasedPaymentAccountPayload {
         TikkieAccountPayload tikkie_account_payload = 17;
         TransferwiseUsdAccountPayload transferwise_usd_account_payload = 18;
         SwiftAccountPayload swift_account_payload = 19;
+        MpesaAccountPayload mpesa_account_payload = 20;
+        MercadoPagoAccountPayload mercado_pago_account_payload = 21;
+        GcashAccountPayload gcash_account_payload = 22;
+        MomoAccountPayload momo_account_payload = 23;
+        SpeiAccountPayload spei_account_payload = 24;
+        BlikAccountPayload blik_account_payload = 25;
+        VippsMobilePayAccountPayload vipps_mobile_pay_account_payload = 26;
+        SbpAccountPayload sbp_account_payload = 27;
+        MirAccountPayload mir_account_payload = 28;
+        YooMoneyAccountPayload yoomoney_account_payload = 29;
+        UkraineCardAccountPayload ukraine_card_account_payload = 30;
+        KaspiAccountPayload kaspi_account_payload = 31;
     }
 }
 
@@ -1209,6 +1235,31 @@ message SatispayAccountPayload {
     string holder_name = 2;
 }
 
+message MpesaAccountPayload {
+    string holder_name = 1;
+    string mobile_nr = 2;
+}
+
+message MercadoPagoAccountPayload {
+    string holder_name = 1;
+    string email_or_mobile_nr = 2;
+}
+
+message GcashAccountPayload {
+    string holder_name = 1;
+    string mobile_nr = 2;
+}
+
+message MomoAccountPayload {
+    string holder_name = 1;
+    string mobile_nr = 2;
+}
+
+message SpeiAccountPayload {
+    string holder_name = 1;
+    string clabe = 2;
+}
+
 message StrikeAccountPayload {
     string holder_name = 1;
 }
@@ -1244,6 +1295,109 @@ message SwiftAccountPayload {
 
 message PaysafeAccountPayload {
     string email = 1;
+}
+
+message BlikAccountPayload {
+    string extra_info = 1;
+}
+
+message VippsMobilePayAccountPayload {
+    string mobile_nr = 1;
+    string holder_name = 2;
+}
+
+message TwintAccountPayload {
+    string mobile_nr = 1;
+    string holder_name = 2;
+}
+
+message NipAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message PagoMovilAccountPayload {
+    string holder_name = 1;
+    string mobile_nr = 2;
+    string holder_tax_id = 3;
+    string bank_name = 4;
+}
+
+message QrisAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message PaparaAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message RaastAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message PayNowAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message WeroAccountPayload {
+    string mobile_nr = 1;
+    string holder_name = 2;
+}
+
+message FpsAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message DuitNowAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+    string bank_name = 3;
+}
+
+message MbWayAccountPayload {
+    string mobile_nr = 1;
+    string holder_name = 2;
+}
+
+message PayPayAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+}
+
+message SbpAccountPayload {
+    string holder_name = 1;
+    string mobile_nr = 2;
+}
+
+message MirAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+}
+
+message YooMoneyAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+}
+
+message UkraineCardAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
+}
+
+message KaspiAccountPayload {
+    string holder_name = 1;
+    string account_nr = 2;
 }
 
 message PersistableEnvelope {
@@ -1370,6 +1524,19 @@ message PaymentAccountList {
 
 message TradableList {
     repeated Tradable tradable = 1;
+}
+
+// A single entry in the append-only ClosedTrades log. An "upsert" adds or replaces the tradable
+// with the matching trade uid or offer id. A "delete_key" removes "trade:<uid>" or "offer:<id>";
+// legacy "delete_id" entries remove all tradables with that offer id.
+message TradableLogEntry {
+    oneof entry {
+        Tradable upsert = 1;
+        string delete_id = 2;
+        string delete_key = 4;
+    }
+    // Local persistence identity, retained when a failed mutation is retried.
+    string mutation_id = 3;
 }
 
 message Offer {
@@ -1551,6 +1718,8 @@ message Trade {
     string uid = 27;
     bool is_completed = 28;
     string challenge = 29;
+    int64 payout_height = 30;
+    int64 completed_revision = 31;
 }
 
 message BuyerAsMakerTrade {
@@ -1728,8 +1897,8 @@ message PreferencesPayload {
     double max_price_distance_in_percent = 16;
     string offer_book_chart_screen_currency_code = 17;
     string trade_charts_screen_currency_code = 18;
-    string buy_screen_currency_code = 19;
-    string sell_screen_currency_code = 20;
+    string buy_screen_fiat_currency_code = 19;
+    string sell_screen_fiat_currency_code = 20;
     int32 trade_statistics_tick_unit_index = 21;
     bool resync_spv_requested = 22;
     bool sort_market_currencies_numerically = 23;
@@ -1778,6 +1947,18 @@ message PreferencesPayload {
     string sell_screen_other_currency_code = 66;
     bool show_no_deposit_offers = 67;
     bool show_private_offers = 68;
+    string buy_screen_fiat_payment_method_id = 69;
+    string sell_screen_fiat_payment_method_id = 70;
+    int32 buy_screen_offer_book_sub_tab_index = 71;
+    int32 sell_screen_offer_book_sub_tab_index = 72;
+    int32 market_selected_tab_index = 73;
+    string buy_screen_crypto_payment_method_id = 74;
+    string sell_screen_crypto_payment_method_id = 75;
+    string buy_screen_other_payment_method_id = 76;
+    string sell_screen_other_payment_method_id = 77;
+    bool deposit_addresses_expanded = 78;
+    int32 tac_accepted_version = 79;
+    bool use_native_xmr_wallet = 80;
 }
 
 message AutoConfirmSettings {
@@ -1927,6 +2108,57 @@ message PaymentAccountForm {
         INTERAC_E_TRANSFER = 26;
         US_POSTAL_MONEY_ORDER = 27;
         PIX = 28;
+        NATIONAL_BANK = 29;
+        WESTERN_UNION = 30;
+        CASH_DEPOSIT = 31;
+        UPI = 32;
+        NEFT = 33;
+        IMPS = 34;
+        PROMPT_PAY = 35;
+        BIZUM = 36;
+        NEQUI = 37;
+        JAPAN_BANK = 38;
+        PAYTM = 39;
+        DOMESTIC_WIRE_TRANSFER = 40;
+        SATISPAY = 41;
+        PAYSERA = 42;
+        TIKKIE = 43;
+        MPESA = 44;
+        MERCADO_PAGO = 45;
+        GCASH = 46;
+        MOMO = 47;
+        SPEI = 48;
+        ADVANCED_CASH = 50;
+        CELPAY = 51;
+        HAL_CASH = 52;
+        MONESE = 53;
+        MONEY_BEAM = 54;
+        PERFECT_MONEY = 55;
+        reserved 56; // was POPMONEY
+        RTGS = 57;
+        VERSE = 58;
+        SAME_BANK = 59;
+        SPECIFIC_BANKS = 60;
+        CAPITUAL = 61;
+        BLIK = 62;
+        VIPPS_MOBILEPAY = 63;
+        TWINT = 64;
+        NIP = 65;
+        PAGO_MOVIL = 66;
+        QRIS = 67;
+        PAPARA = 68;
+        RAAST = 69;
+        PAYNOW = 70;
+        WERO = 71;
+        FPS = 72;
+        DUITNOW = 73;
+        MB_WAY = 74;
+        PAYPAY = 75;
+        SBP = 76;
+        MIR = 77;
+        YOOMONEY = 78;
+        UKRAINE_CARD = 79;
+        KASPI = 80;
     }
     FormId id = 1;
     repeated PaymentAccountFormField fields = 2;
@@ -1994,6 +2226,9 @@ message PaymentAccountFormField {
         USERNAME = 57;
         EMAIL_OR_MOBILE_NR_OR_USERNAME = 58;
         EMAIL_OR_MOBILE_NR_OR_CASHTAG = 59;
+        VIRTUAL_PAYMENT_ADDRESS = 60;
+        CLABE = 61;
+        ACCEPTED_BANKS = 62;
     }
     enum Component {
         TEXT = 0;
@@ -2012,5 +2247,8 @@ message PaymentAccountFormField {
     repeated Country supported_countries = 9;
     repeated Country supported_sepa_euro_countries = 10;
     repeated Country supported_sepa_non_euro_countries = 11;
-    repeated string required_for_countries = 12;
+    repeated string required_for_countries = 12; // required when the country is one of these codes
+    repeated string supported_values = 13; // valid options for a SELECT_ONE/SELECT_MULTIPLE field whose values are plain strings
+    optional bool required = 14; // required regardless of country or other fields
+    repeated FieldId required_if_any_field_has_value = 15; // required when any of these fields has a value
 }

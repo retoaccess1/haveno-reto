@@ -35,13 +35,19 @@ import haveno.network.p2p.peers.getdata.messages.GetDataRequest;
 import haveno.network.p2p.peers.peerexchange.Peer;
 import haveno.network.p2p.seed.SeedNodeRepository;
 import haveno.network.p2p.storage.P2PDataStorage;
+import haveno.network.utils.EventThrottler;
+import haveno.network.utils.EventThrottler.ThrottleResult;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -51,12 +57,16 @@ import org.jetbrains.annotations.Nullable;
 @Slf4j
 public class RequestDataManager implements MessageListener, ConnectionListener, PeerManager.Listener {
     private static final long RETRY_DELAY_SEC = 10;
-    private static final long CLEANUP_TIMER = 120;
+    // delay before retrying another bounded sync cycle after giving up with data known incomplete
+    private static final long RESYNC_DELAY_MIN = 10;
     // How many seeds we request the PreliminaryGetDataRequest from
-    private static int NUM_SEEDS_FOR_PRELIMINARY_REQUEST = 2;
+    private static int NUM_SEEDS_FOR_PRELIMINARY_REQUEST = 3;
     // how many seeds additional to the first responding PreliminaryGetDataRequest seed we request the GetUpdatedDataRequest from
     private static int NUM_ADDITIONAL_SEEDS_FOR_UPDATE_REQUEST = 1;
     private static int MAX_REPEATED_REQUESTS = 30;
+    // Absolute ceiling on data requests per sync cycle. Generous so any realistic initial sync completes in one
+    // startup, but bounds a misbehaving peer that streams endless data from looping indefinitely.
+    private static final int MAX_TOTAL_REQUESTS = 2000;
     private boolean isPreliminaryDataRequest = true;
 
 
@@ -94,6 +104,7 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     private final PeerManager peerManager;
     private final List<NodeAddress> seedNodeAddresses;
     private final List<ResponseListener> responseListeners = new CopyOnWriteArrayList<>();
+    private final EventThrottler retryLogThrottler = new EventThrottler(1, TimeUnit.MINUTES);
 
     // As we use Guice injection we cannot set the listener in our constructor but the P2PService calls the setListener
     // in it's constructor so we can guarantee it is not null.
@@ -103,10 +114,21 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     private final Map<String, GetDataRequestHandler> getDataRequestHandlers = new HashMap<>();
     private Optional<NodeAddress> nodeAddressOfPreliminaryDataRequest = Optional.empty();
     private Timer retryTimer;
+    private Timer resyncTimer;
     private boolean dataUpdateRequested;
     private boolean allDataReceived;
     private boolean stopped;
+    // Counts data requests since the last one that made progress; reset when new data arrives.
     private int numRepeatedRequests = 0;
+    // Counts all data requests in the current sync cycle; bounds total work regardless of progress.
+    private int numTotalRequests = 0;
+    // Non-seed peers already tried in the current sync cycle; exhausting all candidates ends the
+    // cycle instead of looping over unreachable peers without pause (peers are not purged while offline).
+    private final Set<NodeAddress> attemptedNonSeedNodes = new HashSet<>();
+    // A failed redundant request is not exhaustion if the current sync cycle completed and no truncated chain is unfinished.
+    private volatile int syncCycle = 0;
+    private volatile int completedSyncCycle = -1;
+    private final Set<NodeAddress> truncatedNodes = ConcurrentHashMap.newKeySet();
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Constructor
@@ -133,7 +155,7 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
             if (myAddress != null) {
                 seedNodeAddresses.remove(myAddress);
                 if (seedNodeRepository.isSeedNode(myAddress)) {
-                    NUM_SEEDS_FOR_PRELIMINARY_REQUEST = 3;
+                    NUM_SEEDS_FOR_PRELIMINARY_REQUEST = 4;
                     NUM_ADDITIONAL_SEEDS_FOR_UPDATE_REQUEST = 2;
                     MAX_REPEATED_REQUESTS = 100;
                 }
@@ -144,6 +166,7 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     public void shutDown() {
         stopped = true;
         stopRetryTimer();
+        stopResyncTimer();
         networkNode.removeMessageListener(this);
         networkNode.removeConnectionListener(this);
         peerManager.removeListener(this);
@@ -162,6 +185,8 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     }
 
     public void requestPreliminaryData() {
+        attemptedNonSeedNodes.clear();
+        syncCycle++;
         ArrayList<NodeAddress> nodeAddresses = new ArrayList<>(seedNodeAddresses);
         if (!nodeAddresses.isEmpty()) {
             ArrayList<NodeAddress> finalNodeAddresses = new ArrayList<>(nodeAddresses);
@@ -184,6 +209,8 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
         checkArgument(nodeAddressOfPreliminaryDataRequest.isPresent(), "nodeAddressOfPreliminaryDataRequest must be present");
         dataUpdateRequested = true;
         isPreliminaryDataRequest = false;
+        attemptedNonSeedNodes.clear();
+        syncCycle++;
         List<NodeAddress> nodeAddresses = new ArrayList<>(seedNodeAddresses);
         if (!nodeAddresses.isEmpty()) {
             // We use the node we have already connected to to request again
@@ -195,10 +222,11 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                 int numRequests = 0;
                 for (int i = 0; i < finalNodeAddresses.size() && numRequests < NUM_ADDITIONAL_SEEDS_FOR_UPDATE_REQUEST; i++) {
                     NodeAddress nodeAddress = finalNodeAddresses.get(i);
-                    nodeAddresses.remove(nodeAddress);
 
-                    // It might be that we have a prelim. request open for the same seed, if so we skip to the next.
+                    // It might be that we have a prelim. request open for the same seed, if so we skip to the next
+                    // but keep the busy node in the remaining list so failover can still reach it.
                     if (!handlerMap.containsKey(nodeAddress)) {
+                        nodeAddresses.remove(nodeAddress);
                         UserThread.runAfter(() -> requestData(nodeAddress, nodeAddresses), (i * 200 + 1), TimeUnit.MILLISECONDS);
                         numRequests++;
                     }
@@ -228,6 +256,10 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     public void onDisconnect(CloseConnectionReason closeConnectionReason, Connection connection) {
         closeHandler(connection);
 
+        // release any inbound request handler tied to the closed connection
+        GetDataRequestHandler getDataRequestHandler = getDataRequestHandlers.remove(connection.getUid());
+        if (getDataRequestHandler != null) getDataRequestHandler.stop();
+
         if (peerManager.isPeerBanned(closeConnectionReason, connection) && connection.getPeersNodeAddressOptional().isPresent()) {
             NodeAddress nodeAddress = connection.getPeersNodeAddressOptional().get();
             seedNodeAddresses.remove(nodeAddress);
@@ -244,23 +276,19 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     public void onAllConnectionsLost() {
         closeAllHandlers();
         stopRetryTimer();
-        stopped = true;
         restart();
     }
 
     @Override
     public void onNewConnectionAfterAllConnectionsLost() {
-        closeAllHandlers();
-        stopped = false;
         restart();
     }
 
     @Override
     public void onAwakeFromStandby() {
         closeAllHandlers();
-        stopped = false;
-        if (!networkNode.getAllConnections().isEmpty())
-            restart();
+        // restart even if all connections were lost in standby; requesting data opens new connections
+        restart();
     }
 
 
@@ -278,6 +306,13 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                     return;
                 }
                 final String uid = connection.getUid();
+                GetDataRequestHandler existingHandler = getDataRequestHandlers.get(uid);
+                if (existingHandler != null && existingHandler.isStale()) {
+                    // Abandon the stale handler so the new request is served instead of dropped.
+                    log.warn("We found a stale GetDataRequestHandler for connection {}. We stop it and handle the new request.", uid);
+                    existingHandler.stop();
+                    getDataRequestHandlers.remove(uid);
+                }
                 if (!getDataRequestHandlers.containsKey(uid)) {
                     GetDataRequestHandler getDataRequestHandler = new GetDataRequestHandler(networkNode, dataStorage,
                             new GetDataRequestHandler.Listener() {
@@ -306,16 +341,8 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                     getDataRequestHandlers.put(uid, getDataRequestHandler);
                     getDataRequestHandler.handle(getDataRequest, connection);
                 } else {
-                    log.warn("We have already a GetDataRequestHandler for that connection started. " +
-                            "We start a cleanup timer if the handler has not closed by itself in between 2 minutes.");
-
-                    UserThread.runAfter(() -> {
-                        if (getDataRequestHandlers.containsKey(uid)) {
-                            GetDataRequestHandler handler = getDataRequestHandlers.get(uid);
-                            handler.stop();
-                            getDataRequestHandlers.remove(uid);
-                        }
-                    }, CLEANUP_TIMER);
+                    // Expected when the peer re-requests while our response is still in flight; the handler resolves or goes stale on its own.
+                    log.debug("We have already a GetDataRequestHandler for that connection started. We ignore the new request.");
                 }
             } else {
                 log.warn("We have stopped already. We ignore that onMessage call.");
@@ -330,13 +357,27 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     private void requestData(NodeAddress nodeAddress, List<NodeAddress> remainingNodeAddresses) {
         if (!stopped) {
             if (!handlerMap.containsKey(nodeAddress)) {
+                boolean preliminaryRequest = isPreliminaryDataRequest;
+                int requestSyncCycle = syncCycle;
                 RequestDataHandler requestDataHandler = new RequestDataHandler(networkNode, dataStorage, peerManager,
                         new RequestDataHandler.Listener() {
                             @Override
-                            public void onComplete(boolean wasTruncated) {
+                            public void onComplete(boolean wasTruncated, int numNewItems) {
                                 log.trace("RequestDataHandshake of outbound connection complete. nodeAddress={}",
                                         nodeAddress);
                                 stopRetryTimer();
+
+                                // A truncated response that delivered new data is progress, so reset the repeat
+                                // counter. The limit then only bounds requests that fail to make progress, letting
+                                // a large initial sync page through all data within a single startup.
+                                if (numNewItems > 0) numRepeatedRequests = 0;
+
+                                if (wasTruncated) {
+                                    truncatedNodes.add(nodeAddress);
+                                } else {
+                                    truncatedNodes.remove(nodeAddress);
+                                    if (requestSyncCycle == syncCycle) completedSyncCycle = requestSyncCycle;
+                                }
 
                                 // need to remove before listeners are notified as they cause the update call
                                 handlerMap.remove(nodeAddress);
@@ -351,24 +392,28 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                                 }
 
                                 // 2. Later we get a response from requestUpdatesData
-                                if (dataUpdateRequested) {
+                                if (dataUpdateRequested && !preliminaryRequest) {
                                     dataUpdateRequested = false;
                                     checkNotNull(listener).onUpdatedDataReceived();
                                 }
 
                                 if (wasTruncated) {
-                                    if (numRepeatedRequests < MAX_REPEATED_REQUESTS) {
+                                    if (numRepeatedRequests < MAX_REPEATED_REQUESTS && numTotalRequests < MAX_TOTAL_REQUESTS) {
                                         // If we had allDataReceived already set to true but get a response with truncated flag,
                                         // we still repeat the request to that node for higher redundancy. Otherwise, one seed node
                                         // providing incomplete data would stop others to fill the gaps.
                                         log.info("DataResponse did not contain all data, so we repeat request until we got all data");
                                         UserThread.runAfter(() -> requestData(nodeAddress, remainingNodeAddresses), 2);
-                                    } else if (!allDataReceived) {
-                                        allDataReceived = true;
-                                        log.warn("\n#################################################################\n" +
-                                                "Loading initial data from {} did not complete after 20 repeated requests. \n" +
-                                                "#################################################################\n", nodeAddress);
-                                        checkNotNull(listener).onDataReceived();
+                                    } else {
+                                        // data is known incomplete, so retry another bounded sync cycle later instead of waiting for a restart
+                                        scheduleResync();
+                                        if (!allDataReceived) {
+                                            allDataReceived = true;
+                                            log.warn("\n#################################################################\n" +
+                                                    "Loading initial data from {} did not complete after {} requests without progress or {} total requests. Retrying in {} minutes.\n" +
+                                                    "#################################################################\n", nodeAddress, MAX_REPEATED_REQUESTS, MAX_TOTAL_REQUESTS, RESYNC_DELAY_MIN);
+                                            checkNotNull(listener).onDataReceived();
+                                        }
                                     }
                                 } else if (!allDataReceived) {
                                     allDataReceived = true;
@@ -376,6 +421,12 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                                             "Loading initial data from {} completed\n" +
                                             "#################################################################\n", nodeAddress);
                                     checkNotNull(listener).onDataReceived();
+                                }
+
+                                // A failed update can have exhausted failover while this preliminary request was busy.
+                                // Use the now-responsive peer to finish the address-bearing handshake.
+                                if (preliminaryRequest && dataUpdateRequested && handlerMap.isEmpty() && !wasTruncated) {
+                                    requestData(nodeAddress, remainingNodeAddresses);
                                 }
                             }
 
@@ -387,13 +438,19 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                                 peerManager.handleConnectionFault(nodeAddress);
                                 handlerMap.remove(nodeAddress);
 
+                                remainingNodeAddresses.removeIf(peerManager::isPeerUnavailable);
                                 if (!remainingNodeAddresses.isEmpty()) {
                                     log.debug("There are remaining nodes available for requesting data. " +
                                             "We will try requestDataFromPeers again.");
                                     NodeAddress nextCandidate = remainingNodeAddresses.get(0);
                                     remainingNodeAddresses.remove(nextCandidate);
                                     requestData(nextCandidate, remainingNodeAddresses);
-                                } else if (handlerMap.isEmpty()) {
+                                } else if (!handlerMap.isEmpty()) {
+                                    log.debug("We could not connect to seed node {} but we have other connection attempts open.", nodeAddress.getFullAddress());
+                                } else if (completedSyncCycle == syncCycle && truncatedNodes.isEmpty()) {
+                                    // keep redundancy through non-seed peers, but do not restart since data was already received
+                                    if (!requestFromNonSeedNodePeers()) log.debug("Request to {} failed but data was already received in this sync cycle.", nodeAddress.getFullAddress());
+                                } else {
                                     // If not other connection attempts are in the handlerMap we assume that no seed
                                     // nodes are available.
                                     log.debug("There is no remaining node available for requesting data. " +
@@ -410,26 +467,45 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                                         }
                                     }
 
-                                    requestFromNonSeedNodePeers();
-                                } else {
-                                    log.info("We could not connect to seed node {} but we have other connection attempts open.", nodeAddress.getFullAddress());
+                                    boolean requested = requestFromNonSeedNodePeers();
+
+                                    // retry until a node is reachable, else data missed while offline or at bootstrap is only fetched on app restart
+                                    if (!requested) {
+                                        ThrottleResult throttleResult = retryLogThrottler.onEvent();
+                                        if (!throttleResult.throttled) {
+                                            log.warn("Data request attempts exhausted. Retrying in {} seconds ({} similar messages suppressed).",
+                                                    RETRY_DELAY_SEC, throttleResult.throttledCount);
+                                        }
+                                        restart();
+                                    }
                                 }
                             }
                         });
                 handlerMap.put(nodeAddress, requestDataHandler);
                 numRepeatedRequests++;
-                requestDataHandler.requestData(nodeAddress, isPreliminaryDataRequest);
+                numTotalRequests++;
+                requestDataHandler.requestData(nodeAddress, preliminaryRequest);
             } else {
-                log.warn("We have started already a requestDataHandshake to peer. nodeAddress=" + nodeAddress + "\n" +
-                        "We start a cleanup timer if the handler has not closed by itself in between 2 minutes.");
+                RequestDataHandler existingHandler = handlerMap.get(nodeAddress);
+                if (existingHandler.isStale()) {
+                    // Abandon the stale handler and request again instead of skipping the node indefinitely.
+                    log.warn("We found a stale requestDataHandshake to peer {}. We stop it and request again.", nodeAddress.getFullAddress());
+                    existingHandler.stop();
+                    handlerMap.remove(nodeAddress);
+                    requestData(nodeAddress, remainingNodeAddresses);
+                    return;
+                }
 
-                UserThread.runAfter(() -> {
-                    if (handlerMap.containsKey(nodeAddress)) {
-                        RequestDataHandler handler = handlerMap.get(nodeAddress);
-                        handler.stop();
-                        handlerMap.remove(nodeAddress);
-                    }
-                }, CLEANUP_TIMER);
+                // Expected when parallel request chains overlap; the in-flight handler resolves or goes stale on its own.
+                log.debug("We have started already a requestDataHandshake to peer. nodeAddress={}", nodeAddress);
+
+                // This node is already being requested by another parallel chain, so continue
+                // failover with the next remaining seed instead of dead-ending here.
+                if (!remainingNodeAddresses.isEmpty()) {
+                    NodeAddress nextCandidate = remainingNodeAddresses.get(0);
+                    remainingNodeAddresses.remove(nextCandidate);
+                    requestData(nextCandidate, remainingNodeAddresses);
+                }
             }
         } else {
             log.warn("We have stopped already. We ignore that requestData call.");
@@ -441,22 +517,31 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     // Utils
     ///////////////////////////////////////////////////////////////////////////////////////////
 
-    private void requestFromNonSeedNodePeers() {
-        List<NodeAddress> list = getFilteredNonSeedNodeList(getSortedNodeAddresses(peerManager.getReportedPeers()), new ArrayList<>());
-        List<NodeAddress> filteredPersistedPeers = getFilteredNonSeedNodeList(getSortedNodeAddresses(peerManager.getPersistedPeers()), list);
+    private boolean requestFromNonSeedNodePeers() {
+        List<NodeAddress> excluded = new ArrayList<>(attemptedNonSeedNodes);
+        List<NodeAddress> list = getFilteredNonSeedNodeList(getSortedNodeAddresses(peerManager.getReportedPeers()), excluded);
+        excluded.addAll(list);
+        List<NodeAddress> filteredPersistedPeers = getFilteredNonSeedNodeList(getSortedNodeAddresses(peerManager.getPersistedPeers()), excluded);
         list.addAll(filteredPersistedPeers);
 
         if (!list.isEmpty()) {
+            attemptedNonSeedNodes.addAll(list); // the failover chain consumes the whole list before any repeat pass
             NodeAddress nextCandidate = list.get(0);
             list.remove(nextCandidate);
             requestData(nextCandidate, list);
+            return true;
         }
+        return false;
     }
 
     private void restart() {
-        if (retryTimer == null) {
+        if (!stopped && retryTimer == null) {
             retryTimer = UserThread.runAfter(() -> {
-                        stopped = false;
+                        if (stopped) return;
+                        numRepeatedRequests = 0; // reset the repeat limit per sync cycle
+                        numTotalRequests = 0;
+                        attemptedNonSeedNodes.clear();
+                        syncCycle++;
 
                         stopRetryTimer();
 
@@ -473,10 +558,34 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                         List<NodeAddress> filteredPersistedPeers = getFilteredNonSeedNodeList(getSortedNodeAddresses(peerManager.getPersistedPeers()), list);
                         list.addAll(filteredPersistedPeers);
 
+                        // mark queued non-seed peers so the exhaustion fallback does not dial them again this cycle
+                        attemptedNonSeedNodes.addAll(filteredReportedPeers);
+                        attemptedNonSeedNodes.addAll(filteredPersistedPeers);
+
+                        // prefer connected nodes so short wake windows complete before unreachable candidates time out
+                        Set<NodeAddress> connectedNodes = networkNode.getAllConnections().stream()
+                                .flatMap(connection -> connection.getPeersNodeAddressOptional().stream())
+                                .collect(Collectors.toSet());
+                        list.sort(Comparator.comparing(e -> !connectedNodes.contains(e)));
+
                         if (!list.isEmpty()) {
                             NodeAddress nextCandidate = list.get(0);
                             list.remove(nextCandidate);
                             requestData(nextCandidate, list);
+
+                            // after bootstrap, also refresh from additional seeds so data missing on any single node is filled
+                            if (allDataReceived) {
+                                int numRequests = 0;
+                                List<NodeAddress> seedCandidates = list.stream().filter(peerManager::isSeedNode).collect(Collectors.toList());
+                                for (int i = 0; i < seedCandidates.size() && numRequests < NUM_ADDITIONAL_SEEDS_FOR_UPDATE_REQUEST; i++) {
+                                    NodeAddress nodeAddress = seedCandidates.get(i);
+                                    if (!handlerMap.containsKey(nodeAddress)) {
+                                        list.remove(nodeAddress);
+                                        requestData(nodeAddress, list);
+                                        numRequests++;
+                                    }
+                                }
+                            }
                         }
                     },
                     RETRY_DELAY_SEC);
@@ -494,7 +603,8 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     private List<NodeAddress> getFilteredList(Collection<NodeAddress> collection, List<NodeAddress> list) {
         return collection.stream()
                 .filter(e -> !list.contains(e) &&
-                        !peerManager.isSelf(e))
+                        !peerManager.isSelf(e) &&
+                        !peerManager.isPeerUnavailable(e))
                 .collect(Collectors.toList());
     }
 
@@ -504,10 +614,28 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
                 .collect(Collectors.toList());
     }
 
+    // Retries a full sync cycle after a give-up with incomplete data. Repeats via the give-up path until a
+    // cycle completes, so missing data is eventually fetched without an application restart.
+    private void scheduleResync() {
+        if (resyncTimer == null) {
+            resyncTimer = UserThread.runAfter(() -> {
+                resyncTimer = null;
+                restart();
+            }, RESYNC_DELAY_MIN, TimeUnit.MINUTES);
+        }
+    }
+
     private void stopRetryTimer() {
         if (retryTimer != null) {
             retryTimer.stop();
             retryTimer = null;
+        }
+    }
+
+    private void stopResyncTimer() {
+        if (resyncTimer != null) {
+            resyncTimer.stop();
+            resyncTimer = null;
         }
     }
 
@@ -518,6 +646,8 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
             if (handlerMap.containsKey(nodeAddress)) {
                 handlerMap.get(nodeAddress).cancel();
                 handlerMap.remove(nodeAddress);
+                // a canceled handler reports no fault, so retry unless other requests are still open
+                if (!stopped && handlerMap.isEmpty()) restart();
             }
         } else {
             log.trace("closeRequestDataHandler: nodeAddress not set in connection {}", connection);
@@ -527,6 +657,8 @@ public class RequestDataManager implements MessageListener, ConnectionListener, 
     private void closeAllHandlers() {
         handlerMap.values().forEach(RequestDataHandler::cancel);
         handlerMap.clear();
+        getDataRequestHandlers.values().forEach(GetDataRequestHandler::stop);
+        getDataRequestHandlers.clear();
     }
 
 }

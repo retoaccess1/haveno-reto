@@ -22,7 +22,9 @@ import com.google.inject.Singleton;
 import com.google.inject.name.Named;
 import haveno.common.config.Config;
 import haveno.common.file.FileUtil;
+import haveno.common.util.Utilities;
 import static haveno.common.util.Preconditions.checkDir;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -30,6 +32,7 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.LinkOption;
 import java.security.Key;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -46,6 +49,12 @@ import java.security.spec.InvalidKeySpecException;
 import java.security.spec.KeySpec;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.RSAPublicKeySpec;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
+import java.util.UUID;
 import javax.crypto.SecretKey;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -102,10 +111,30 @@ public class KeyStorage {
     @Inject
     public KeyStorage(@Named(Config.KEY_STORAGE_DIR) File storageDir) {
         this.storageDir = checkDir(storageDir);
+        setStoragePermissions();
+    }
+
+    private void setStoragePermissions() {
+        FileUtil.setOwnerOnlyPermissions(storageDir.toPath());
+        for (KeyEntry keyEntry : KeyEntry.values()) {
+            Path path = storageDir.toPath().resolve(keyEntry.getFileName());
+            if (Files.exists(path)) FileUtil.setOwnerOnlyPermissions(path);
+        }
     }
 
     public boolean allKeyFilesExist() {
         return fileExists(KeyEntry.MSG_SIGNATURE) && fileExists(KeyEntry.MSG_ENCRYPTION) && fileExists(KeyEntry.SYM_ENCRYPTION);
+    }
+
+    public boolean hasAccountFiles() {
+        for (String name : new String[] {"sig.key", "enc.key", "sym.p12", "backup"}) {
+            if (new File(storageDir, name).exists()) return true;
+        }
+        return false;
+    }
+
+    public void checkKeyFiles() {
+        if (!allKeyFilesExist()) throw new IllegalStateException("Account key files are incomplete. Restore a complete backup; existing files have been preserved.");
     }
 
     private boolean fileExists(KeyEntry keyEntry) {
@@ -133,7 +162,6 @@ public class KeyStorage {
      * @param secretKey  The symmetric key that protects the key entry file
      */
     public KeyPair loadKeyPair(KeyEntry keyEntry, SecretKey secretKey) {
-        FileUtil.rollingBackup(storageDir, keyEntry.getFileName(), 20);
         try {
             KeyFactory keyFactory = KeyFactory.getInstance(keyEntry.getAlgorithm());
             byte[] encodedPrivateKey = loadKeyBytes(keyEntry, secretKey);
@@ -170,16 +198,26 @@ public class KeyStorage {
      * @param password Optional password that protects the key
      */
     public SecretKey loadSecretKey(KeyEntry keyEntry, String password) throws IncorrectPasswordException {
-        FileUtil.rollingBackup(storageDir, keyEntry.getFileName(), 20);
+        return loadSecretKey(new File(storageDir, keyEntry.getFileName()).toPath(), password);
+    }
+
+    // verify without creating or pruning backups
+    public void verifyPassword(SecretKey expected, String password) throws IncorrectPasswordException {
+        if (!expected.equals(loadSecretKey(KeyEntry.SYM_ENCRYPTION, password))) {
+            throw new IllegalStateException("Account master key does not match the key on disk");
+        }
+    }
+
+    private SecretKey loadSecretKey(Path path, String password) throws IncorrectPasswordException {
         char[] passwordChars = password == null ? new char[0] : password.toCharArray();
         try {
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
 
-            try (FileInputStream fileInputStream = new FileInputStream(storageDir + "/" + keyEntry.getFileName())) {
+            try (FileInputStream fileInputStream = new FileInputStream(path.toFile())) {
                 keyStore.load(fileInputStream, passwordChars);
             }
 
-            Key key = keyStore.getKey(keyEntry.getAlias(), passwordChars);
+            Key key = keyStore.getKey(KeyEntry.SYM_ENCRYPTION.getAlias(), passwordChars);
             return (SecretKey) key;
         } catch (UnrecoverableKeyException e) { // null password when password is required
             throw new IncorrectPasswordException("Incorrect password");
@@ -187,12 +225,14 @@ public class KeyStorage {
             if (e.getCause() instanceof UnrecoverableKeyException) {
                 throw new IncorrectPasswordException("Incorrect password");
             } else {
-                log.error("Could not load key " + keyEntry.toString(), e);
-                throw new RuntimeException("Could not load key " + keyEntry.toString(), e);
+                log.error("Could not load key " + path.getFileName(), e);
+                throw new RuntimeException("Could not load key " + path.getFileName(), e);
             }
         } catch (Exception e) {
-            log.error("Could not load key " + keyEntry.toString(), e);
-            throw new RuntimeException("Could not load key " + keyEntry.toString(), e);
+            log.error("Could not load key " + path.getFileName(), e);
+            throw new RuntimeException("Could not load key " + path.getFileName(), e);
+        } finally {
+            Arrays.fill(passwordChars, '\0');
         }
     }
 
@@ -203,6 +243,11 @@ public class KeyStorage {
      * @param password Optional password
      */
     public void saveKeyRing(KeyRing keyRing, String oldPassword, String password) {
+        if (!storageDir.exists())
+            //noinspection ResultOfMethodCallIgnored
+            storageDir.mkdirs();
+        setStoragePermissions();
+
         SecretKey symmetric = keyRing.getSymmetricKey();
 
         // password protect the symmetric key
@@ -213,6 +258,236 @@ public class KeyStorage {
         saveKey(keyRing.getEncryptionKeyPair().getPrivate(), KeyEntry.MSG_ENCRYPTION.getFileName(), symmetric);
     }
 
+    // validate both passwords and serialize the replacement before any wallet is changed
+    public byte[] preparePasswordChange(String oldPassword, String newPassword) {
+        if (newPassword != null && newPassword.codePoints().anyMatch(cp -> cp > 127)) {
+            throw new IllegalArgumentException("Password must be ASCII.");
+        }
+        char[] oldChars = oldPassword == null ? new char[0] : oldPassword.toCharArray();
+        char[] newChars = newPassword == null ? new char[0] : newPassword.toCharArray();
+        try {
+            KeyStore keyStore = KeyStore.getInstance("PKCS12");
+            try (FileInputStream in = new FileInputStream(new File(storageDir, KeyEntry.SYM_ENCRYPTION.getFileName()))) {
+                keyStore.load(in, oldChars);
+            }
+            String alias = KeyEntry.SYM_ENCRYPTION.getAlias();
+            Key key = keyStore.getKey(alias, oldChars);
+            keyStore.setKeyEntry(alias, key, newChars, null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            keyStore.store(out, newChars);
+            backupAccountKey(); // preserve a durable copy before any wallet password is changed
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not prepare account password change", e);
+        } finally {
+            Arrays.fill(oldChars, '\0');
+            Arrays.fill(newChars, '\0');
+        }
+    }
+
+    // only the symmetric key's wrapping password changes; the private key files remain valid
+    public void commitPasswordChange(byte[] keyStore) {
+        try {
+            FileUtil.writeAtomically(new File(storageDir, KeyEntry.SYM_ENCRYPTION.getFileName()).toPath(), keyStore);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not save account key", e);
+        }
+    }
+
+    // keep a current backup before removing readable copies protected by superseded passwords
+    public void finishPasswordChange(KeyRing keyRing, String password, List<String> candidates) {
+        String fileName = KeyEntry.SYM_ENCRYPTION.getFileName();
+        List<String> backupPasswords = new ArrayList<>(candidates);
+        if (!backupPasswords.contains(null)) backupPasswords.add(null); // older builds may have left an unprotected wrapper
+        backupPasswords.removeIf(candidate -> Objects.equals(candidate, password));
+        try {
+            Path current = storageDir.toPath().resolve(fileName);
+            SecretKey expected = keyRing.getSymmetricKey();
+            if (!matchesKey(current, password, expected)) throw new IOException("Current account key could not be verified");
+            FileUtil.syncFileAndDirectory(current);
+            Path saved = backupAccountKey();
+            if (!matchesKey(saved, password, expected)) throw new IOException("Account-key backup could not be verified");
+
+            // remove superseded wrappers of this key and protect other copies without discarding their bytes
+            List<Path> currentBackups = new ArrayList<>();
+            for (File backup : FileUtil.getBackupFiles(storageDir, fileName)) {
+                if (!Files.isRegularFile(backup.toPath(), LinkOption.NOFOLLOW_LINKS) || backup.toPath().equals(saved)) continue;
+                if (matchesKey(backup.toPath(), password, expected)) {
+                    currentBackups.add(backup.toPath());
+                    continue;
+                }
+                for (String candidate : backupPasswords) {
+                    if (matchesKey(backup.toPath(), candidate, expected)) {
+                        Files.delete(backup.toPath());
+                        break;
+                    }
+                }
+                if (backup.exists()) retainAccountKey(backup.toPath(), expected);
+            }
+            // prune only verified copies after a successful unlock or change and a flushed replacement backup
+            currentBackups.sort(Comparator.comparing(path -> path.getFileName().toString()));
+            for (int i = 0; i < currentBackups.size() - 19; i++) Files.delete(currentBackups.get(i));
+            List<String> tempPasswords = new ArrayList<>(backupPasswords);
+            tempPasswords.add(password);
+            for (Path temp : getTemporaryAccountKeys()) {
+                for (String candidate : tempPasswords) {
+                    if (matchesKey(temp, candidate, expected)) {
+                        Files.delete(temp);
+                        break;
+                    }
+                }
+                if (Files.exists(temp)) retainAccountKey(temp, expected);
+            }
+            FileUtil.syncDirectory(saved.getParent());
+            FileUtil.syncDirectory(storageDir.toPath());
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not update account-key backups after the password change", e);
+        }
+    }
+
+    private Path backupAccountKey() throws IOException {
+        Path backups = Files.createDirectories(storageDir.toPath().resolve("backup/backups_sym_p12"));
+        Path saved = backups.resolve(System.currentTimeMillis() + "_" + UUID.randomUUID() + "_sym.p12");
+        FileUtil.writeAtomically(saved, Files.readAllBytes(storageDir.toPath().resolve("sym.p12")));
+        FileUtil.syncDirectory(backups.getParent());
+        FileUtil.syncDirectory(storageDir.toPath());
+        return saved;
+    }
+
+    private List<Path> getTemporaryAccountKeys() throws IOException {
+        List<Path> copies = new ArrayList<>();
+        for (Path directory : List.of(storageDir.toPath(), storageDir.toPath().resolve("backup/backups_sym_p12"))) {
+            if (!Files.isDirectory(directory)) continue;
+            try (var files = Files.list(directory)) {
+                copies.addAll(files.filter(path -> {
+                    String name = path.getFileName().toString();
+                    return name.endsWith(".tmp") && (name.startsWith(".haveno-write-")
+                            || (name.startsWith(".") && name.contains("sym.p12.haveno-write-")));
+                }).filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)).toList());
+            }
+        }
+        return copies;
+    }
+
+    // even an unreadable wrapper can contain recoverable keys under a previous or empty password
+    private void retainAccountKey(Path original, SecretKey key) throws IOException {
+        byte[] bytes = Files.readAllBytes(original);
+        Path directory = Files.createDirectories(storageDir.toPath().resolve("backup/retained_sym_p12"));
+        String name = Utilities.encodeToHex(Hash.getSha256Hash(bytes)) + "_" + original.getFileName() + ".enc";
+        Path retained = directory.resolve(name);
+        try {
+            FileUtil.writeAtomically(retained, Encryption.encryptPayloadWithHmac(bytes, key));
+            if (!Arrays.equals(bytes, Encryption.decryptPayloadWithHmac(Files.readAllBytes(retained), key))) {
+                throw new IOException("Retained account-key copy could not be verified");
+            }
+        } catch (CryptoException e) {
+            throw new IOException("Could not protect retained account-key copy", e);
+        }
+        FileUtil.syncDirectory(directory.getParent());
+        FileUtil.syncDirectory(storageDir.toPath());
+        Files.delete(original);
+        FileUtil.syncDirectory(original.getParent());
+    }
+
+    // export exact original bytes to a new directory without changing the account or retained copies
+    public void exportRetainedAccountKeys(String password, Path outputDir) throws IOException, IncorrectPasswordException {
+        SecretKey key = loadSecretKey(KeyEntry.SYM_ENCRYPTION, password);
+        Path directory = storageDir.toPath().resolve("backup/retained_sym_p12");
+        if (!Files.isDirectory(directory)) throw new IOException("No retained account-key copies are available");
+        Files.createDirectory(outputDir);
+        try (var copies = Files.list(directory)) {
+            for (Path copy : copies.filter(path -> path.getFileName().toString().endsWith(".enc"))
+                    .filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                String name = copy.getFileName().toString();
+                try {
+                    byte[] bytes = Encryption.decryptPayloadWithHmac(Files.readAllBytes(copy), key);
+                    FileUtil.writeAtomically(outputDir.resolve(name.substring(0, name.length() - ".enc".length())), bytes);
+                } catch (CryptoException e) {
+                    throw new IOException("Could not decrypt retained account-key copy " + name, e);
+                }
+            }
+        }
+    }
+
+    public void cleanupAfterUnlock(KeyRing keyRing, String password) {
+        try {
+            finishPasswordChange(keyRing, password, Arrays.asList(password, null));
+            // refresh private-key backups only after both keys have been authenticated successfully
+            for (KeyEntry entry : List.of(KeyEntry.MSG_SIGNATURE, KeyEntry.MSG_ENCRYPTION)) {
+                FileUtil.syncFileAndDirectory(new File(storageDir, entry.getFileName()).toPath());
+                if (!FileUtil.rollingBackup(storageDir, entry.getFileName(), 20)) throw new IOException("Could not back up " + entry.getFileName());
+            }
+        } catch (Exception e) {
+            log.warn("Could not refresh account-key backups; use password recovery to retry cleanup", e);
+        }
+    }
+
+    // recovery may restore a damaged wrapper only from a key that authenticates both account private-key files
+    public void recoverAccountKey(String password, List<String> candidates) throws IncorrectPasswordException, IOException {
+        if (!fileExists(KeyEntry.MSG_SIGNATURE) || !fileExists(KeyEntry.MSG_ENCRYPTION)) {
+            throw new IOException("Account private-key files are incomplete. Restore a complete backup");
+        }
+        Path current = storageDir.toPath().resolve("sym.p12");
+        if (readAccountKey(current, password) != null) return;
+        // a readable authoritative wrapper still determines the current account password
+        for (String candidate : candidates) {
+            if (readAccountKey(current, candidate) != null) {
+                throw new IncorrectPasswordException("Use the password that opens the current account key");
+            }
+        }
+        List<Path> copies = new ArrayList<>();
+        for (File backup : FileUtil.getBackupFiles(storageDir, "sym.p12")) copies.add(backup.toPath());
+        copies.addAll(getTemporaryAccountKeys());
+        for (Path copy : copies) {
+            if (!Files.isRegularFile(copy, LinkOption.NOFOLLOW_LINKS)) continue;
+            for (String candidate : candidates) {
+                SecretKey key = readAccountKey(copy, candidate);
+                if (key == null) continue;
+                byte[] replacement = wrapSecretKey(key, password);
+                if (Files.exists(current)) backupAccountKey(); // retain the unreadable original
+                commitPasswordChange(replacement);
+                return;
+            }
+        }
+        throw new IOException("No readable account-key copy matches this account. Keep all files and restore a complete readable backup");
+    }
+
+    private SecretKey readAccountKey(Path path, String password) {
+        try {
+            SecretKey key = loadSecretKey(path, password);
+            loadKeyBytes(KeyEntry.MSG_SIGNATURE, key);
+            loadKeyBytes(KeyEntry.MSG_ENCRYPTION, key);
+            return key;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private byte[] wrapSecretKey(SecretKey key, String password) {
+        if (password != null && password.codePoints().anyMatch(cp -> cp > 127)) throw new IllegalArgumentException("Password must be ASCII.");
+        char[] chars = password == null ? new char[0] : password.toCharArray();
+        try {
+            KeyStore keyStore = KeyStore.getInstance("PKCS12");
+            keyStore.load(null, null);
+            keyStore.setKeyEntry(KeyEntry.SYM_ENCRYPTION.getAlias(), key, chars, null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            keyStore.store(out, chars);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not restore account key", e);
+        } finally {
+            Arrays.fill(chars, '\0');
+        }
+    }
+
+    private boolean matchesKey(Path path, String password, SecretKey expected) {
+        try {
+            return expected.equals(loadSecretKey(path, password));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     /**
      * Saves private key in PKCS#8 to a file and encrypts using the symmetric key.
      *
@@ -221,13 +496,10 @@ public class KeyStorage {
      * @param secretKey Secret key to encrypt the key pair
      */
     private void saveKey(PrivateKey key, String fileName, SecretKey secretKey) {
-        if (!storageDir.exists())
-            //noinspection ResultOfMethodCallIgnored
-            storageDir.mkdirs();
-
         PKCS8EncodedKeySpec pkcs8EncodedKeySpec = new PKCS8EncodedKeySpec(key.getEncoded());
         byte[] keyBytes = pkcs8EncodedKeySpec.getEncoded();
         try (FileOutputStream fos = new FileOutputStream(storageDir + "/" + fileName)) {
+            FileUtil.setOwnerOnlyPermissions(storageDir.toPath().resolve(fileName));
             keyBytes = Encryption.encryptPayloadWithHmac(keyBytes, secretKey);
             fos.write(keyBytes);
         } catch (Exception e) {
@@ -246,10 +518,6 @@ public class KeyStorage {
      * @param password    Optional password to encrypt the key store
      */
     private void saveKey(SecretKey key, String alias, String fileName, String oldPassword, String password) {
-        if (!storageDir.exists())
-            //noinspection ResultOfMethodCallIgnored
-            storageDir.mkdirs();
-
         // password must be ascii
         if (password != null && !password.matches("\\p{ASCII}*")) {
             throw new IllegalArgumentException("Password must be ASCII.");
@@ -275,6 +543,7 @@ public class KeyStorage {
             keyStore.setKeyEntry(alias, key, passwordChars, null);
 
             try (FileOutputStream fileOutputStream = new FileOutputStream(path)) {
+                FileUtil.setOwnerOnlyPermissions(Path.of(path));
                 // save the keystore
                 keyStore.store(fileOutputStream, passwordChars);
             }

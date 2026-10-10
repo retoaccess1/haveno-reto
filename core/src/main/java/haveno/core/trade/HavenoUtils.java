@@ -66,9 +66,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
@@ -120,14 +125,41 @@ public class HavenoUtils {
         return GENERAL_PRIVATE_OFFERS_ENABLED;
     }
 
-    // synchronize requests to monerod
-    private static boolean SYNC_DAEMON_REQUESTS = false; // sync long requests to daemon (e.g. refresh, update pool) // TODO: performance suffers by syncing daemon requests, but otherwise we sometimes get sporadic errors?
+    // limit concurrent requests to monerod
+    private static final int MAX_CONCURRENT_DAEMON_REQUESTS = 50; // limit long requests to daemon (e.g. sync, refresh pool) without fully serializing them
+    private static final long DAEMON_LOCK_TIMEOUT_MS = 120000; // bound waits so stalled requests cannot block others indefinitely
     private static boolean SYNC_WALLET_REQUESTS = false; // additionally sync wallet functions to daemon (e.g. create txs)
     private static boolean SYNC_IMPORT_MULTISIG_REQUESTS = false; // sync import multisig requests to avoid concurrent imports
-    private static Object DAEMON_LOCK = new Object();
+    private static final ReentrantLock[] DAEMON_LOCKS = new ReentrantLock[MAX_CONCURRENT_DAEMON_REQUESTS];
+    private static final AtomicInteger DAEMON_LOCK_INDEX = new AtomicInteger();
     private static Object IMPORT_MULTISIG_LOCK = new Object();
-    public static Object getDaemonLock() {
-        return SYNC_DAEMON_REQUESTS ? DAEMON_LOCK : new Object();
+    static {
+        for (int i = 0; i < DAEMON_LOCKS.length; i++) DAEMON_LOCKS[i] = new ReentrantLock();
+    }
+
+    // return one of a fixed pool of locks to limit concurrent daemon requests, reusing a lock already held by this thread
+    public static ReentrantLock getDaemonLock() {
+        for (ReentrantLock lock : DAEMON_LOCKS) if (lock.isHeldByCurrentThread()) return lock;
+        return DAEMON_LOCKS[Math.floorMod(DAEMON_LOCK_INDEX.getAndIncrement(), DAEMON_LOCKS.length)];
+    }
+
+    // acquire a daemon lock with bounded wait, returning null to proceed without limiting concurrency if stalled
+    public static ReentrantLock acquireDaemonLock() {
+        ReentrantLock lock = getDaemonLock();
+        try {
+            if (!lock.tryLock(DAEMON_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                log.warn("Timed out waiting for daemon lock, proceeding without limiting concurrency");
+                return null;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        return lock;
+    }
+
+    public static void releaseDaemonLock(ReentrantLock lock) {
+        if (lock != null) lock.unlock();
     }
     public static Object getWalletFunctionLock() {
         return SYNC_WALLET_REQUESTS ? getDaemonLock() : new Object();
@@ -166,8 +198,16 @@ public class HavenoUtils {
         return havenoSetup.getCoreContext().isApiUser();
     }
 
+    public static boolean isWalletInitialized() {
+        return havenoSetup != null && havenoSetup.getWalletInitialized().get();
+    }
+
     public static boolean isAllDomainServicesInitialized() {
         return havenoSetup != null && havenoSetup.getAppStartupState() != null && havenoSetup.getAppStartupState().isAllDomainServicesInitialized();
+    }
+
+    public static boolean isApplicationFullyInitialized() {
+        return havenoSetup != null && havenoSetup.getAppStartupState() != null && havenoSetup.getAppStartupState().isApplicationFullyInitialized();
     }
 
     @SuppressWarnings("unused")
@@ -338,11 +378,19 @@ public class HavenoUtils {
     }
 
     public static BigInteger parseXmr(String input) {
-        if (input == null || input.length() == 0) return BigInteger.ZERO; // TODO: throw instead?
         try {
             return new BigDecimal(input).multiply(new BigDecimal(XMR_AU_MULTIPLIER)).toBigInteger();
-        } catch (Exception e) {
-            return BigInteger.ZERO;
+        } catch (NumberFormatException | NullPointerException | ArithmeticException e) { // ArithmeticException on exponents too large for BigInteger
+            throw new NumberFormatException("Invalid XMR amount: " + input);
+        }
+    }
+
+    // parse the amount, or return the fallback when the input is blank or not a valid number
+    public static BigInteger parseXmrOrElse(String input, BigInteger fallback) {
+        try {
+            return parseXmr(input);
+        } catch (NumberFormatException e) {
+            return fallback;
         }
     }
 
@@ -593,7 +641,7 @@ public class HavenoUtils {
     public static boolean connectionConfigsEqual(MoneroRpcConnection c1, MoneroRpcConnection c2) {
         if (c1 == c2) return true;
         if (c1 == null) return false;
-        return c1.equals(c2); // equality considers uri, username, and password
+        return c1.equals(c2); // equality includes credentials, proxy, and TLS verification
     }
 
     // TODO: move to monero-java MoneroTxWallet
@@ -631,6 +679,10 @@ public class HavenoUtils {
 
     public static boolean isUnresponsive(Throwable t) {
         return isConnectionRefused(t) || isReadTimeout(t) || XmrWalletBase.isSyncWithProgressTimeout(t);
+    }
+
+    public static boolean isNotConnectedToDaemon(Throwable t) {
+        return t != null && t.getMessage() != null && (t.getMessage().contains("no connection to daemon") || t.getMessage().contains("Wallet is not connected to daemon"));
     }
 
     private static boolean isNotEnoughSigners(Throwable t) {
@@ -682,13 +734,35 @@ public class HavenoUtils {
         playAudioFile("chime.wav");
     }
 
+    public static void playChatSound() {
+        playAudioFile("chat.wav");
+    }
+
     public static void playCashRegisterSound() {
         playAudioFile("cash_register.wav");
+    }
+
+    // sounds requested before the app is fully initialized, replayed once each on launch
+    private static final Set<String> deferredSounds = new LinkedHashSet<>();
+
+    public static void playDeferredSounds() {
+        List<String> fileNames;
+        synchronized (deferredSounds) {
+            fileNames = new ArrayList<>(deferredSounds);
+            deferredSounds.clear();
+        }
+        for (String fileName : fileNames) playAudioFile(fileName);
     }
 
     private static void playAudioFile(String fileName) {
         if (isDaemon()) return; // ignore if running as daemon
         if (!preferences.getUseSoundForNotificationsProperty().get()) return; // ignore if sounds disabled
+        if (!isApplicationFullyInitialized()) { // defer sounds while catching up during startup
+            synchronized (deferredSounds) {
+                deferredSounds.add(fileName);
+            }
+            return;
+        }
         new Thread(() -> {
             try {
 
@@ -729,7 +803,7 @@ public class HavenoUtils {
                 convertedStream.close();
                 audioInputStream.close();
             } catch (Exception e) {
-                e.printStackTrace();
+                log.warn("Failed to play sound {}: {}", fileName, e.getMessage(), e);
             }
         }).start();
     }

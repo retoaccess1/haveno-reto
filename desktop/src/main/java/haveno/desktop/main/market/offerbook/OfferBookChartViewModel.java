@@ -30,6 +30,7 @@ import haveno.core.monetary.Volume;
 import haveno.core.offer.Offer;
 import haveno.core.offer.OfferDirection;
 import haveno.core.offer.OpenOfferManager;
+import haveno.core.provider.price.MarketPrice;
 import haveno.core.provider.price.PriceFeedService;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.user.Preferences;
@@ -278,6 +279,12 @@ class OfferBookChartViewModel extends ActivatableViewModel {
         return selectedTradeCurrencyProperty.get().getCode();
     }
 
+    public Optional<Double> getMarketPriceAsDouble() {
+        MarketPrice marketPrice = priceFeedService.getMarketPrice(getCurrencyCode());
+        if (marketPrice == null || !marketPrice.isPriceAvailable()) return Optional.empty();
+        return Optional.of(marketPrice.getPrice());
+    }
+
     public ObservableList<OfferBookListItem> getOfferBookListItems() {
         return offerBookListItems;
     }
@@ -345,7 +352,7 @@ class OfferBookChartViewModel extends ActivatableViewModel {
         return offerBookListItems.stream().anyMatch(item -> item.getOffer().getPrice() == null);
     }
 
-    private void updateChartData() {
+    void updateChartData() {
 
         // Offer price can be null (if price feed unavailable), thus a null-tolerant comparator is used.
         Comparator<Offer> offerPriceComparator = Comparator.comparing(Offer::getPrice, Comparator.nullsLast(Comparator.naturalOrder()));
@@ -454,7 +461,7 @@ class OfferBookChartViewModel extends ActivatableViewModel {
     private void updateScreenCurrencyInPreferences(OfferDirection direction) {
         if (isSellOffer(direction)) {
             if (CurrencyUtil.isFiatCurrency(getCurrencyCode())) {
-                preferences.setBuyScreenCurrencyCode(getCurrencyCode());
+                preferences.setBuyScreenFiatCurrencyCode(getCurrencyCode());
             } else if (CurrencyUtil.isCryptoCurrency(getCurrencyCode())) {
                 preferences.setBuyScreenCryptoCurrencyCode(getCurrencyCode());
             } else if (CurrencyUtil.isTraditionalCurrency(getCurrencyCode())) {
@@ -462,7 +469,7 @@ class OfferBookChartViewModel extends ActivatableViewModel {
             }
         } else {
             if (CurrencyUtil.isFiatCurrency(getCurrencyCode())) {
-                preferences.setSellScreenCurrencyCode(getCurrencyCode());
+                preferences.setSellScreenFiatCurrencyCode(getCurrencyCode());
             } else if (CurrencyUtil.isCryptoCurrency(getCurrencyCode())) {
                 preferences.setSellScreenCryptoCurrencyCode(getCurrencyCode());
             } else if (CurrencyUtil.isTraditionalCurrency(getCurrencyCode())) {

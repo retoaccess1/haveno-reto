@@ -18,6 +18,7 @@
 package haveno.desktop.components;
 
 import haveno.desktop.main.overlays.editor.PeerInfoWithTagEditor;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.DisplayUtils;
 
 import haveno.core.alert.PrivateNotificationManager;
@@ -30,6 +31,7 @@ import haveno.network.p2p.NodeAddress;
 
 import com.google.common.base.Charsets;
 
+import javafx.scene.AccessibleAction;
 import javafx.scene.Group;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
@@ -39,6 +41,7 @@ import javafx.scene.image.ImageView;
 import javafx.scene.input.MouseButton;
 import javafx.scene.layout.Pane;
 import javafx.scene.paint.Color;
+import javafx.scene.shape.Rectangle;
 
 import javafx.geometry.Point2D;
 
@@ -143,7 +146,12 @@ public class PeerInfoIcon extends Group {
 
         updatePeerInfoIcon();
 
-        getChildren().addAll(outerBackground, innerBackground, avatarImageView, tagPane, numTradesPane);
+        // transparent rect spans the full extent incl. badges so bounds stay constant and centering doesn't shift
+        Rectangle boundsRect = new Rectangle(scaleFactor * 34, scaleFactor * 32, Color.TRANSPARENT);
+        boundsRect.setLayoutY(scaleFactor * -2);
+        boundsRect.setMouseTransparent(true);
+
+        getChildren().addAll(boundsRect, outerBackground, innerBackground, avatarImageView, tagPane, numTradesPane);
     }
 
     protected void addMouseListener(int numTrades,
@@ -171,6 +179,7 @@ public class PeerInfoIcon extends Group {
                         Res.get("peerInfo.unknownAge") :
                 null;
 
+        Accessibility.asButton(this, null); // tag-aware name already set by refreshTag
         setOnMouseClicked(e -> {
             if (e.getButton().equals(MouseButton.PRIMARY)) {
                 new PeerInfoWithTagEditor(privateNotificationManager, trade, offer, preferences, useDevPrivilegeKeys)
@@ -189,6 +198,12 @@ public class PeerInfoIcon extends Group {
                         .show();
             }
         });
+    }
+
+    @Override
+    public void executeAccessibleAction(AccessibleAction action, Object... parameters) {
+        if (action == AccessibleAction.FIRE) Accessibility.click(this); // screen-reader press
+        else super.executeAccessibleAction(action, parameters);
     }
 
     protected double getScaleFactor() {
@@ -223,8 +238,10 @@ public class PeerInfoIcon extends Group {
             tag.set(peerTagMap.get(fullAddress));
         }
 
-        Tooltip.install(this, new Tooltip(!tag.get().isEmpty() ?
-                Res.get("peerInfoIcon.tooltip", tooltipText, tag.get()) : tooltipText));
+        String tooltip = !tag.get().isEmpty() ?
+                Res.get("peerInfoIcon.tooltip", tooltipText, tag.get()) : tooltipText;
+        Tooltip.install(this, new Tooltip(tooltip));
+        Accessibility.setName(this, tooltip);
 
         if (!tag.get().isEmpty()) {
             tagLabel.setText(tag.get().substring(0, 1));

@@ -17,10 +17,10 @@
 
 package haveno.desktop.main.offer.offerbook;
 
-import de.jensd.fx.fontawesome.AwesomeDude;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import haveno.desktop.util.Accessibility;
+import haveno.desktop.util.GlyphsDude;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
-import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIconView;
 import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.common.util.Tuple3;
@@ -74,12 +74,17 @@ import javafx.beans.value.ObservableValue;
 import javafx.collections.ListChangeListener;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
+import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
 import javafx.geometry.VPos;
+import javafx.scene.AccessibleRole;
+import javafx.scene.Node;
 import javafx.scene.canvas.Canvas;
+import javafx.scene.control.ButtonBase;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.Label;
+import javafx.scene.control.ScrollBar;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableRow;
@@ -87,11 +92,13 @@ import javafx.scene.control.TableView;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.Tooltip;
 import javafx.scene.image.ImageView;
+import javafx.scene.input.MouseButton;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
+import javafx.scene.text.Text;
 import javafx.scene.text.TextAlignment;
 import javafx.util.Callback;
 import javafx.util.StringConverter;
@@ -118,6 +125,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
     private final SignedWitnessService signedWitnessService;
 
     protected AutocompleteComboBox<TradeCurrency> currencyComboBox;
+    private Map<String, Integer> currencyOfferCounts;
     private AutocompleteComboBox<PaymentMethod> paymentMethodComboBox;
     private AutoTooltipButton createOfferButton;
     private AutoTooltipTextField filterInputField;
@@ -138,6 +146,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
     private ListChangeListener<OfferBookListItem> offerListListener;
     private ChangeListener<Number> priceFeedUpdateCounterListener;
     private Subscription currencySelectionSubscriber;
+    private Subscription filterTextHidesOffersSubscriber;
     private static final int SHOW_ALL = 0;
     private Label disabledCreateOfferButtonTooltip;
     protected VBox currencyComboBoxContainer;
@@ -179,37 +188,46 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         currencyComboBoxContainer = currencyBoxTuple.first;
         currencyComboBox = currencyBoxTuple.third;
         currencyComboBox.setPrefWidth(250);
+        currencyComboBox.setMinWidth(150);
         currencyComboBox.getStyleClass().add("input-with-border");
 
         Tuple3<VBox, Label, AutocompleteComboBox<PaymentMethod>> paymentBoxTuple = FormBuilder.addTopLabelAutocompleteComboBox(
                 Res.get("offerbook.filterByPaymentMethod"));
         paymentMethodComboBox = paymentBoxTuple.third;
-        paymentMethodComboBox.setCellFactory(GUIUtil.getPaymentMethodCellFactory());
         paymentMethodComboBox.setPrefWidth(250);
+        paymentMethodComboBox.setMinWidth(150);
         paymentMethodComboBox.getStyleClass().add("input-with-border");
 
         noDepositOffersToggleButton = new ToggleButton(Res.get("offerbook.filterNoDeposit"));
+        noDepositOffersToggleButton.setMinWidth(Region.USE_PREF_SIZE); // never ellipsize
         noDepositOffersToggleButton.getStyleClass().add("toggle-button-no-slider");
         Tooltip noDepositOffersTooltip = new Tooltip(Res.get("offerbook.noDepositOffers"));
         Tooltip.install(noDepositOffersToggleButton, noDepositOffersTooltip);
 
         privateOffersToggleButton = new ToggleButton();
-        privateOffersToggleButton.setGraphic(GUIUtil.getLockIcon(privateOffersToggleButton, "1.4em"));
+        privateOffersToggleButton.setGraphic(GUIUtil.getLockIcon("1.4em"));
         privateOffersToggleButton.getStyleClass().add("toggle-button-no-slider");
         // lock filter is shown only when enabled on the network
         privateOffersToggleButton.setManaged(HavenoUtils.isGeneralPrivateOffersEnabled());
         privateOffersToggleButton.setVisible(HavenoUtils.isGeneralPrivateOffersEnabled());
         Tooltip privateOffersTooltip = new Tooltip(Res.get("offerbook.privateOffers"));
         Tooltip.install(privateOffersToggleButton, privateOffersTooltip);
+        Accessibility.setName(privateOffersToggleButton, Res.get("offerbook.privateOffers"));
 
-        matchingOffersToggleButton = AwesomeDude.createIconToggleButton(AwesomeIcon.USER, null, "1.4em", null);
+        matchingOffersToggleButton = GlyphsDude.createIconToggleButton(FontAwesomeIcon.USER, null, "1.4em", null);
         matchingOffersToggleButton.getStyleClass().add("toggle-button-no-slider");
         Tooltip matchingOffersTooltip = new Tooltip(Res.get("offerbook.matchingOffers"));
         Tooltip.install(matchingOffersToggleButton, matchingOffersTooltip);
+        Accessibility.setName(matchingOffersToggleButton, Res.get("offerbook.matchingOffers"));
 
-        createOfferButton = new AutoTooltipButton("");
-        createOfferButton.setMinHeight(40);
+        createOfferButton = new AutoTooltipButton("") {
+            @Override
+            protected double computeMinWidth(double height) {
+                return computePrefWidth(height); // collapse at most to full text width, never ellipsize
+            }
+        };
         createOfferButton.setGraphicTextGap(10);
+        createOfferButton.setPrefWidth(340); // overhangs the actions + trader columns (300) for emphasis
         createOfferButton.setStyle("-fx-padding: 7 25 7 25;");
         disabledCreateOfferButtonTooltip = new Label("");
         disabledCreateOfferButtonTooltip.setMinSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
@@ -227,6 +245,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         VBox filterBox = autoToolTipTextField.first;
         filterInputField = autoToolTipTextField.third;
         filterInputField.setPromptText(Res.get("shared.filter"));
+        filterInputField.setMinWidth(80);
         filterInputField.getStyleClass().add("input-with-border");
 
         offerToolsBox.getChildren().addAll(currencyBoxTuple.first, paymentBoxTuple.first,
@@ -239,6 +258,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         root.getChildren().add(offerToolsBox);
 
         tableView = new TableView<>();
+        tableView.getStyleClass().add("large-rows");
         GUIUtil.applyTableStyle(tableView);
 
         GridPane.setRowIndex(tableView, ++gridRow);
@@ -268,6 +288,36 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
         tableView.getSortOrder().add(priceColumn);
         tableView.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
+        tableView.setRowFactory(tableView -> {
+            TableRow<OfferBookListItem> row = new TableRow<>();
+            row.setOnMouseClicked(event -> {
+                if (event.getButton() != MouseButton.PRIMARY || event.getClickCount() != 2 || row.isEmpty()) return;
+                for (Node node = (Node) event.getTarget(); node != null && node != row; node = node.getParent()) {
+                    // row actions keep their own behavior
+                    if (node instanceof ButtonBase || node instanceof PeerInfoIconTrading) return;
+                }
+                Offer offer = row.getItem().getOffer();
+                if (model.isOfferBanned(offer)) return;
+                offerDetailsWindow.show(offer);
+                event.consume();
+            });
+            return row;
+        });
+
+        // widen by the scrollbar width to keep a constant overhang past the take offer buttons, which shift with it
+        tableView.skinProperty().addListener((observable, oldValue, newValue) -> {
+            if (newValue == null) return;
+            for (Node node : tableView.lookupAll(".scroll-bar")) {
+                if (node instanceof ScrollBar bar && bar.getOrientation() == Orientation.VERTICAL) {
+                    double baseWidth = createOfferButton.getPrefWidth();
+                    ChangeListener<Object> widthUpdater = (o, oldVal, newVal) -> UserThread.execute(() ->
+                            createOfferButton.setPrefWidth(baseWidth + (bar.isVisible() ? bar.getWidth() : 0)));
+                    bar.visibleProperty().addListener(widthUpdater);
+                    bar.widthProperty().addListener(widthUpdater);
+                    break;
+                }
+            }
+        });
         Label placeholder = new AutoTooltipLabel(Res.get("table.placeholder.noItems", Res.get("shared.multipleOffers")));
         placeholder.setWrapText(true);
         tableView.setPlaceholder(placeholder);
@@ -344,10 +394,8 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
     @Override
     protected void activate() {
 
-        Map<String, Integer> offerCounts = model.getOfferCounts();
-        currencyComboBox.setCellFactory(GUIUtil.getTradeCurrencyCellFactory(Res.get("shared.oneOffer"),
-                Res.get("shared.multipleOffers"),
-                offerCounts));
+        updateCurrencyCellFactory();
+        currencyComboBox.setOnShowing(e -> updateCurrencyCellFactory());
 
         currencyComboBox.setConverter(new CurrencyStringConverter(currencyComboBox));
         currencyComboBox.getEditor().getStyleClass().add("combo-box-editor-bold");
@@ -360,6 +408,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                 return;
             model.onSetTradeCurrency(currencyComboBox.getSelectionModel().getSelectedItem());
             paymentMethodComboBox.setAutocompleteItems(model.getPaymentMethods());
+            updatePaymentMethodCellFactory();
             model.updateSelectedPaymentMethod();
             updatePaymentMethodComboBoxEditor();
             model.onSetPaymentMethod(paymentMethodComboBox.getSelectionModel().getSelectedItem());
@@ -382,6 +431,9 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                 privateOffersToggleButton.setSelected(false);
                 model.onShowPrivateOffers(false);
             }
+            paymentMethodComboBox.setAutocompleteItems(model.getPaymentMethods());
+            updatePaymentMethodCellFactory();
+            updatePaymentMethodComboBoxEditor();
         });
 
         privateOffersToggleButton.setSelected(model.showPrivateOffers);
@@ -392,6 +444,9 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                 noDepositOffersToggleButton.setSelected(false);
                 model.onShowNoDepositOffers(false);
             }
+            paymentMethodComboBox.setAutocompleteItems(model.getPaymentMethods());
+            updatePaymentMethodCellFactory();
+            updatePaymentMethodComboBoxEditor();
         });
 
         model.getOfferList().comparatorProperty().bind(tableView.comparatorProperty());
@@ -415,6 +470,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         paymentMethodComboBox.getEditor().getStyleClass().add("combo-box-editor-bold");
 
         paymentMethodComboBox.setAutocompleteItems(model.getPaymentMethods());
+        updatePaymentMethodCellFactory();
         paymentMethodComboBox.setVisibleRowCount(Math.min(paymentMethodComboBox.getItems().size(), 10));
 
         paymentMethodComboBox.setOnChangeConfirmed(e -> {
@@ -457,12 +513,29 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
         model.getOfferList().addListener(offerListListener);
         nrOfOffersLabel.setText(Res.get("offerbook.nrOffers", model.getOfferList().size()));
+        filterTextHidesOffersSubscriber = EasyBind.subscribe(model.filterTextHidesOffers, hides ->
+                GUIUtil.updateFilterPlaceholder(tableView, hides));
 
         model.priceFeedService.updateCounterProperty().addListener(priceFeedUpdateCounterListener);
 
         filterInputField.setOnKeyTyped(event -> {
             model.onFilterKeyTyped(filterInputField.getText());
         });
+    }
+
+    private void updateCurrencyCellFactory() {
+        Map<String, Integer> offerCounts = model.getOfferCounts();
+        if (offerCounts.equals(currencyOfferCounts)) return;
+        currencyOfferCounts = offerCounts;
+        currencyComboBox.setCellFactory(GUIUtil.getTradeCurrencyCellFactory(Res.get("shared.oneOffer"),
+                Res.get("shared.multipleOffers"),
+                currencyOfferCounts));
+    }
+
+    private void updatePaymentMethodCellFactory() {
+        paymentMethodComboBox.setCellFactory(GUIUtil.getPaymentMethodCellFactory(Res.get("shared.oneOffer"),
+                Res.get("shared.multipleOffers"),
+                model.getPaymentMethodOfferCounts()));
     }
 
     private void updatePaymentMethodComboBoxEditor() {
@@ -493,6 +566,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
     @Override
     protected void deactivate() {
+        currencyComboBox.setOnShowing(null);
         createOfferButton.setOnAction(null);
         matchingOffersToggleButton.setOnAction(null);
         matchingOffersToggleButton.disableProperty().unbind();
@@ -510,6 +584,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         model.priceFeedService.updateCounterProperty().removeListener(priceFeedUpdateCounterListener);
 
         currencySelectionSubscriber.unsubscribe();
+        filterTextHidesOffersSubscriber.unsubscribe();
     }
 
     static class CurrencyStringConverter extends StringConverter<TradeCurrency> {
@@ -614,7 +689,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
     public void setDirection(OfferDirection direction) {
         model.initWithDirection(direction);
-        createOfferButton.setGraphic(GUIUtil.getCurrencyIconWithBorder(Res.getBaseCurrencyCode()));
+        createOfferButton.setGraphic(GUIUtil.getCurrencyIconWithBorder(Res.getBaseCurrencyCode(), 26, 1));
         createOfferButton.setContentDisplay(ContentDisplay.RIGHT);
         createOfferButton.setId(direction == OfferDirection.SELL ? "sell-button-big" : "buy-button-big");
         avatarColumn.setTitle(direction == OfferDirection.SELL ? Res.get("shared.buyerUpperCase") : Res.get("shared.sellerUpperCase"));
@@ -638,7 +713,9 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
         if (isSelected) {
             updateCurrencyComboBoxFromModel();
-            root.requestFocus();
+            Node focusOwner = root.getScene() == null ? null : root.getScene().getFocusOwner();
+            if (focusOwner == null || focusOwner.getAccessibleRole() != AccessibleRole.TAB_ITEM)
+                root.requestFocus(); // keep focus on a tab the user is navigating so screen readers announce it
             updateCreateOfferButton();
         }
         updateCreateOfferButton();
@@ -1019,6 +1096,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                                         setGraphic(new AutoTooltipLabel(model.getPaymentMethod(item)));
                                     } else {
                                         field = new HyperlinkWithIcon(model.getPaymentMethod(item));
+                                        field.hideIcon();
                                         field.setOnAction(event -> {
                                             offerDetailsWindow.show(offer);
                                         });
@@ -1088,7 +1166,9 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
     private TableColumn<OfferBookListItem, OfferBookListItem> getActionColumn() {
         TableColumn<OfferBookListItem, OfferBookListItem> column = new AutoTooltipTableColumn<>(Res.get("shared.actions")) {
             {
-                setMinWidth(180);
+                // fixed width fitting the buttons; extra space goes to the other columns
+                setMinWidth(225);
+                setMaxWidth(225);
                 setSortable(false);
             }
         };
@@ -1112,15 +1192,17 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                                     button.setGraphic(iconView);
                                     button.setGraphicTextGap(10);
                                     button.setPrefWidth(10000);
+                                    button.setStyle("-fx-min-height: 30;"); // inline to beat the 32px stylesheet floor
                                 }
     
-                                MaterialDesignIconView iconView2 = new MaterialDesignIconView(MaterialDesignIcon.PENCIL);
+                                Text iconView2 = GlyphsDude.createIcon(MaterialDesignIcon.PENCIL);
                                 final AutoTooltipButton button2 = new AutoTooltipButton();
     
                                 {
                                     button2.setGraphic(iconView2);
                                     button2.setGraphicTextGap(10);
                                     button2.setPrefWidth(10000);
+                                    button2.setStyle("-fx-min-height: 30;");
                                 }
     
                                 final HBox hbox = new HBox();
@@ -1172,7 +1254,8 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                                         title = Res.get("shared.remove");
                                         button.setOnAction(e -> onRemoveOpenOffer(offer));
 
-                                        iconView2.setSize("16px");
+                                        iconView2.setStyle(String.format("-fx-font-family: %s; -fx-font-size: %s;",
+                                                MaterialDesignIcon.PENCIL.fontFamily(), "16px"));
                                         button2.updateText(Res.get("shared.edit"));
                                         button2.setOnAction(e -> onEditOpenOffer(offer));
                                         button2.setManaged(true);
@@ -1188,7 +1271,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
                                             iconView.setFitWidth(16);
                                         }
                                         button.setId(isSellOffer ? "buy-button" : "sell-button");
-                                        button.setStyle("-fx-text-fill: white");
+                                        button.setStyle("-fx-text-fill: white; -fx-min-height: 30;");
                                         title = Res.get(isSellOffer ? "mainView.menu.buyXmr" : "mainView.menu.sellXmr");
                                         button.setTooltip(new Tooltip(Res.get("offerbook.takeOfferButton.tooltip", model.getDirectionLabelTooltip(offer))));
                                         button.setOnAction(e -> onTakeOffer(offer));

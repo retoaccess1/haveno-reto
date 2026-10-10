@@ -19,6 +19,8 @@ package haveno.network.p2p.peers;
 
 import com.google.common.annotations.VisibleForTesting;
 import static com.google.common.base.Preconditions.checkArgument;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.inject.Inject;
 import com.google.inject.name.Named;
 import haveno.common.ClockWatcher;
@@ -35,6 +37,7 @@ import haveno.network.p2p.network.Connection;
 import haveno.network.p2p.network.ConnectionListener;
 import haveno.network.p2p.network.InboundConnection;
 import haveno.network.p2p.network.NetworkNode;
+import haveno.network.p2p.network.OutboundConnection;
 import haveno.network.p2p.network.PeerType;
 import haveno.network.p2p.network.RuleViolation;
 import haveno.network.p2p.peers.peerexchange.Peer;
@@ -44,9 +47,12 @@ import haveno.network.utils.EventThrottler;
 import haveno.network.utils.EventThrottler.ThrottleResult;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
@@ -67,6 +73,7 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     private static final long CHECK_MAX_CONN_DELAY_SEC = 10;
+    private static final long RECOVERY_GRACE_PERIOD_SEC = 10; // connectivity must survive this long to declare recovery from all connections lost
     // Use a long delay as the bootstrapping peer might need a while until it knows its onion address
     private static final long REMOVE_ANONYMOUS_PEER_SEC = 240;
 
@@ -118,10 +125,21 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
     private final Set<Peer> reportedPeers = new HashSet<>();
     // Most recent peers with activity date of last 30 min.
     private final Set<Peer> latestLivePeers = new HashSet<>();
+    // Peers detected on a different P2P network; never dialed or re-added, bounded with eldest-first eviction
+    private static final int MAX_WRONG_NETWORK_PEERS = 2000;
+    private final Set<NodeAddress> wrongNetworkPeers = Collections.synchronizedSet(new LinkedHashSet<>());
+    // Peers evicted after repeated silent failures may be retried after the cooldown
+    private final Cache<NodeAddress, Boolean> failedPeers = CacheBuilder.newBuilder()
+            .maximumSize(2000)
+            .expireAfterWrite(1, TimeUnit.HOURS)
+            .build();
 
     private Timer checkMaxConnectionsTimer;
+    private Timer recoveryGraceTimer;
+    private int recoveryGraceEpoch; // invalidates in-flight recovery grace timers when incremented
     private boolean stopped;
     private boolean lostAllConnections;
+    private boolean lostAllConnectionsReported; // whether listeners were notified for the current loss episode
     private int maxConnections;
 
     @Getter
@@ -187,6 +205,7 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
         clockWatcher.removeListener(clockWatcherListener);
 
         stopCheckMaxConnectionsTimer();
+        stopRecoveryGraceTimer();
 
         if (printStatisticsTimer != null) {
             printStatisticsTimer.stop();
@@ -221,19 +240,24 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
 
         numOnConnections++;
 
-        if (lostAllConnections) {
-            lostAllConnections = false;
-            stopped = false;
-            log.info("\n------------------------------------------------------------\n" +
-                    "Established a new connection from/to {} after all connections lost.\n" +
-                    "------------------------------------------------------------", connection.getPeersNodeAddressOptional());
-            synchronized (listeners) {
-                listeners.forEach(Listener::onNewConnectionAfterAllConnectionsLost);
-            }
+        if (lostAllConnections && recoveryGraceTimer == null) {
+            int epoch = recoveryGraceEpoch;
+            recoveryGraceTimer = ThreadUtils.runAfter(() -> ThreadUtils.execute(() -> { // serialize with connection events
+                if (shutDownRequested || epoch != recoveryGraceEpoch) return; // timer was stopped after expiry
+                recoveryGraceTimer = null;
+                if (networkNode.getAllConnections().stream().allMatch(Connection::isStopped)) return; // require a live connection to declare recovery
+                lostAllConnections = false;
+                lostAllConnectionsReported = false;
+                stopped = false;
+                log.info("\n------------------------------------------------------------\n" +
+                        "Connectivity recovered after all connections lost.\n" +
+                        "------------------------------------------------------------");
+                synchronized (listeners) {
+                    listeners.forEach(Listener::onNewConnectionAfterAllConnectionsLost);
+                }
+                doHouseKeeping();
+            }, Connection.THREAD_ID), RECOVERY_GRACE_PERIOD_SEC);
         }
-        connection.getPeersNodeAddressOptional()
-                .flatMap(this::findPeer)
-                .ifPresent(Peer::onConnection);
     }
 
     @Override
@@ -242,25 +266,52 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
                 connection.getPeersNodeAddressOptional(), closeConnectionReason);
         handleConnectionFault(connection);
 
-        boolean previousLostAllConnections = lostAllConnections;
-        lostAllConnections = networkNode.getAllConnections().isEmpty();
-
-        // At start-up we ignore if we would lose a connection and would fall back to no connections
-        if (lostAllConnections && numOnConnections > 2) {
-            stopped = true;
-
-            if (!shutDownRequested) {
-                if (!previousLostAllConnections) {
-                    // If we enter to 'All connections lost' we count the event.
-                    numAllConnectionsLostEvents++;
+        // score each outbound connection once; only a silent unintended close accrues a failure
+        // partial responses are not silent, and inbound addresses are unverified
+        if (connection instanceof OutboundConnection && connection.tryAccountPeerFault()) {
+            boolean receivedData = connection.getStatistic().getReceivedBytes() > 0;
+            if (receivedData && connection.getRuleViolation() == null) {
+                connection.getPeersNodeAddressOptional().ifPresent(failedPeers::invalidate);
+            }
+            connection.getPeersNodeAddressOptional().flatMap(this::findPersistedPeer).ifPresent(peer -> {
+                if (receivedData) {
+                    peer.onConnection();
+                } else if (!closeConnectionReason.isIntended && connection.getLastReadTimestamp() == 0) {
+                    peer.onDisconnect();
+                    if (peer.tooManyFailedConnectionAttempts()) {
+                        if (!isSeedNode(peer.getNodeAddress())) {
+                            failedPeers.put(peer.getNodeAddress(), true);
+                            log.info("Pausing peer discovery to {} for one hour after repeated silent connection failures", peer.getNodeAddress());
+                        }
+                        removePersistedPeer(peer.getNodeAddress());
+                    }
                 }
+            });
+        }
 
-                log.warn("\n------------------------------------------------------------\n" +
-                        "All connections lost\n" +
-                        "------------------------------------------------------------");
+        boolean previousLostAllConnections = lostAllConnections;
+        if (networkNode.getAllConnections().isEmpty()) {
+            boolean newLossEvent = !previousLostAllConnections || recoveryGraceTimer != null; // a failed recovery attempt counts as a new loss event
+            lostAllConnections = true; // remains set until recovery is declared after the grace period
+            stopRecoveryGraceTimer(); // a fresh grace period starts with the next connection
 
-                synchronized (listeners) {
-                    listeners.forEach(Listener::onAllConnectionsLost);
+            // At start-up we ignore if we would lose a connection and would fall back to no connections
+            if (numOnConnections > 2) {
+                stopped = true;
+                if (!shutDownRequested) {
+                    if (newLossEvent) numAllConnectionsLostEvents++;
+
+                    // only notify listeners once per loss episode, not on repeats while still lost
+                    if (!lostAllConnectionsReported) {
+                        lostAllConnectionsReported = true;
+                        log.warn("\n------------------------------------------------------------\n" +
+                                "All connections lost\n" +
+                                "------------------------------------------------------------");
+
+                        synchronized (listeners) {
+                            listeners.forEach(Listener::onAllConnectionsLost);
+                        }
+                    }
                 }
             }
         }
@@ -290,16 +341,17 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
     }
 
     public void handleConnectionFault(NodeAddress nodeAddress, @Nullable Connection connection) {
-        boolean doRemovePersistedPeer = false;
-        removeReportedPeer(nodeAddress);
-        Optional<Peer> persistedPeerOptional = findPersistedPeer(nodeAddress);
-        if (persistedPeerOptional.isPresent()) {
-            Peer persistedPeer = persistedPeerOptional.get();
-            persistedPeer.onDisconnect();
-            doRemovePersistedPeer = persistedPeer.tooManyFailedConnectionAttempts();
-        }
+        // inbound faults are no evidence against the peer, whose address is an unverified claim
+        if (connection instanceof InboundConnection) return;
+        // the peer failure counter is adjusted only at onDisconnect by outbound connection outcomes
+        boolean isOffline = connection == null && networkNode.getAllConnections().isEmpty();
+        if (!isOffline) removeReportedPeer(nodeAddress);
         boolean ruleViolation = connection != null && connection.getRuleViolation() != null;
-        doRemovePersistedPeer = doRemovePersistedPeer || ruleViolation;
+        boolean doRemovePersistedPeer = ruleViolation ||
+                findPersistedPeer(nodeAddress).map(Peer::tooManyFailedConnectionAttempts).orElse(false);
+
+        // never dial or re-add peers detected on a different P2P network
+        if (connection != null && connection.getRuleViolation() == RuleViolation.WRONG_NETWORK_ID) blocklistWrongNetworkPeer(nodeAddress);
 
         if (doRemovePersistedPeer)
             removePersistedPeer(nodeAddress);
@@ -317,6 +369,26 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
                 synchronized (reportedPeers) {
                     reportedPeers.removeIf(peer -> peer.getNodeAddress().equals(optionalNodeAddress.get()));
                 }
+            }
+        }
+    }
+
+    public boolean isWrongNetworkPeer(NodeAddress nodeAddress) {
+        return wrongNetworkPeers.contains(nodeAddress);
+    }
+
+    public boolean isPeerUnavailable(NodeAddress nodeAddress) {
+        return isWrongNetworkPeer(nodeAddress) || failedPeers.getIfPresent(nodeAddress) != null;
+    }
+
+    private void blocklistWrongNetworkPeer(NodeAddress nodeAddress) {
+        synchronized (wrongNetworkPeers) {
+            wrongNetworkPeers.remove(nodeAddress); // re-insert so eviction order tracks the latest detection
+            wrongNetworkPeers.add(nodeAddress);
+            if (wrongNetworkPeers.size() > MAX_WRONG_NETWORK_PEERS) {
+                Iterator<NodeAddress> it = wrongNetworkPeers.iterator();
+                it.next();
+                it.remove();
             }
         }
     }
@@ -392,29 +464,29 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
                                    Capabilities capabilities) {
         applyCapabilities(connection, capabilities);
 
+        // an oversized list is a rule violation which shuts down the connection on the 2nd offense;
+        // check the raw count before filtering, so filtered-out entries cannot mask an oversized list
+        if (reportedPeersToAdd.size() > (MAX_REPORTED_PEERS + maxConnectionsAbsolute + 10)) {
+            connection.reportInvalidRequest(RuleViolation.TOO_MANY_REPORTED_PEERS_SENT, "Too many reported peers sent");
+            return;
+        }
+
         Set<Peer> peers = reportedPeersToAdd.stream()
                 .filter(peer -> !isSelf(peer.getNodeAddress()))
+                .filter(peer -> !isPeerUnavailable(peer.getNodeAddress()))
                 .collect(Collectors.toSet());
 
         printNewReportedPeers(peers);
 
-        // We check if the reported msg is not violating our rules
-        if (peers.size() <= (MAX_REPORTED_PEERS + maxConnectionsAbsolute + 10)) {
-            synchronized (reportedPeers) {
-                reportedPeers.addAll(peers);
-                purgeReportedPeersIfExceeds();
+        synchronized (reportedPeers) {
+            reportedPeers.addAll(peers);
+            purgeReportedPeersIfExceeds();
 
-                peerList.addAll(peers);
-                purgePersistedPeersIfExceeds();
-                requestPersistence();
+            peerList.addAll(peers);
+            purgePersistedPeersIfExceeds();
+            requestPersistence();
 
-                printReportedPeers();
-            }
-        } else {
-            // If a node is trying to send too many list we treat it as rule violation.
-            // Reported list include the connected list. We use the max value and give some extra headroom.
-            // Will trigger a shutdown after 2nd time sending too much
-            connection.reportInvalidRequest(RuleViolation.TOO_MANY_REPORTED_PEERS_SENT, "Too many reported peers sent");
+            printReportedPeers();
         }
     }
 
@@ -435,6 +507,7 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
             latestLivePeers.clear();
             Set<Peer> recentPeers = peers.stream()
                     .filter(peer -> peer.getDateAsLong() > maxAge)
+                    .filter(peer -> !isPeerUnavailable(peer.getNodeAddress()))
                     .collect(Collectors.toSet());
             latestLivePeers.addAll(recentPeers);
 
@@ -861,6 +934,8 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
         // networkNode.getConfirmedConnections includes:
         // filter(connection -> connection.getPeersNodeAddressOptional().isPresent())
         return networkNode.getConfirmedConnections().stream()
+                // A dial target is not live until it has sent a valid message
+                .filter(connection -> !connection.isStopped() && connection.getStatistic().getLastReceivedMessageTimestamp() > 0)
                 .map((Connection connection) -> {
                     Capabilities supportedCapabilities = new Capabilities(connection.getCapabilities());
                     // If we have a new connection the supportedCapabilities is empty.
@@ -903,6 +978,14 @@ public final class PeerManager implements ConnectionListener, PersistedDataHost 
         if (checkMaxConnectionsTimer != null) {
             checkMaxConnectionsTimer.stop();
             checkMaxConnectionsTimer = null;
+        }
+    }
+
+    private void stopRecoveryGraceTimer() {
+        recoveryGraceEpoch++;
+        if (recoveryGraceTimer != null) {
+            recoveryGraceTimer.stop();
+            recoveryGraceTimer = null;
         }
     }
 

@@ -24,7 +24,10 @@ import haveno.common.util.Tuple2;
 import haveno.common.util.Tuple3;
 import haveno.common.util.Utilities;
 import haveno.core.account.witness.AccountAgeWitnessService;
+import haveno.core.locale.Country;
+import haveno.core.locale.CountryUtil;
 import haveno.core.locale.Res;
+import haveno.core.locale.TradeCurrency;
 import haveno.core.offer.OfferRestrictions;
 import haveno.core.payment.AmazonGiftCardAccount;
 import haveno.core.payment.AustraliaPayidAccount;
@@ -60,11 +63,15 @@ import haveno.core.payment.validation.InteracETransferValidator;
 import haveno.core.payment.validation.JapanBankTransferValidator;
 import haveno.core.payment.validation.LengthValidator;
 import haveno.core.payment.validation.MoneyBeamValidator;
+import haveno.core.payment.validation.PagoMovilValidator;
 import haveno.core.payment.validation.PerfectMoneyValidator;
 import haveno.core.payment.validation.PopmoneyValidator;
 import haveno.core.payment.validation.PromptPayValidator;
 import haveno.core.payment.validation.RevolutValidator;
 import haveno.core.payment.validation.SwishValidator;
+import haveno.core.payment.validation.TwintValidator;
+import haveno.core.payment.validation.WeroValidator;
+import haveno.core.payment.validation.MbWayValidator;
 import haveno.core.payment.validation.TransferwiseValidator;
 import haveno.core.payment.validation.USPostalMoneyOrderValidator;
 import haveno.core.payment.validation.UpholdValidator;
@@ -81,6 +88,7 @@ import haveno.desktop.components.paymentmethods.AliPayForm;
 import haveno.desktop.components.paymentmethods.AmazonGiftCardForm;
 import haveno.desktop.components.paymentmethods.AustraliaPayidForm;
 import haveno.desktop.components.paymentmethods.BizumForm;
+import haveno.desktop.components.paymentmethods.BlikForm;
 import haveno.desktop.components.paymentmethods.CapitualForm;
 import haveno.desktop.components.paymentmethods.CashAppForm;
 import haveno.desktop.components.paymentmethods.CashAtAtmForm;
@@ -90,6 +98,15 @@ import haveno.desktop.components.paymentmethods.ChaseQuickPayForm;
 import haveno.desktop.components.paymentmethods.DomesticWireTransferForm;
 import haveno.desktop.components.paymentmethods.F2FForm;
 import haveno.desktop.components.paymentmethods.FasterPaymentsForm;
+import haveno.desktop.components.paymentmethods.DuitNowForm;
+import haveno.desktop.components.paymentmethods.MbWayForm;
+import haveno.desktop.components.paymentmethods.PayPayForm;
+import haveno.desktop.components.paymentmethods.SbpForm;
+import haveno.desktop.components.paymentmethods.MirForm;
+import haveno.desktop.components.paymentmethods.YooMoneyForm;
+import haveno.desktop.components.paymentmethods.UkraineCardForm;
+import haveno.desktop.components.paymentmethods.KaspiForm;
+import haveno.desktop.components.paymentmethods.FpsForm;
 import haveno.desktop.components.paymentmethods.HalCashForm;
 import haveno.desktop.components.paymentmethods.ImpsForm;
 import haveno.desktop.components.paymentmethods.InteracETransferForm;
@@ -97,6 +114,17 @@ import haveno.desktop.components.paymentmethods.JapanBankTransferForm;
 import haveno.desktop.components.paymentmethods.MoneseForm;
 import haveno.desktop.components.paymentmethods.MoneyBeamForm;
 import haveno.desktop.components.paymentmethods.MoneyGramForm;
+import haveno.desktop.components.paymentmethods.NipForm;
+import haveno.desktop.components.paymentmethods.PagoMovilForm;
+import haveno.desktop.components.paymentmethods.PaparaForm;
+import haveno.desktop.components.paymentmethods.RaastForm;
+import haveno.desktop.components.paymentmethods.PayNowForm;
+import haveno.desktop.components.paymentmethods.QrisForm;
+import haveno.desktop.components.paymentmethods.GcashForm;
+import haveno.desktop.components.paymentmethods.MercadoPagoForm;
+import haveno.desktop.components.paymentmethods.MomoForm;
+import haveno.desktop.components.paymentmethods.SpeiForm;
+import haveno.desktop.components.paymentmethods.MpesaForm;
 import haveno.desktop.components.paymentmethods.NationalBankForm;
 import haveno.desktop.components.paymentmethods.NeftForm;
 import haveno.desktop.components.paymentmethods.NequiForm;
@@ -124,12 +152,15 @@ import haveno.desktop.components.paymentmethods.SwishForm;
 import haveno.desktop.components.paymentmethods.TikkieForm;
 import haveno.desktop.components.paymentmethods.TransferwiseForm;
 import haveno.desktop.components.paymentmethods.TransferwiseUsdForm;
+import haveno.desktop.components.paymentmethods.TwintForm;
 import haveno.desktop.components.paymentmethods.USPostalMoneyOrderForm;
 import haveno.desktop.components.paymentmethods.UpholdForm;
 import haveno.desktop.components.paymentmethods.UpiForm;
 import haveno.desktop.components.paymentmethods.VenmoForm;
 import haveno.desktop.components.paymentmethods.VerseForm;
+import haveno.desktop.components.paymentmethods.VippsMobilePayForm;
 import haveno.desktop.components.paymentmethods.WeChatPayForm;
+import haveno.desktop.components.paymentmethods.WeroForm;
 import haveno.desktop.components.paymentmethods.WesternUnionForm;
 import haveno.desktop.components.paymentmethods.ZelleForm;
 import haveno.desktop.main.account.content.PaymentAccountsView;
@@ -143,8 +174,14 @@ import static haveno.desktop.util.FormBuilder.addTopLabelListView;
 import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.Layout;
 import java.math.BigInteger;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.StringUtils;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.scene.control.Button;
@@ -168,6 +205,10 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
     private final AliPayValidator aliPayValidator;
     private final PerfectMoneyValidator perfectMoneyValidator;
     private final SwishValidator swishValidator;
+    private final TwintValidator twintValidator;
+    private final WeroValidator weroValidator;
+    private final MbWayValidator mbWayValidator;
+    private final PagoMovilValidator pagoMovilValidator;
     private final EmailOrMobileNrValidator zelleValidator;
     private final EmailOrMobileNrOrUsernameValidator paypalValidator;
     private final EmailOrMobileNrOrUsernameValidator venmoValidator;
@@ -202,6 +243,10 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
                             AliPayValidator aliPayValidator,
                             PerfectMoneyValidator perfectMoneyValidator,
                             SwishValidator swishValidator,
+                            TwintValidator twintValidator,
+                            WeroValidator weroValidator,
+                            MbWayValidator mbWayValidator,
+                            PagoMovilValidator pagoMovilValidator,
                             EmailOrMobileNrValidator zelleValidator,
                             EmailOrMobileNrOrCashtagValidator cashAppValidator,
                             EmailOrMobileNrOrUsernameValidator emailMobileUsernameValidator,
@@ -232,6 +277,10 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
         this.aliPayValidator = aliPayValidator;
         this.perfectMoneyValidator = perfectMoneyValidator;
         this.swishValidator = swishValidator;
+        this.twintValidator = twintValidator;
+        this.weroValidator = weroValidator;
+        this.mbWayValidator = mbWayValidator;
+        this.pagoMovilValidator = pagoMovilValidator;
         this.zelleValidator = zelleValidator;
         this.paypalValidator = emailMobileUsernameValidator;
         this.venmoValidator = emailMobileUsernameValidator;
@@ -484,6 +533,7 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
                 .sorted()
                 .collect(Collectors.toList());
         paymentMethodComboBox.setAutocompleteItems(FXCollections.observableArrayList(list));
+        paymentMethodComboBox.setQueryFilter(getPaymentMethodQueryFilter(list));
         paymentMethodComboBox.setConverter(new StringConverter<>() {
             @Override
             public String toString(PaymentMethod paymentMethod) {
@@ -527,6 +577,40 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
                 GridPane.setRowSpan(accountTitledGroupBg, paymentMethodForm.getRowSpan() + 1);
             }
         });
+    }
+
+    // Method names take precedence over partial country matches; exact country names and codes still match.
+    private static Function<String, Predicate<PaymentMethod>> getPaymentMethodQueryFilter(List<PaymentMethod> methods) {
+        Map<PaymentMethod, String> currencyTextByMethod = new HashMap<>();
+        Map<PaymentMethod, Set<String>> countryCodesByMethod = new HashMap<>();
+        for (PaymentMethod method : methods) {
+            PaymentAccount account = PaymentAccountFactory.getPaymentAccount(method);
+            currencyTextByMethod.put(method, account.getSupportedCurrencies().stream()
+                    .map(TradeCurrency::getCodeAndName).collect(Collectors.joining(" ")));
+            List<Country> countries = account.getSupportedCountries();
+            if (countries != null) countryCodesByMethod.put(method, countries.stream().map(country -> country.code).collect(Collectors.toSet()));
+        }
+        return query -> {
+            Predicate<PaymentMethod> matchesName = method -> StringUtils.containsIgnoreCase(Res.get(method.getId()), query);
+            boolean matchesMethodName = methods.stream().anyMatch(matchesName);
+            Set<String> queriedCountryCodes = CountryUtil.getAllCountries().stream()
+                    .filter(country -> country.code.equalsIgnoreCase(query) || country.name.equalsIgnoreCase(query)
+                            || (!matchesMethodName && countryMatches(country, query)))
+                    .map(country -> country.code).collect(Collectors.toSet());
+            return method -> {
+                if (matchesName.test(method)) return true;
+                Set<String> supported = countryCodesByMethod.get(method);
+                if (!queriedCountryCodes.isEmpty()) return supported == null || supported.stream().anyMatch(queriedCountryCodes::contains);
+                return StringUtils.containsIgnoreCase(currencyTextByMethod.get(method), query);
+            };
+        };
+    }
+
+    // A query names a country when it matches the code or leads the name or one of its words.
+    private static boolean countryMatches(Country country, String query) {
+        if (country.code.equalsIgnoreCase(query) || StringUtils.startsWithIgnoreCase(country.name, query)) return true;
+        for (String word : country.name.split(" ")) if (StringUtils.startsWithIgnoreCase(word, query)) return true;
+        return false;
     }
 
     // Select account form
@@ -656,6 +740,16 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
                 return new PaytmForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
             case PaymentMethod.NEQUI_ID:
                 return new NequiForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.MPESA_ID:
+                return new MpesaForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.MERCADO_PAGO_ID:
+                return new MercadoPagoForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.GCASH_ID:
+                return new GcashForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.MOMO_ID:
+                return new MomoForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.SPEI_ID:
+                return new SpeiForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
             case PaymentMethod.BIZUM_ID:
                 return new BizumForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
             case PaymentMethod.PIX_ID:
@@ -690,6 +784,44 @@ public class TraditionalAccountsView extends PaymentAccountsView<GridPane, Tradi
                 return new CashAppForm(paymentAccount, accountAgeWitnessService, cashAppValidator, inputValidator, root, gridRow, formatter);
             case PaymentMethod.PAYSAFE_ID:
                 return new PaysafeForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.BLIK_ID:
+                return new BlikForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.VIPPS_MOBILEPAY_ID:
+                return new VippsMobilePayForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.TWINT_ID:
+                return new TwintForm(paymentAccount, accountAgeWitnessService, twintValidator, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.NIP_ID:
+                return new NipForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.PAGO_MOVIL_ID:
+                return new PagoMovilForm(paymentAccount, accountAgeWitnessService, pagoMovilValidator, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.QRIS_ID:
+                return new QrisForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.PAPARA_ID:
+                return new PaparaForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.RAAST_ID:
+                return new RaastForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.PAYNOW_ID:
+                return new PayNowForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.WERO_ID:
+                return new WeroForm(paymentAccount, accountAgeWitnessService, weroValidator, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.FPS_ID:
+                return new FpsForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.DUITNOW_ID:
+                return new DuitNowForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.MB_WAY_ID:
+                return new MbWayForm(paymentAccount, accountAgeWitnessService, mbWayValidator, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.PAYPAY_ID:
+                return new PayPayForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.SBP_ID:
+                return new SbpForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.MIR_ID:
+                return new MirForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.YOOMONEY_ID:
+                return new YooMoneyForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.UKRAINE_CARD_ID:
+                return new UkraineCardForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
+            case PaymentMethod.KASPI_ID:
+                return new KaspiForm(paymentAccount, accountAgeWitnessService, inputValidator, root, gridRow, formatter);
             default:
                 log.error("Not supported PaymentMethod: " + paymentMethod);
                 return null;

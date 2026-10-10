@@ -51,16 +51,18 @@ If it's the first time you are building Haveno, run the following commands to do
 ```
 git clone https://github.com/haveno-dex/haveno.git
 cd haveno
-git checkout v1.2.3
+git checkout v1.10.0
 make
 ```
 
 *If you only want to quickly build the binaries, use `make skip-tests` instead of `make`. It will skip the tests and increase the build speed drastically.*
 
+Run `make help` for all build targets (daemon JAR, desktop JAR, packaging, etc.).
+
 If you are updating from a previous version, run from the root of the repository:
 
 ```
-git checkout v1.2.3
+git checkout v1.10.0
 git pull
 make clean && make
 ```

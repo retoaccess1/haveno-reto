@@ -20,6 +20,7 @@ package haveno.desktop.main.portfolio.closedtrades;
 import com.google.inject.Inject;
 
 import haveno.common.UserThread;
+import haveno.common.ThreadUtils;
 import haveno.core.account.witness.AccountAgeWitnessService;
 import haveno.core.monetary.Price;
 import haveno.core.monetary.Volume;
@@ -35,6 +36,7 @@ import haveno.core.user.Preferences;
 import haveno.core.util.PriceUtil;
 import haveno.core.util.VolumeUtil;
 import haveno.desktop.common.model.ActivatableDataModel;
+import javafx.beans.Observable;
 import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
@@ -51,7 +53,8 @@ class ClosedTradesDataModel extends ActivatableDataModel {
     private final Preferences preferences;
     private final PriceFeedService priceFeedService;
     final AccountAgeWitnessService accountAgeWitnessService;
-    private final ObservableList<ClosedTradesListItem> list = FXCollections.observableArrayList();
+    private final ObservableList<ClosedTradesListItem> list = FXCollections.observableArrayList(item ->
+            item.getTradable() instanceof Trade trade ? new Observable[]{trade.payoutStateProperty()} : new Observable[0]);
     private final ListChangeListener<Tradable> tradesListChangeListener;
     private final TradeManager tradeManager;
 
@@ -139,6 +142,6 @@ class ClosedTradesDataModel extends ActivatableDataModel {
     }
 
     public void onMoveTradeToPendingTrades(Trade trade) {
-        tradeManager.onMoveClosedTradeToPendingTrades(trade);
+        ThreadUtils.execute(() -> tradeManager.onMoveClosedTradeToPendingTrades(trade), trade.getId());
     }
 }

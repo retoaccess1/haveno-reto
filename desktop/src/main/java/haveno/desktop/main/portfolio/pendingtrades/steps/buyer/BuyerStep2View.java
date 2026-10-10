@@ -17,15 +17,16 @@
 
 package haveno.desktop.main.portfolio.pendingtrades.steps.buyer;
 
+import javafx.animation.PauseTransition;
+import javafx.util.Duration;
 import haveno.common.Timer;
 import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.common.util.Tuple4;
 import haveno.core.locale.Res;
-import haveno.core.offer.Offer;
 import haveno.core.payment.PaymentAccount;
-import haveno.core.payment.PaymentAccountUtil;
 import haveno.core.payment.payload.AssetAccountPayload;
+import haveno.core.payment.payload.BlikAccountPayload;
 import haveno.core.payment.payload.CashDepositAccountPayload;
 import haveno.core.payment.payload.F2FAccountPayload;
 import haveno.core.payment.payload.FasterPaymentsAccountPayload;
@@ -41,8 +42,6 @@ import haveno.core.trade.Trade;
 import haveno.core.user.DontShowAgainLookup;
 import haveno.core.util.VolumeUtil;
 import haveno.desktop.components.BusyAnimation;
-import haveno.desktop.components.TextFieldWithCopyIcon;
-import haveno.desktop.components.TitledGroupBg;
 import haveno.desktop.components.paymentmethods.AchTransferForm;
 import haveno.desktop.components.paymentmethods.AdvancedCashForm;
 import haveno.desktop.components.paymentmethods.AliPayForm;
@@ -50,6 +49,7 @@ import haveno.desktop.components.paymentmethods.AmazonGiftCardForm;
 import haveno.desktop.components.paymentmethods.AssetsForm;
 import haveno.desktop.components.paymentmethods.AustraliaPayidForm;
 import haveno.desktop.components.paymentmethods.BizumForm;
+import haveno.desktop.components.paymentmethods.BlikForm;
 import haveno.desktop.components.paymentmethods.CapitualForm;
 import haveno.desktop.components.paymentmethods.CashAppForm;
 import haveno.desktop.components.paymentmethods.CashAtAtmForm;
@@ -70,7 +70,28 @@ import haveno.desktop.components.paymentmethods.JapanBankTransferForm;
 import haveno.desktop.components.paymentmethods.MoneseForm;
 import haveno.desktop.components.paymentmethods.MoneyBeamForm;
 import haveno.desktop.components.paymentmethods.MoneyGramForm;
+import haveno.desktop.components.paymentmethods.NipForm;
+import haveno.desktop.components.paymentmethods.PagoMovilForm;
+import haveno.desktop.components.paymentmethods.PaparaForm;
+import haveno.desktop.components.paymentmethods.RaastForm;
+import haveno.desktop.components.paymentmethods.PayNowForm;
+import haveno.desktop.components.paymentmethods.WeroForm;
+import haveno.desktop.components.paymentmethods.DuitNowForm;
+import haveno.desktop.components.paymentmethods.MbWayForm;
+import haveno.desktop.components.paymentmethods.PayPayForm;
+import haveno.desktop.components.paymentmethods.SbpForm;
+import haveno.desktop.components.paymentmethods.MirForm;
+import haveno.desktop.components.paymentmethods.YooMoneyForm;
+import haveno.desktop.components.paymentmethods.UkraineCardForm;
+import haveno.desktop.components.paymentmethods.KaspiForm;
+import haveno.desktop.components.paymentmethods.FpsForm;
+import haveno.desktop.components.paymentmethods.QrisForm;
 import haveno.desktop.components.paymentmethods.NationalBankForm;
+import haveno.desktop.components.paymentmethods.GcashForm;
+import haveno.desktop.components.paymentmethods.MercadoPagoForm;
+import haveno.desktop.components.paymentmethods.MomoForm;
+import haveno.desktop.components.paymentmethods.SpeiForm;
+import haveno.desktop.components.paymentmethods.MpesaForm;
 import haveno.desktop.components.paymentmethods.NeftForm;
 import haveno.desktop.components.paymentmethods.NequiForm;
 import haveno.desktop.components.paymentmethods.PaxumForm;
@@ -93,44 +114,48 @@ import haveno.desktop.components.paymentmethods.SwishForm;
 import haveno.desktop.components.paymentmethods.TikkieForm;
 import haveno.desktop.components.paymentmethods.TransferwiseForm;
 import haveno.desktop.components.paymentmethods.TransferwiseUsdForm;
+import haveno.desktop.components.paymentmethods.TwintForm;
 import haveno.desktop.components.paymentmethods.USPostalMoneyOrderForm;
 import haveno.desktop.components.paymentmethods.UpholdForm;
 import haveno.desktop.components.paymentmethods.UpiForm;
 import haveno.desktop.components.paymentmethods.VenmoForm;
 import haveno.desktop.components.paymentmethods.VerseForm;
+import haveno.desktop.components.paymentmethods.VippsMobilePayForm;
 import haveno.desktop.components.paymentmethods.WeChatPayForm;
 import haveno.desktop.components.paymentmethods.WesternUnionForm;
 import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.main.portfolio.pendingtrades.PendingTradesViewModel;
 import haveno.desktop.main.portfolio.pendingtrades.steps.TradeStepView;
-import haveno.desktop.util.Layout;
-import javafx.geometry.Insets;
+import haveno.desktop.main.portfolio.pendingtrades.TradeFormPane;
+import haveno.desktop.main.portfolio.pendingtrades.steps.TradeConfirmationPane;
+import haveno.common.util.Utilities;
+import javafx.geometry.Pos;
+import javafx.scene.control.Hyperlink;
+import javafx.scene.Node;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
-import javafx.scene.control.TextArea;
 import javafx.scene.layout.ColumnConstraints;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
-import javafx.scene.text.Font;
+import javafx.scene.layout.Region;
 
 import org.fxmisc.easybind.EasyBind;
 import org.fxmisc.easybind.Subscription;
 
-import java.util.List;
-
 import static com.google.common.base.Preconditions.checkNotNull;
 import static haveno.desktop.util.FormBuilder.addButtonBusyAnimationLabel;
 import static haveno.desktop.util.FormBuilder.addCompactTopLabelTextFieldWithCopyIcon;
-import static haveno.desktop.util.FormBuilder.addTitledGroupBg;
-import static haveno.desktop.util.FormBuilder.addTopLabelTextFieldWithCopyIcon;
 
 public class BuyerStep2View extends TradeStepView {
 
     private Button confirmButton;
     private BusyAnimation busyAnimation;
     private Subscription tradeStatePropertySubscription;
+    private Subscription phaseSubscription;
     private Timer timeoutTimer;
+    private PauseTransition copyFeedback;
+    private Hyperlink copyAll;
     private int paymentAccountGridRow = 0;
     private GridPane paymentAccountGridPane;
     private GridPane moreConfirmationsGridPane;
@@ -148,6 +173,7 @@ public class BuyerStep2View extends TradeStepView {
     @Override
     public void activate() {
         super.activate();
+        phaseSubscription = EasyBind.subscribe(trade.statePhaseProperty(), phase -> updatePaymentDetailsVisibility());
 
         if (timeoutTimer != null)
             timeoutTimer.stop();
@@ -155,13 +181,14 @@ public class BuyerStep2View extends TradeStepView {
         //TODO we get called twice, check why
         if (tradeStatePropertySubscription == null) {
             tradeStatePropertySubscription = EasyBind.subscribe(trade.stateProperty(), state -> {
+                updatePaymentDetailsVisibility();
                 if (timeoutTimer != null)
                     timeoutTimer.stop();
 
                 if (trade.isDepositsUnlocked() && !trade.isPaymentSent()) {
                     busyAnimation.stop();
                     setTradeStatus("");
-                    showPopup();
+                    maybeShowPaymentReminder();
                 } else if (state.ordinal() <= Trade.State.SELLER_RECEIVED_PAYMENT_SENT_MSG.ordinal()) {
                     switch (state) {
                         case BUYER_CONFIRMED_PAYMENT_SENT:
@@ -197,6 +224,9 @@ public class BuyerStep2View extends TradeStepView {
                             break;
                     }
                 }
+
+                // update confirm button state
+                confirmButton.setDisable(!confirmPaymentSentPermitted());
             });
         }
     }
@@ -204,6 +234,9 @@ public class BuyerStep2View extends TradeStepView {
     @Override
     public void deactivate() {
         super.deactivate();
+        if (phaseSubscription != null) phaseSubscription.unsubscribe();
+        if (copyFeedback != null) copyFeedback.stop();
+        if (copyAll != null) copyAll.setText(Res.get("portfolio.pending.tradeView.copyAll"));
 
         busyAnimation.stop();
 
@@ -230,41 +263,23 @@ public class BuyerStep2View extends TradeStepView {
     protected void addContent() {
         gridPane.getColumnConstraints().get(1).setHgrow(Priority.ALWAYS);
 
-        addTradeInfoBlock();
         createPaymentDetailsGridPane();
         createRecommendationGridPane();
 
-        // attach grid pane based on current state
-        EasyBind.subscribe(trade.statePhaseProperty(), newValue -> {
-            if (trade.isPaymentSent() || model.getShowPaymentDetailsEarly() || trade.isDepositsFinalized()) {
-                attachPaymentDetailsGrid();
-            } else {
-                attachRecommendationGrid();
-            }
-        });
+        updatePaymentDetailsVisibility();
+    }
+
+    private void updatePaymentDetailsVisibility() {
+        if (trade.isPaymentSent() || model.getShowPaymentDetailsEarly() || trade.isDepositsFinalized()) attachPaymentDetailsGrid();
+        else attachRecommendationGrid();
     }
 
     private void createPaymentDetailsGridPane() {
         PaymentAccountPayload paymentAccountPayload = model.dataModel.getSellersPaymentAccountPayload();
         String paymentMethodId = paymentAccountPayload != null ? paymentAccountPayload.getPaymentMethodId() : "<pending>";
         
-        paymentAccountGridPane = createGridPane();
-        TitledGroupBg accountTitledGroupBg = addTitledGroupBg(paymentAccountGridPane, paymentAccountGridRow, 4,
-                Res.get("portfolio.pending.step2_buyer.startPaymentUsing", Res.get(paymentMethodId)),
-                Layout.COMPACT_GROUP_DISTANCE);
-        TextFieldWithCopyIcon field = addTopLabelTextFieldWithCopyIcon(paymentAccountGridPane, paymentAccountGridRow, 0,
-                Res.get("portfolio.pending.step2_buyer.amountToTransfer"),
-                model.getFiatVolume(),
-                Layout.COMPACT_FIRST_ROW_AND_GROUP_DISTANCE).second;
-        field.setCopyWithoutCurrencyPostFix(true);
-
-        //preland: this fixes a textarea layout glitch // TODO: can this be removed now?
-        TextArea uiHack = new TextArea();
-        uiHack.setMaxHeight(1);
-        GridPane.setRowIndex(uiHack, 1);
-        GridPane.setMargin(uiHack, new Insets(0, 0, 0, 0));
-        uiHack.setVisible(false);
-        paymentAccountGridPane.getChildren().add(uiHack);
+        TradeFormPane paymentFields = new TradeFormPane();
+        paymentAccountGridPane = paymentFields;
 
         switch (paymentMethodId) {
             case PaymentMethod.UPHOLD_ID:
@@ -412,6 +427,21 @@ public class BuyerStep2View extends TradeStepView {
             case PaymentMethod.SATISPAY_ID:
                 paymentAccountGridRow = SatispayForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
                 break;
+            case PaymentMethod.MPESA_ID:
+                paymentAccountGridRow = MpesaForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.MERCADO_PAGO_ID:
+                paymentAccountGridRow = MercadoPagoForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.GCASH_ID:
+                paymentAccountGridRow = GcashForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.MOMO_ID:
+                paymentAccountGridRow = MomoForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.SPEI_ID:
+                paymentAccountGridRow = SpeiForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
             case PaymentMethod.TIKKIE_ID:
                 paymentAccountGridRow = TikkieForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
                 break;
@@ -442,33 +472,123 @@ public class BuyerStep2View extends TradeStepView {
             case PaymentMethod.PAYSAFE_ID:
                 paymentAccountGridRow = PaysafeForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
                 break;
+            case PaymentMethod.BLIK_ID:
+                paymentAccountGridRow = BlikForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.VIPPS_MOBILEPAY_ID:
+                paymentAccountGridRow = VippsMobilePayForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.TWINT_ID:
+                paymentAccountGridRow = TwintForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.NIP_ID:
+                paymentAccountGridRow = NipForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.PAGO_MOVIL_ID:
+                paymentAccountGridRow = PagoMovilForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.QRIS_ID:
+                paymentAccountGridRow = QrisForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.PAPARA_ID:
+                paymentAccountGridRow = PaparaForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.RAAST_ID:
+                paymentAccountGridRow = RaastForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.PAYNOW_ID:
+                paymentAccountGridRow = PayNowForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.WERO_ID:
+                paymentAccountGridRow = WeroForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.FPS_ID:
+                paymentAccountGridRow = FpsForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.DUITNOW_ID:
+                paymentAccountGridRow = DuitNowForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.MB_WAY_ID:
+                paymentAccountGridRow = MbWayForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.PAYPAY_ID:
+                paymentAccountGridRow = PayPayForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.SBP_ID:
+                paymentAccountGridRow = SbpForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.MIR_ID:
+                paymentAccountGridRow = MirForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.YOOMONEY_ID:
+                paymentAccountGridRow = YooMoneyForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.UKRAINE_CARD_ID:
+                paymentAccountGridRow = UkraineCardForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
+            case PaymentMethod.KASPI_ID:
+                paymentAccountGridRow = KaspiForm.addFormForBuyer(paymentAccountGridPane, paymentAccountGridRow, paymentAccountPayload);
+                break;
             default:
                 log.error("Not supported PaymentMethod: " + paymentMethodId);
         }
 
-        Trade trade = model.getTrade();
-        if (trade != null && model.getUser().getPaymentAccounts() != null) {
-            Offer offer = trade.getOffer();
-            List<PaymentAccount> possiblePaymentAccounts = PaymentAccountUtil.getPossiblePaymentAccounts(offer,
-                    model.getUser().getPaymentAccounts(), model.dataModel.getAccountAgeWitnessService());
-            PaymentAccountPayload buyersPaymentAccountPayload = model.dataModel.getBuyersPaymentAccountPayload();
-            if (buyersPaymentAccountPayload != null && possiblePaymentAccounts.size() > 1) {
-                String id = buyersPaymentAccountPayload.getId();
-                possiblePaymentAccounts.stream()
-                        .filter(paymentAccount -> paymentAccount.getId().equals(id))
-                        .findFirst()
-                        .ifPresent(paymentAccount -> {
-                            String accountName = paymentAccount.getAccountName();
-                            addCompactTopLabelTextFieldWithCopyIcon(paymentAccountGridPane, ++paymentAccountGridRow, 0,
-                                    Res.get("portfolio.pending.step2_buyer.buyerAccount"), accountName);
-                        });
+        Node buyerAccount = null;
+        PaymentAccountPayload buyersPaymentAccountPayload = model.dataModel.getBuyersPaymentAccountPayload();
+        if (buyersPaymentAccountPayload != null) {
+            PaymentAccount savedAccount = model.getUser().getPaymentAccount(buyersPaymentAccountPayload.getId());
+            boolean hasAccountName = savedAccount != null && savedAccount.getAccountName() != null && !savedAccount.getAccountName().isBlank();
+            if (buyersPaymentAccountPayload instanceof AssetAccountPayload) {
+                String accountDetails = ((AssetAccountPayload) buyersPaymentAccountPayload).getAddress();
+                if (hasAccountName) accountDetails = savedAccount.getAccountName() + "\n" + accountDetails;
+                TradeFormPane registeredAccount = new TradeFormPane();
+                addCompactTopLabelTextFieldWithCopyIcon(registeredAccount, 0, 0,
+                        Res.get("portfolio.pending.tradeView.registeredPaymentAccount"), accountDetails);
+                registeredAccount.finish(true);
+                buyerAccount = registeredAccount;
+            } else if (hasAccountName) {
+                buyerAccount = createAccountSummary(Res.getWithCol("portfolio.pending.tradeView.payingFrom"), savedAccount.getAccountName());
             }
         }
 
-        GridPane.setRowSpan(accountTitledGroupBg, gridRow + paymentAccountGridRow - 1);
-
-        Tuple4<Button, BusyAnimation, Label, HBox> tuple3 = addButtonBusyAnimationLabel(paymentAccountGridPane, ++paymentAccountGridRow, 0,
-                Res.get("portfolio.pending.step2_buyer.paymentSent"), 10);
+        paymentFields.finish(model.isBlockChainMethod());
+        paymentAccountGridPane = createGridPane();
+        Label title = new Label(Res.get("portfolio.pending.tradeView.sendAmount", model.getFiatVolume(), Res.get(paymentMethodId)));
+        title.setWrapText(true);
+        title.getStyleClass().add("trade-action-title");
+        paymentAccountGridPane.add(title, 0, 0, 2, 1);
+        Label instructions = new Label(Res.get("portfolio.pending.tradeView.paymentInstructions"));
+        instructions.setWrapText(true);
+        instructions.getStyleClass().add("trade-body");
+        instructions.setMaxWidth(640);
+        paymentAccountGridPane.add(instructions, 0, 1, 2, 1);
+        paymentAccountGridPane.add(createAmountPanel(Res.get("portfolio.pending.step2_buyer.amountToTransfer")), 0, 2, 2, 1);
+        int actionRow = 3;
+        Label detailsTitle = new Label(Res.get("portfolio.pending.tradeView.paymentDetails"));
+        detailsTitle.setWrapText(true);
+        detailsTitle.getStyleClass().add("trade-section-heading");
+        copyAll = new Hyperlink(Res.get("portfolio.pending.tradeView.copyAll"));
+        copyFeedback = new PauseTransition(Duration.seconds(1));
+        copyFeedback.setOnFinished(event -> copyAll.setText(Res.get("portfolio.pending.tradeView.copyAll")));
+        copyAll.setOnAction(event -> {
+            Utilities.copyToClipboard(Res.get("portfolio.pending.step2_buyer.amountToTransfer") + ": " + model.getFiatVolume() + "\n" + paymentFields.getPaymentDetails());
+            copyAll.setText(Res.get("shared.copiedToClipboard"));
+            copyFeedback.playFromStart();
+        });
+        boolean hasInlineDetails = !paymentMethodId.equals(PaymentMethod.SWIFT_ID) && !paymentFields.getPaymentDetails().isEmpty();
+        copyAll.setVisible(hasInlineDetails);
+        copyAll.setManaged(hasInlineDetails);
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox detailsHeading = new HBox(12, detailsTitle, spacer, copyAll);
+        detailsHeading.setAlignment(Pos.CENTER_LEFT);
+        paymentAccountGridPane.add(detailsHeading, 0, actionRow++, 2, 1);
+        paymentAccountGridPane.add(paymentFields, 0, actionRow++, 2, 1);
+        if (buyerAccount != null) paymentAccountGridPane.add(buyerAccount, 0, actionRow++, 2, 1);
+        Node offerExtraInfo = createOfferExtraInfoField();
+        if (offerExtraInfo != null) paymentAccountGridPane.add(offerExtraInfo, 0, actionRow++, 2, 1);
+        Tuple4<Button, BusyAnimation, Label, HBox> tuple3 = addConfirmationButton(paymentAccountGridPane, actionRow,
+                Res.get("portfolio.pending.step2_buyer.paymentSent"));
 
         HBox confirmButtonHBox = tuple3.fourth;
         GridPane.setColumnSpan(confirmButtonHBox, 2);
@@ -480,42 +600,34 @@ public class BuyerStep2View extends TradeStepView {
     }
 
     private void createRecommendationGridPane() {
-
-        // create grid pane to show recommendation for more blocks
-        moreConfirmationsGridPane = new GridPane();
-        moreConfirmationsGridPane.setStyle("-fx-background-color: -bs-content-background-gray;");
-        moreConfirmationsGridPane.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
-
-        // add title
-        addTitledGroupBg(moreConfirmationsGridPane, 0, 1,  Res.get("portfolio.pending.step1.waitForConf"), Layout.COMPACT_GROUP_DISTANCE);
-
-        // add text
+        moreConfirmationsGridPane = createGridPane();
+        Label title = new Label(Res.get("portfolio.pending.step1.waitForConf"));
+        title.setWrapText(true);
+        title.getStyleClass().add("trade-action-title");
+        moreConfirmationsGridPane.add(title, 0, 0, 2, 1);
         Label label = new Label(Res.get("portfolio.pending.step2_buyer.additionalConf", Trade.NUM_BLOCKS_DEPOSITS_FINALIZED));
-        label.setFont(new Font(15));
-        GridPane.setMargin(label, new Insets(20, 0, 0, 0));
+        label.setWrapText(true);
+        label.getStyleClass().add("trade-secondary");
         moreConfirmationsGridPane.add(label, 0, 1, 2, 1);
-
-        Tuple4<Button, BusyAnimation, Label, HBox> tuple3 = addButtonBusyAnimationLabel(moreConfirmationsGridPane, gridRow, 0,
-                Res.get("portfolio.pending.step2_buyer.showEarly"), 10);
-
-        // add button to show payment details
-        Button showPaymentDetailsButton = tuple3.first;
-        showPaymentDetailsButton.setOnAction(e -> {
+        confirmationPane = new TradeConfirmationPane();
+        confirmationPane.update(getNumDepositConfirmations(), trade.isDepositsUnlocked());
+        moreConfirmationsGridPane.add(confirmationPane, 0, 2, 2, 1);
+        Tuple4<Button, BusyAnimation, Label, HBox> tuple = addButtonBusyAnimationLabel(moreConfirmationsGridPane, 3, 0,
+                Res.get("portfolio.pending.step2_buyer.showEarly"), 4);
+        GridPane.setColumnSpan(tuple.fourth, 2);
+        tuple.first.setOnAction(event -> {
             model.setShowPaymentDetailsEarly(true);
-            gridPane.getChildren().remove(moreConfirmationsGridPane);
-            gridPane.getChildren().add(paymentAccountGridPane);
-            GridPane.setRowIndex(paymentAccountGridPane, gridRow + 1);
-            GridPane.setColumnSpan(paymentAccountGridPane, 2);
-            statusLabel = paymentDetailsLabel;
-            updateStatus();
+            attachPaymentDetailsGrid();
         });
-        moreConfirmationsLabel = tuple3.third;
+        moreConfirmationsLabel = tuple.third;
+        initStatusLabel(moreConfirmationsLabel);
     }
 
     private GridPane createGridPane() {
         GridPane gridPane = new GridPane();
-        gridPane.setHgap(Layout.GRID_GAP);
-        gridPane.setVgap(Layout.GRID_GAP);
+        gridPane.setHgap(20);
+        gridPane.setMinWidth(0);
+        gridPane.setVgap(16);
         ColumnConstraints columnConstraints1 = new ColumnConstraints();
         columnConstraints1.setHgrow(Priority.ALWAYS);
         ColumnConstraints columnConstraints2 = new ColumnConstraints();
@@ -525,20 +637,23 @@ public class BuyerStep2View extends TradeStepView {
     }
 
     private void attachRecommendationGrid() {
+        updateStepCaption(Res.get("portfolio.pending.tradeView.recommendedWait"));
         if (gridPane.getChildren().contains(moreConfirmationsGridPane)) return;
         if (gridPane.getChildren().contains(paymentAccountGridPane)) gridPane.getChildren().remove(paymentAccountGridPane);
         gridPane.getChildren().add(moreConfirmationsGridPane);
-        GridPane.setRowIndex(moreConfirmationsGridPane, gridRow + 1);
+        GridPane.setRowIndex(moreConfirmationsGridPane, gridRow);
         GridPane.setColumnSpan(moreConfirmationsGridPane, 2);
         statusLabel = moreConfirmationsLabel;
         updateStatus();
     }
 
     private void attachPaymentDetailsGrid() {
+        boolean confirming = trade.isPaymentSent() && trade.getState() != Trade.State.BUYER_SEND_FAILED_PAYMENT_SENT_MSG;
+        updateStepCaption(Res.get(confirming ? "portfolio.pending.tradeView.confirmingPayment" : "portfolio.pending.tradeView.yourTurn"));
         if (gridPane.getChildren().contains(paymentAccountGridPane)) return;
         if (gridPane.getChildren().contains(moreConfirmationsGridPane)) gridPane.getChildren().remove(moreConfirmationsGridPane);
         gridPane.getChildren().add(paymentAccountGridPane);
-        GridPane.setRowIndex(paymentAccountGridPane, gridRow + 1);
+        GridPane.setRowIndex(paymentAccountGridPane, gridRow);
         GridPane.setColumnSpan(paymentAccountGridPane, 2);
         statusLabel = paymentDetailsLabel;
         updateStatus();
@@ -546,6 +661,7 @@ public class BuyerStep2View extends TradeStepView {
 
     private boolean confirmPaymentSentPermitted() {
         if (!trade.confirmPermitted()) return false;
+        if (model.dataModel.getSellersPaymentAccountPayload() == null) return false;
         if (trade.getState() == Trade.State.BUYER_SEND_FAILED_PAYMENT_SENT_MSG) return true;
         return trade.isDepositsUnlocked() && trade.getState().ordinal() < Trade.State.BUYER_CONFIRMED_PAYMENT_SENT.ordinal();
     }
@@ -556,9 +672,7 @@ public class BuyerStep2View extends TradeStepView {
 
     @Override
     protected String getFirstHalfOverWarnText() {
-        return Res.get("portfolio.pending.step2_buyer.warn",
-                getCurrencyCode(trade),
-                model.getDateForOpenDispute());
+        return Res.get("portfolio.pending.tradeView.paymentHalf");
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -567,7 +681,7 @@ public class BuyerStep2View extends TradeStepView {
 
     @Override
     protected String getPeriodOverWarnText() {
-        return Res.get("portfolio.pending.step2_buyer.openForDispute");
+        return Res.get("portfolio.pending.tradeView.paymentExpired");
     }
 
     @Override
@@ -684,23 +798,32 @@ public class BuyerStep2View extends TradeStepView {
 
     private void confirmPaymentSent() {
         busyAnimation.play();
-        setTradeStatus(Res.get("shared.preparingConfirmation"));
-        confirmButton.setDisable(true);
+        setPreparingConfirmation();
+        disableConfirmationButton(confirmButton);
 
         model.dataModel.onPaymentSent(() -> {
-        }, errorMessage -> {
+        }, errorMessage -> UserThread.execute(() -> {
             busyAnimation.stop();
             new Popup().warning(Res.get("popup.warning.sendMsgFailed") + "\n\n" + errorMessage).show();
             confirmButton.setDisable(!confirmPaymentSentPermitted());
-            UserThread.execute(() -> setTradeStatus("Error confirming payment sent."));
-        });
+            setTradeStatus("Error confirming payment sent");
+        }));
     }
 
-    private void showPopup() {
+    private boolean shouldShowReferenceWarning(PaymentAccountPayload payload) {
+        return !(payload instanceof AssetAccountPayload || payload instanceof WesternUnionAccountPayload ||
+                payload instanceof MoneyGramAccountPayload || payload instanceof F2FAccountPayload ||
+                payload instanceof PayByMailAccountPayload || payload instanceof HalCashAccountPayload ||
+                payload instanceof BlikAccountPayload);
+    }
+
+    @Override
+    protected void showPaymentReminder() {
+        if (!trade.isDepositsUnlocked() || trade.isPaymentSent()) return;
         PaymentAccountPayload paymentAccountPayload = model.dataModel.getSellersPaymentAccountPayload();
         if (paymentAccountPayload != null && !trade.isPayoutPublished()) {
             String message = Res.get("portfolio.pending.step2.confReached");
-            String refTextWarn = Res.get("portfolio.pending.step2_buyer.refTextWarn");
+            String refTextWarn = shouldShowReferenceWarning(paymentAccountPayload) ? Res.get("portfolio.pending.step2_buyer.refTextWarn") : "";
             String fees = Res.get("portfolio.pending.step2_buyer.fees");
             String id = trade.getShortId();
             String amount = VolumeUtil.formatVolumeWithCode(trade.getVolume());
@@ -743,6 +866,8 @@ public class BuyerStep2View extends TradeStepView {
                 message += Res.get("portfolio.pending.step2_buyer.pay", amount) +
                         refTextWarn + "\n\n" +
                         Res.get("portfolio.pending.step2_buyer.fees.swift");
+            } else if (paymentAccountPayload instanceof BlikAccountPayload) {
+                message += Res.get("portfolio.pending.step2_buyer.pay.blik", amount);
             } else {
                 message += Res.get("portfolio.pending.step2_buyer.pay", amount) +
                         refTextWarn + "\n\n" +

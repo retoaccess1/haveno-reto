@@ -1,35 +1,95 @@
-# See docs/installing.md
+# See docs/installing.md and `make help`
+SHELL := env bash
+GRADLE := ./gradlew
+# Skip slow checks for dev-iteration targets
+SKIP_CHECKS := -x test -x checkstyleMain -x checkstyleTest
+# Extra Gradle flags, e.g. make skip-tests GRADLE_EXTRA='--rerun-tasks'
+GRADLE_EXTRA ?=
+# Required Java major version — single source of truth is the Gradle version catalog
+JAVA_VERSION := $(shell sed -n 's/^java = "\([0-9][0-9]*\)".*/\1/p' gradle/libs.versions.toml)
 
-build: localnet haveno
+.PHONY: help build clean clean-all clean-cache haveno skip-tests daemon desktop seednode seednode-jar package test check-java \
+        update-dependencies refresh-deps haveno-apps localnet clean-localnet deploy-screen deploy-tmux
+
+.DEFAULT_GOAL := build
+
+help:
+	@echo "Haveno build targets (Java $(JAVA_VERSION), Gradle 8.14):"
+	@echo ""
+	@echo "  make / make build     Full build with tests (downloads monero bins via Gradle)"
+	@echo "  make skip-tests       Build without tests or checkstyle (fast dev iteration)"
+	@echo "  make haveno-apps      Compile core + build desktop + daemon shadow JAR (no tests)"
+	@echo "  make daemon           Build daemon fat JAR (:daemon:shadowJar)"
+	@echo "  make desktop          Build desktop fat JAR (:desktop:shadowJar)"
+	@echo "  make seednode-jar     Build seednode fat JAR (:seednode:shadowJar)"
+	@echo "  make package          Build platform installers (:desktop:packageInstallers)"
+	@echo "  make test             Run unit tests only"
+	@echo "  make clean            Gradle clean + remove root haveno-* launchers"
+	@echo "  make clean-all        clean + remove .localnet monero cache"
+	@echo "  make clean-cache      Clear Gradle build cache (recover from stale/empty cached outputs)"
+	@echo "  make check-java       Verify Java $(JAVA_VERSION) is active"
+	@echo "  make update-dependencies  Refresh dependency lock metadata"
+	@echo "  make refresh-deps     Refresh verification metadata and rebuild (no tests)"
+	@echo ""
+	@echo "Local network runtime targets are listed in the Makefile below this section."
+
+check-java:
+	@java -version 2>&1 | grep -qE 'version "$(JAVA_VERSION)(\.|")' || { echo "ERROR: Java $(JAVA_VERSION) is required (see docs/installing.md)"; exit 1; }
+	@echo "Java $(JAVA_VERSION) OK"
+
+build: check-java localnet haveno
 
 clean:
-	./gradlew clean
+	$(GRADLE) clean $(GRADLE_EXTRA)
+
+clean-all: clean clean-localnet
 
 clean-localnet:
 	rm -rf .localnet
+
+clean-cache:
+	rm -rf "$${GRADLE_USER_HOME:-$$HOME/.gradle}/caches/build-cache-1"
+	@echo "Gradle build cache cleared"
 
 localnet:
 	mkdir -p .localnet
 
 haveno:
-	./gradlew build
+	$(GRADLE) build $(GRADLE_EXTRA)
 
 update-dependencies:
-	./gradlew --refresh-dependencies && ./gradlew --write-verification-metadata sha256
+	$(GRADLE) --refresh-dependencies $(GRADLE_EXTRA)
+	$(GRADLE) --write-verification-metadata sha256 $(GRADLE_EXTRA)
+
+daemon: localnet
+	$(GRADLE) :daemon:shadowJar $(SKIP_CHECKS) $(GRADLE_EXTRA)
+
+desktop: localnet
+	$(GRADLE) :desktop:shadowJar $(SKIP_CHECKS) $(GRADLE_EXTRA)
+
+seednode-jar: localnet
+	$(GRADLE) :seednode:shadowJar $(SKIP_CHECKS) $(GRADLE_EXTRA)
+
+package: localnet
+	$(GRADLE) :desktop:packageInstallers $(GRADLE_EXTRA)
 
 daemon: localnet
 	./gradlew :daemon:shadowJar -x test -x checkstyleMain -x checkstyleTest
 
 # build haveno without tests
-skip-tests: localnet
-	./gradlew build -x test -x checkstyleMain -x checkstyleTest
+skip-tests: check-java localnet
+	$(GRADLE) build $(SKIP_CHECKS) $(GRADLE_EXTRA)
 
 # quick build desktop and daemon apps without tests
-haveno-apps:
-	./gradlew :core:compileJava :desktop:build -x test -x checkstyleMain -x checkstyleTest
+haveno-apps: localnet
+	$(GRADLE) :core:compileJava :desktop:build :daemon:shadowJar $(SKIP_CHECKS) $(GRADLE_EXTRA)
+
+test: localnet
+	$(GRADLE) test $(GRADLE_EXTRA)
 
 refresh-deps:
-	./gradlew --write-verification-metadata sha256 && ./gradlew build --refresh-keys --refresh-dependencies -x test -x checkstyleMain -x checkstyleTest
+	$(GRADLE) --write-verification-metadata sha256 $(GRADLE_EXTRA)
+	$(GRADLE) build --refresh-keys --refresh-dependencies $(SKIP_CHECKS) $(GRADLE_EXTRA)
 
 deploy-screen:
 	# create a new screen session named 'localnet'
@@ -58,8 +118,6 @@ deploy-tmux:
 	sleep 5
 	# Attach to the tmux session
 	tmux attach-session -t localnet
-
-.PHONY: build seednode localnet
 
 # Local network
 
@@ -125,6 +183,7 @@ monerod3-local:
 funding-wallet-local:
 	./.localnet/monero-wallet-rpc \
 		--testnet \
+		--allow-mismatched-daemon-version \
 		--daemon-address http://localhost:28081 \
 		--rpc-bind-port 28084 \
 		--rpc-login rpc_user:abc123 \
@@ -196,7 +255,6 @@ arbitrator-desktop-local:
 		--appName=haveno-XMR_LOCAL_arbitrator \
 		--apiPassword=apitest \
 		--apiPort=9998 \
-		--useNativeXmrWallet=false \
 	    --xmrNode=http://127.0.0.1:48081 \
 
 arbitrator2-daemon-local:
@@ -222,7 +280,6 @@ arbitrator2-desktop-local:
 		--appName=haveno-XMR_LOCAL_arbitrator2 \
 		--apiPassword=apitest \
 		--apiPort=10001 \
-		--useNativeXmrWallet=false \
 	    --xmrNode=http://127.0.0.1:48081 \
 
 user1-daemon-local:
@@ -249,7 +306,6 @@ user1-desktop-local:
 		--apiPort=9999 \
 		--walletRpcBindPort=38091 \
 		--logLevel=info \
-		--useNativeXmrWallet=false \
 
 user2-desktop-local:
 	./haveno-desktop$(APP_EXT) \
@@ -261,7 +317,6 @@ user2-desktop-local:
 		--apiPassword=apitest \
 		--apiPort=10000 \
 		--walletRpcBindPort=38092 \
-		--useNativeXmrWallet=false \
 
 user2-daemon-local:
 	./haveno-daemon$(APP_EXT) \
@@ -286,7 +341,6 @@ user3-desktop-local:
 		--apiPassword=apitest \
 		--apiPort=10002 \
 		--walletRpcBindPort=38093 \
-		--useNativeXmrWallet=false \
 
 user3-daemon-local:
 	./haveno-daemon$(APP_EXT) \
@@ -361,7 +415,6 @@ arbitrator-desktop-stagenet:
 		--apiPassword=apitest \
 		--apiPort=3200 \
 		--xmrNode=http://127.0.0.1:38081 \
-		--useNativeXmrWallet=false \
 
 user1-daemon-stagenet:
 	./haveno-daemon$(APP_EXT) \
@@ -384,7 +437,6 @@ user1-desktop-stagenet:
 		--appName=haveno-XMR_STAGENET_user1 \
 		--apiPassword=apitest \
 		--apiPort=3201 \
-		--useNativeXmrWallet=false \
 
 user2-daemon-stagenet:
 	./haveno-daemon$(APP_EXT) \
@@ -407,7 +459,6 @@ user2-desktop-stagenet:
 		--appName=haveno-XMR_STAGENET_user2 \
 		--apiPassword=apitest \
 		--apiPort=3202 \
-		--useNativeXmrWallet=false \
 
 user3-desktop-stagenet:
 	./haveno-desktop$(APP_EXT) \
@@ -418,7 +469,6 @@ user3-desktop-stagenet:
 		--appName=haveno-XMR_STAGENET_user3 \
 		--apiPassword=apitest \
 		--apiPort=3203 \
-		--useNativeXmrWallet=false \
 
 haveno-desktop-stagenet:
 	./haveno-desktop$(APP_EXT) \
@@ -429,7 +479,6 @@ haveno-desktop-stagenet:
 		--appName=Haveno \
 		--apiPassword=apitest \
 		--apiPort=3204 \
-		--useNativeXmrWallet=false \
 
 haveno-daemon-stagenet:
 	./haveno-daemon$(APP_EXT) \
@@ -441,6 +490,11 @@ haveno-daemon-stagenet:
 		--apiPassword=apitest \
 		--apiPort=3204 \
 		--useNativeXmrWallet=false \
+
+# expose the stagenet daemon API to grpc-web clients at http://localhost:8080
+envoy-stagenet:
+	@command -v envoy >/dev/null || { echo "ERROR: envoy is required (e.g. brew install envoy)"; exit 1; }
+	envoy -c config/envoy.stagenet.yaml
 
 # Mainnet network
 
@@ -494,7 +548,6 @@ arbitrator-desktop-mainnet:
 		--apiPassword=apitest \
 		--apiPort=1200 \
 		--xmrNode=http://127.0.0.1:18081 \
-		--useNativeXmrWallet=false \
 
 arbitrator2-daemon-mainnet:
 	./haveno-daemon$(APP_EXT) \
@@ -519,7 +572,6 @@ arbitrator2-desktop-mainnet:
 		--apiPassword=apitest \
 		--apiPort=1205 \
 		--xmrNode=http://127.0.0.1:18081 \
-		--useNativeXmrWallet=false \
 
 haveno-daemon-mainnet:
 	./haveno-daemon$(APP_EXT) \
@@ -542,8 +594,12 @@ haveno-desktop-mainnet:
 		--appName=Haveno-reto \
 		--apiPassword=apitest \
 		--apiPort=1201 \
-		--useNativeXmrWallet=false \
 		--ignoreLocalXmrNode=false \
+
+# expose the mainnet daemon API to grpc-web clients at http://localhost:8080
+envoy-mainnet:
+	@command -v envoy >/dev/null || { echo "ERROR: envoy is required (e.g. brew install envoy)"; exit 1; }
+	envoy -c config/envoy.yaml
 
 user1-daemon-mainnet:
 	./haveno-daemon$(APP_EXT) \
@@ -567,7 +623,6 @@ user1-desktop-mainnet:
 		--appName=haveno-reto-XMR_MAINNET_user1 \
 		--apiPassword=apitest \
 		--apiPort=1202 \
-		--useNativeXmrWallet=false \
 		--ignoreLocalXmrNode=false \
 
 user2-daemon-mainnet:
@@ -592,7 +647,6 @@ user2-desktop-mainnet:
 		--appName=haveno-reto-XMR_MAINNET_user2 \
 		--apiPassword=apitest \
 		--apiPort=1203 \
-		--useNativeXmrWallet=false \
 		--ignoreLocalXmrNode=false \
 
 user3-desktop-mainnet:
@@ -604,7 +658,6 @@ user3-desktop-mainnet:
 		--appName=haveno-reto-XMR_MAINNET_user3 \
 		--apiPassword=apitest \
 		--apiPort=1204 \
-		--useNativeXmrWallet=false \
 		--ignoreLocalXmrNode=false \
 
 buyer-wallet-mainnet:

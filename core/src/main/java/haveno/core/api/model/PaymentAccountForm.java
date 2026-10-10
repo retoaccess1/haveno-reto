@@ -87,7 +87,57 @@ public final class PaymentAccountForm implements PersistablePayload {
         ACH_TRANSFER,
         INTERAC_E_TRANSFER,
         US_POSTAL_MONEY_ORDER,
-        PIX;
+        PIX,
+        NATIONAL_BANK,
+        WESTERN_UNION,
+        CASH_DEPOSIT,
+        UPI,
+        NEFT,
+        IMPS,
+        PROMPT_PAY,
+        BIZUM,
+        NEQUI,
+        JAPAN_BANK,
+        PAYTM,
+        DOMESTIC_WIRE_TRANSFER,
+        SATISPAY,
+        PAYSERA,
+        TIKKIE,
+        MPESA,
+        MERCADO_PAGO,
+        GCASH,
+        MOMO,
+        SPEI,
+        ADVANCED_CASH,
+        CELPAY,
+        HAL_CASH,
+        MONESE,
+        MONEY_BEAM,
+        PERFECT_MONEY,
+        RTGS,
+        VERSE,
+        SAME_BANK,
+        SPECIFIC_BANKS,
+        CAPITUAL,
+        BLIK,
+        VIPPS_MOBILEPAY,
+        TWINT,
+        NIP,
+        PAGO_MOVIL,
+        QRIS,
+        PAPARA,
+        RAAST,
+        PAYNOW,
+        WERO,
+        FPS,
+        DUITNOW,
+        MB_WAY,
+        PAYPAY,
+        SBP,
+        MIR,
+        YOOMONEY,
+        UKRAINE_CARD,
+        KASPI;
 
         public static PaymentAccountForm.FormId fromProto(protobuf.PaymentAccountForm.FormId formId) {
             return ProtoUtil.enumFromProto(PaymentAccountForm.FormId.class, formId.name());
@@ -120,7 +170,7 @@ public final class PaymentAccountForm implements PersistablePayload {
     }
 
     public static PaymentAccountForm fromProto(protobuf.PaymentAccountForm proto) {
-        List<PaymentAccountFormField> fields = proto.getFieldsList().isEmpty() ? null : proto.getFieldsList().stream().map(PaymentAccountFormField::fromProto).collect(Collectors.toList());
+        List<PaymentAccountFormField> fields = proto.getFieldsList().stream().map(PaymentAccountFormField::fromProto).collect(Collectors.toList());
         return new PaymentAccountForm(FormId.fromProto(proto.getId()), fields);
     }
 

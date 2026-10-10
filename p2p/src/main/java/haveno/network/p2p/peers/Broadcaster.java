@@ -49,6 +49,8 @@ public class Broadcaster implements BroadcastHandler.ResultHandler {
     private final List<BroadcastRequest> broadcastRequests = new ArrayList<>();
     private Timer timer;
     private boolean shutDownRequested;
+    private boolean shutDownComplete;
+    private BroadcastHandler shutDownBroadcastHandler;
     private Runnable shutDownResultHandler;
     private final ListeningExecutorService executor;
     private final Object lock = new Object();
@@ -75,19 +77,16 @@ public class Broadcaster implements BroadcastHandler.ResultHandler {
 
     public void shutDown(Runnable resultHandler) {
         log.info("Broadcaster shutdown started");
-        shutDownRequested = true;
-        shutDownResultHandler = resultHandler;
         synchronized (lock) {
+            shutDownRequested = true;
+            shutDownResultHandler = resultHandler;
             if (broadcastRequests.isEmpty()) {
                 doShutDown();
             } else {
-                // We set delay of broadcasts and timeout to very low values,
-                // so we can expect that we get onCompleted called very fast and trigger the
-                // doShutDown from there.
+                // Keep the executor available until the shutdown bundle finishes its delayed sends.
                 maybeBroadcastBundle();
             }
         }
-        executor.shutdown();
     }
 
     public void flush() {
@@ -95,14 +94,28 @@ public class Broadcaster implements BroadcastHandler.ResultHandler {
     }
 
     private void doShutDown() {
-        log.info("Broadcaster doShutDown started");
         synchronized (lock) {
-            broadcastHandlers.forEach(BroadcastHandler::cancel);
-            if (timer != null) {
-                timer.stop();
+            if (shutDownComplete) return;
+            shutDownComplete = true;
+            log.info("Broadcaster doShutDown started");
+            try {
+                broadcastHandlers.forEach(handler -> {
+                    try {
+                        handler.cancel();
+                    } catch (Throwable t) {
+                        log.error("Failed to cancel broadcast handler", t);
+                    }
+                });
+                broadcastHandlers.clear();
+                if (timer != null) {
+                    timer.stop();
+                    timer = null;
+                }
+            } finally {
+                executor.shutdown();
+                shutDownResultHandler.run();
             }
         }
-        shutDownResultHandler.run();
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -118,6 +131,7 @@ public class Broadcaster implements BroadcastHandler.ResultHandler {
             @Nullable NodeAddress sender,
             @Nullable BroadcastHandler.Listener listener) {
         synchronized (lock) {
+            if (shutDownRequested) return;
             broadcastRequests.add(new BroadcastRequest(message, sender, listener));
             if (timer == null) {
                 timer = UserThread.runAfter(this::maybeBroadcastBundle, BROADCAST_INTERVAL_MS, TimeUnit.MILLISECONDS);
@@ -130,6 +144,7 @@ public class Broadcaster implements BroadcastHandler.ResultHandler {
             if (!broadcastRequests.isEmpty()) {
                 BroadcastHandler broadcastHandler = new BroadcastHandler(networkNode, peerManager, this);
                 broadcastHandlers.add(broadcastHandler);
+                if (shutDownRequested) shutDownBroadcastHandler = broadcastHandler;
                 broadcastHandler.broadcast(new ArrayList<>(broadcastRequests), shutDownRequested, executor);
                 broadcastRequests.clear();
 
@@ -149,7 +164,8 @@ public class Broadcaster implements BroadcastHandler.ResultHandler {
     public void onCompleted(BroadcastHandler broadcastHandler) {
         synchronized (lock) {
             broadcastHandlers.remove(broadcastHandler);
-            if (shutDownRequested) {
+            // An older broadcast can finish while the shutdown bundle is still waiting to send.
+            if (broadcastHandler == shutDownBroadcastHandler) {
                 doShutDown();
             }
         }

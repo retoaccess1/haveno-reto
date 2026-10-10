@@ -104,6 +104,16 @@ public class PaymentAccountFactory {
                 return new PaytmAccount();
             case PaymentMethod.NEQUI_ID:
                 return new NequiAccount();
+            case PaymentMethod.MPESA_ID:
+                return new MpesaAccount();
+            case PaymentMethod.MERCADO_PAGO_ID:
+                return new MercadoPagoAccount();
+            case PaymentMethod.GCASH_ID:
+                return new GcashAccount();
+            case PaymentMethod.MOMO_ID:
+                return new MomoAccount();
+            case PaymentMethod.SPEI_ID:
+                return new SpeiAccount();
             case PaymentMethod.BIZUM_ID:
                 return new BizumAccount();
             case PaymentMethod.PIX_ID:
@@ -142,6 +152,44 @@ public class PaymentAccountFactory {
             // Cannot be deleted as it would break old trade history entries
             case PaymentMethod.OK_PAY_ID:
                 return new OKPayAccount();
+            case PaymentMethod.BLIK_ID:
+                return new BlikAccount();
+            case PaymentMethod.VIPPS_MOBILEPAY_ID:
+                return new VippsMobilePayAccount();
+            case PaymentMethod.TWINT_ID:
+                return new TwintAccount();
+            case PaymentMethod.NIP_ID:
+                return new NipAccount();
+            case PaymentMethod.PAGO_MOVIL_ID:
+                return new PagoMovilAccount();
+            case PaymentMethod.QRIS_ID:
+                return new QrisAccount();
+            case PaymentMethod.PAPARA_ID:
+                return new PaparaAccount();
+            case PaymentMethod.RAAST_ID:
+                return new RaastAccount();
+            case PaymentMethod.PAYNOW_ID:
+                return new PayNowAccount();
+            case PaymentMethod.WERO_ID:
+                return new WeroAccount();
+            case PaymentMethod.FPS_ID:
+                return new FpsAccount();
+            case PaymentMethod.DUITNOW_ID:
+                return new DuitNowAccount();
+            case PaymentMethod.MB_WAY_ID:
+                return new MbWayAccount();
+            case PaymentMethod.PAYPAY_ID:
+                return new PayPayAccount();
+            case PaymentMethod.SBP_ID:
+                return new SbpAccount();
+            case PaymentMethod.MIR_ID:
+                return new MirAccount();
+            case PaymentMethod.YOOMONEY_ID:
+                return new YooMoneyAccount();
+            case PaymentMethod.UKRAINE_CARD_ID:
+                return new UkraineCardAccount();
+            case PaymentMethod.KASPI_ID:
+                return new KaspiAccount();
             default:
                 throw new RuntimeException("Not supported PaymentMethod: " + paymentMethod);
         }

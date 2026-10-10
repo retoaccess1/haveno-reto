@@ -26,8 +26,10 @@
  */
 package haveno.desktop.components.controlsfx.skin;
 
+import haveno.core.locale.Res;
 import haveno.desktop.components.controlsfx.control.PopOver;
 import haveno.desktop.components.controlsfx.control.PopOver.ArrowLocation;
+import haveno.desktop.util.Accessibility;
 import javafx.beans.InvalidationListener;
 import javafx.beans.binding.Bindings;
 import javafx.beans.property.DoubleProperty;
@@ -136,6 +138,7 @@ public class PopOverSkin implements Skin<PopOver> {
         closeIcon.getStyleClass().add("icon"); //$NON-NLS-1$
         closeIcon.setAlignment(CENTER_LEFT);
         closeIcon.getGraphic().setOnMouseClicked(evt -> popOver.hide());
+        Accessibility.asButton(closeIcon.getGraphic(), Res.get("shared.close"));
 
         titlePane = new StackPane();
         titlePane.getChildren().add(title);
@@ -224,7 +227,7 @@ public class PopOverSkin implements Skin<PopOver> {
         updatePath();
 
         final EventHandler<MouseEvent> mousePressedHandler = evt -> {
-            log.info("mousePressed:" + popOver.isDetachable() + "," + popOver.isDetached());
+            log.debug("mousePressed:" + popOver.isDetachable() + "," + popOver.isDetached());
             if (popOver.isDetachable() || popOver.isDetached()) {
                 tornOff = false;
 
@@ -236,7 +239,7 @@ public class PopOverSkin implements Skin<PopOver> {
         };
 
         final EventHandler<MouseEvent> mouseReleasedHandler = evt -> {
-            log.info("mouseReleased:tornOff" + tornOff + ", " + !getSkinnable().isDetached());
+            log.debug("mouseReleased:tornOff" + tornOff + ", " + !getSkinnable().isDetached());
             if (tornOff && !getSkinnable().isDetached()) {
                 tornOff = false;
                 getSkinnable().detach();
@@ -244,7 +247,7 @@ public class PopOverSkin implements Skin<PopOver> {
         };
 
         final EventHandler<MouseEvent> mouseDragHandler = evt -> {
-            log.info("mouseDrag:" + popOver.isDetachable() + "," + popOver.isDetached());
+            log.debug("mouseDrag:" + popOver.isDetachable() + "," + popOver.isDetached());
             if (popOver.isDetachable() || popOver.isDetached()) {
                 double deltaX = evt.getScreenX() - xOffset;
                 double deltaY = evt.getScreenY() - yOffset;

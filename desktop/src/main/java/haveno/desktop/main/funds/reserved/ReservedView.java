@@ -19,8 +19,7 @@ package haveno.desktop.main.funds.reserved;
 
 import com.google.inject.Inject;
 import com.google.inject.name.Named;
-import com.googlecode.jcsv.writer.CSVEntryConverter;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import java.util.function.Function;
 import haveno.core.locale.Res;
 import haveno.core.offer.OpenOffer;
 import haveno.core.offer.OpenOfferManager;
@@ -165,15 +164,15 @@ public class ReservedView extends ActivatableView<VBox, Void> {
 
         numItems.setText(Res.get("shared.numItemsLabel", sortedList.size()));
         exportButton.setOnAction(event -> {
-            ObservableList<TableColumn<ReservedListItem, ?>> tableColumns = GUIUtil.getContentColumns(tableView);
+            ObservableList<TableColumn<ReservedListItem, ?>> tableColumns = tableView.getColumns();
             int reportColumns = tableColumns.size();
-            CSVEntryConverter<ReservedListItem> headerConverter = item -> {
+            Function<ReservedListItem, String[]> headerConverter = item -> {
                 String[] columns = new String[reportColumns];
                 for (int i = 0; i < columns.length; i++)
                     columns[i] = ((AutoTooltipLabel) tableColumns.get(i).getGraphic()).getText();
                 return columns;
             };
-            CSVEntryConverter<ReservedListItem> contentConverter = item -> {
+            Function<ReservedListItem, String[]> contentConverter = item -> {
                 String[] columns = new String[reportColumns];
                 columns[0] = item.getDateAsString();
                 columns[1] = item.getDetails();
@@ -293,7 +292,8 @@ public class ReservedView extends ActivatableView<VBox, Void> {
                         if (item != null && !empty) {
                             Optional<Tradable> tradableOptional = getTradable(item);
                             if (tradableOptional.isPresent()) {
-                                field = new HyperlinkWithIcon(item.getDetails(), AwesomeIcon.INFO_SIGN);
+                                field = new HyperlinkWithIcon(item.getDetails());
+                                field.hideIcon();
                                 field.setOnAction(event -> openDetailPopup(item));
                                 field.setTooltip(new Tooltip(Res.get("tooltip.openPopupForDetails")));
                                 setGraphic(field);

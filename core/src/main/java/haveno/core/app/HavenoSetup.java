@@ -56,6 +56,7 @@ import haveno.core.alert.AlertManager;
 import haveno.core.alert.PrivateNotificationManager;
 import haveno.core.alert.PrivateNotificationPayload;
 import haveno.core.api.CoreContext;
+import haveno.core.api.CoreNotificationService;
 import haveno.core.api.XmrConnectionService;
 import haveno.core.api.XmrConnectionService.XmrConnectionFallbackType;
 import haveno.core.api.XmrLocalNode;
@@ -142,8 +143,8 @@ public class HavenoSetup {
     private final AccountAgeWitnessService accountAgeWitnessService;
     private final TorSetup torSetup;
     private final CoinFormatter formatter;
-    private final XmrLocalNode xmrLocalNode;
     private final AppStartupState appStartupState;
+    private final CoreNotificationService notificationService;
     private final MediationManager mediationManager;
     private final RefundManager refundManager;
     private final ArbitrationManager arbitrationManager;
@@ -155,7 +156,7 @@ public class HavenoSetup {
     @Nullable
     private Consumer<String> chainFileLockedExceptionHandler,
             lockedUpFundsHandler, filterWarningHandler,
-            displaySecurityRecommendationHandler, displayLocalhostHandler,
+            displaySecurityRecommendationHandler,
             wrongOSArchitectureHandler, displaySignedByArbitratorHandler,
             displaySignedByPeerHandler, displayPeerLimitLiftedHandler, displayPeerSignerHandler,
             rejectedTxErrorMessageHandler;
@@ -242,8 +243,8 @@ public class HavenoSetup {
                        AccountAgeWitnessService accountAgeWitnessService,
                        TorSetup torSetup,
                        @Named(FormattingUtils.BTC_FORMATTER_KEY) CoinFormatter formatter,
-                       XmrLocalNode xmrLocalNode,
                        AppStartupState appStartupState,
+                       CoreNotificationService notificationService,
                        Socks5ProxyProvider socks5ProxyProvider,
                        MediationManager mediationManager,
                        RefundManager refundManager,
@@ -268,14 +269,19 @@ public class HavenoSetup {
         this.accountAgeWitnessService = accountAgeWitnessService;
         this.torSetup = torSetup;
         this.formatter = formatter;
-        this.xmrLocalNode = xmrLocalNode;
         this.appStartupState = appStartupState;
+        this.notificationService = notificationService;
         this.mediationManager = mediationManager;
         this.refundManager = refundManager;
         this.arbitrationManager = arbitrationManager;
 
         HavenoUtils.havenoSetup = this;
         HavenoUtils.preferences = preferences;
+
+        // notify api clients of applicable alerts, registered before p2p startup
+        alertManager.alertMessageProperty().addListener((observable, oldValue, newValue) -> {
+            if (newValue != null && newValue.isApplicable(preferences)) notificationService.sendAlertNotification(newValue);
+        });
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -348,7 +354,6 @@ public class HavenoSetup {
                 // We set that after calling the setupCompleteHandler to not trigger a popup from the dev dummy accounts
                 // in MainViewModel
                 maybeShowSecurityRecommendation();
-                maybeShowLocalhostRunningInfo();
                 maybeShowAccountSigningStateInfo();
                 maybeShowTorAddressUpgradeInformation();
                 checkInboundConnections();
@@ -365,10 +370,10 @@ public class HavenoSetup {
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     private void maybeShowTac(Runnable nextStep) {
-        if (!preferences.isTacAcceptedV120() && !DevEnv.isDevMode()) {
+        if (preferences.getTacAcceptedVersion() != Version.TAC_VERSION && !DevEnv.isDevMode()) {
             if (displayTacHandler != null)
                 displayTacHandler.accept(() -> {
-                    preferences.setTacAcceptedV120(true);
+                    preferences.setTacAcceptedVersion(Version.TAC_VERSION);
                     nextStep.run();
                 });
         } else {
@@ -380,7 +385,7 @@ public class HavenoSetup {
         try {
 
             // install monerod
-            File monerodFile = new File(XmrLocalNode.MONEROD_PATH);
+            File monerodFile = new File(XmrLocalNode.getMonerodPath());
             String monerodResourcePath = "bin/" + XmrLocalNode.MONEROD_NAME;
             if (!monerodFile.exists() || (config.updateXmrBinaries && !FileUtil.resourceEqualToFile(monerodResourcePath, monerodFile))) {
                 log.info("Installing monerod");
@@ -390,14 +395,7 @@ public class HavenoSetup {
             }
 
             // install monero-wallet-rpc
-            File moneroWalletRpcFile = new File(XmrWalletService.MONERO_WALLET_RPC_PATH);
-            String moneroWalletRpcResourcePath = "bin/" + XmrWalletService.MONERO_WALLET_RPC_NAME;
-            if (!moneroWalletRpcFile.exists() || (config.updateXmrBinaries && !FileUtil.resourceEqualToFile(moneroWalletRpcResourcePath, moneroWalletRpcFile))) {
-                log.info("Installing monero-wallet-rpc");
-                moneroWalletRpcFile.getParentFile().mkdirs();
-                FileUtil.resourceToFile(moneroWalletRpcResourcePath, moneroWalletRpcFile);
-                moneroWalletRpcFile.setExecutable(true);
-            }
+            XmrWalletService.maybeInstallMoneroWalletRpc(config.updateXmrBinaries);
         } catch (Exception e) {
             log.warn("Failed to install Monero binaries: {}\n", e.getMessage(), e);
         }
@@ -412,6 +410,7 @@ public class HavenoSetup {
         if (p2pNetworkAndWalletInitialized != null && p2pNetworkAndWalletInitialized.get()) return; // skip if already initialized
         if (startupTimeout != null) startupTimeout.stop();
         startupTimeout = UserThread.runAfter(() -> {
+            if (p2pNetworkAndWalletInitialized != null && p2pNetworkAndWalletInitialized.get()) return;
             if (p2PNetworkSetup.p2pNetworkFailed.get() || walletsSetup.walletsSetupFailed.get()) {
                 // Skip this timeout action if the p2p network or wallet setup failed
                 // since an error prompt will be shown containing the error message
@@ -640,10 +639,6 @@ public class HavenoSetup {
                     displaySecurityRecommendationHandler != null)
                 displaySecurityRecommendationHandler.accept(key);
         });
-    }
-
-    private void maybeShowLocalhostRunningInfo() {
-        maybeTriggerDisplayHandler("xmrLocalNode", displayLocalhostHandler, xmrLocalNode.shouldBeUsed());
     }
 
     private void maybeShowAccountSigningStateInfo() {

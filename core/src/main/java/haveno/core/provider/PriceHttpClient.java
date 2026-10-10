@@ -21,6 +21,7 @@ import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import haveno.network.Socks5ProxyProvider;
 import haveno.network.http.HttpClientImpl;
+import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 
 @Singleton
@@ -28,5 +29,8 @@ public class PriceHttpClient extends HttpClientImpl {
     @Inject
     public PriceHttpClient(@Nullable Socks5ProxyProvider socks5ProxyProvider) {
         super(socks5ProxyProvider);
+        // onion connects legitimately take ~45s; a request outlasting the poll period is canceled by the price feed
+        connectTimeoutMs = (int) TimeUnit.SECONDS.toMillis(50);
+        readTimeoutMs = (int) TimeUnit.SECONDS.toMillis(50);
     }
 }

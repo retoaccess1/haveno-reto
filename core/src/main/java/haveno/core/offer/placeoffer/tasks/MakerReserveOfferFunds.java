@@ -19,7 +19,9 @@ package haveno.core.offer.placeoffer.tasks;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 
@@ -40,6 +42,8 @@ import monero.wallet.model.MoneroTxWallet;
 
 @Slf4j
 public class MakerReserveOfferFunds extends Task<PlaceOfferModel> {
+
+    private List<OpenOffer> offerGroup; // group snapshot before reserving so removed members still receive the reserve tx
 
     public MakerReserveOfferFunds(TaskRunner taskHandler, PlaceOfferModel model) {
         super(taskHandler, model);
@@ -81,7 +85,8 @@ public class MakerReserveOfferFunds extends Task<PlaceOfferModel> {
             Integer preferredSubaddressIndex = fundingEntry == null ? null : fundingEntry.getSubaddressIndex();
 
             // copy address entries to clones
-            for (OpenOffer offerClone : model.getOpenOfferManager().getOpenOfferGroup(model.getOpenOffer().getGroupId())) {
+            offerGroup = model.getOpenOfferManager().getOpenOfferGroup(openOffer.getGroupId());
+            for (OpenOffer offerClone : offerGroup) {
                 if (offerClone.getId().equals(offer.getId())) continue; // skip self
                 model.getXmrWalletService().cloneAddressEntries(openOffer.getId(), offerClone.getId());
             }
@@ -95,13 +100,15 @@ public class MakerReserveOfferFunds extends Task<PlaceOfferModel> {
 
                 // attempt creating reserve tx
                 MoneroTxWallet reserveTx = null;
+                List<String> splitOutputKeyImages = model.getOpenOfferManager().getSplitOutputKeyImages(openOffer);
                 try {
+                    model.getXmrWalletService().thawOutputs(splitOutputKeyImages); // thaw split output to spend it in reserve tx
                     synchronized (HavenoUtils.getWalletFunctionLock()) {
                         for (int i = 0; i < TradeProtocol.MAX_ATTEMPTS; i++) {
                             MoneroRpcConnection sourceConnection = model.getXmrWalletService().getXmrConnectionService().getConnection();
                             try {
                                 //if (true) throw new RuntimeException("Pretend error");
-                                reserveTx = model.getXmrWalletService().createReserveTx(penaltyFee, makerFee, sendAmount, securityDeposit, returnAddress, openOffer.isReserveExactAmount(), preferredSubaddressIndex);
+                                reserveTx = model.getXmrWalletService().createReserveTx(openOffer, penaltyFee, makerFee, sendAmount, securityDeposit, returnAddress, openOffer.isReserveExactAmount(), preferredSubaddressIndex);
                             } catch (IllegalStateException e) {
                                 log.warn("Illegal state creating reserve tx, offerId={}, error={}", openOffer.getShortId(), i + 1, e.getMessage());
                                 throw e;
@@ -125,6 +132,7 @@ public class MakerReserveOfferFunds extends Task<PlaceOfferModel> {
                     setReserveTx(null);
                     model.getXmrWalletService().resetAddressEntriesForOpenOffer(offer.getId());
                     if (reserveTx != null) model.getXmrWalletService().thawOutputs(HavenoUtils.getInputKeyImages(reserveTx));
+                    model.getXmrWalletService().freezeOutputs(splitOutputKeyImages);
                     throw e;
                 }
 
@@ -176,13 +184,11 @@ public class MakerReserveOfferFunds extends Task<PlaceOfferModel> {
             for (MoneroOutput input : reserveTx.getInputs()) reservedKeyImages.add(input.getKeyImage().getHex());
         }
 
-        // collect offers to update
-        List<OpenOffer> offersToUpdate = new ArrayList<OpenOffer>();
-        if (openOffer.getGroupId() == null) {
-            offersToUpdate.add(openOffer);
-        } else {
-            offersToUpdate.addAll(model.getOpenOfferManager().getOpenOfferGroup(model.getOpenOffer().getGroupId()));
-        }
+        // collect offers to update by instance, including any removed while reserving so their cancellation thaws the inputs
+        Set<OpenOffer> offersToUpdate = Collections.newSetFromMap(new IdentityHashMap<OpenOffer, Boolean>());
+        offersToUpdate.add(openOffer);
+        if (offerGroup != null) offersToUpdate.addAll(offerGroup);
+        offersToUpdate.addAll(model.getOpenOfferManager().getOpenOfferGroup(openOffer.getGroupId()));
 
         // update offer state
         for (OpenOffer offerToUpdate : offersToUpdate) {

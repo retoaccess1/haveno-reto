@@ -8,6 +8,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 import haveno.common.ThreadUtils;
 import haveno.common.Timer;
@@ -25,6 +27,7 @@ import monero.common.MoneroRpcConnection;
 import monero.common.TaskLooper;
 import monero.wallet.MoneroWallet;
 import monero.wallet.MoneroWalletFull;
+import monero.wallet.MoneroWalletRpc;
 import monero.wallet.model.MoneroSyncResult;
 import monero.wallet.model.MoneroWalletListener;
 
@@ -38,9 +41,15 @@ public abstract class XmrWalletBase {
     private static final String RECEIVED_ERROR_RESPONSE_MSG = "Received error response from RPC request";
     private static final long SAVE_AFTER_ELAPSED_SECONDS = 300;
     private static final long SAVE_PROGRESS_CHECK_PERIOD_MS = 10000;
+    private static final long SAVE_MAX_SYNC_TIME_FRACTION = 10; // save at most 1/10 of the time spent syncing
+    private static final long SAVE_PROGRESS_NATIVE_INTERVAL_MS = 30000; // native saves complete at sync chunk boundaries, so use a fixed interval
+    private static final long SUSTAINED_DISCONNECTION_MS = 120000; // request connection switch after this long disconnected from daemon
+    private static final int WALLET_RESTART_NUM_DISCONNECTIONS = 10; // restart wallet after this many disconnections within the window
+    private static final long WALLET_RESTART_DISCONNECTION_WINDOW_MS = 1200000; // window for counting disconnections towards a restart
+    private static final long WALLET_RESTART_BACKOFF_MS = 900000; // minimum time between disconnection restarts
 
     // inherited
-    protected MoneroWallet wallet;
+    protected volatile MoneroWallet wallet;
     @Getter
     protected final Object walletLock = new Object();
     private final Object resetSyncProgressTimeoutLock = new Object();
@@ -50,11 +59,20 @@ public abstract class XmrWalletBase {
     protected boolean wasWalletSynced;
     protected long lastSaveTimeMs = 0;
     protected boolean isSyncingWithoutProgress;
-    protected boolean isSyncingWithProgress;
+    @Getter
+    protected volatile boolean isSyncingWithProgress; // volatile for unsynchronized cross-thread reads
     private final Object syncWithProgressLock = new Object();
     protected Long syncStartHeight;
+    protected long syncFromHeight;
+    private Long lastReportedHeight;
+    private Long firstDisconnectionTimestamp;
+    private Long disconnectionWindowTimestamp;
+    private int numWindowDisconnections;
+    private Long lastWalletRestartTimestamp;
     protected TaskLooper syncProgressLooper;
     protected CountDownLatch syncProgressLatch;
+    private volatile CountDownLatch backgroundRefreshLatch; // released when the native background sync returns, which can outlive the latch release at target height
+    private volatile MoneroWallet backgroundRefreshWallet; // wallet the background refresh belongs to, to skip stale waits after the wallet is replaced
     protected Exception syncProgressError;
     protected Timer syncProgressTimeout;
     protected long syncProgressTargetHeight;
@@ -62,7 +80,7 @@ public abstract class XmrWalletBase {
     protected final DownloadListener syncProgressListener = new DownloadListener();
     protected final LongProperty walletHeight = new SimpleLongProperty(0);
     @Getter
-    protected boolean isShutDownStarted;
+    protected volatile boolean isShutDownStarted;
     @Getter
     protected boolean isShutDown;
 
@@ -81,7 +99,9 @@ public abstract class XmrWalletBase {
 
     public MoneroSyncResult syncWithTimeout(Long syncTimeoutMs) {
         synchronized (walletLock) {
-            synchronized (HavenoUtils.getDaemonLock()) {
+            awaitBackgroundRefresh(); // otherwise this sync serializes behind it and its work counts against the timeout
+            ReentrantLock daemonLock = HavenoUtils.acquireDaemonLock();
+            try {
                 ExecutorService executor = Executors.newSingleThreadExecutor();
 
                 Callable<MoneroSyncResult> task = () -> {
@@ -116,8 +136,25 @@ public abstract class XmrWalletBase {
                     saveWalletIfElapsedTime();
                     executor.shutdownNow();
                 }
+            } finally {
+                HavenoUtils.releaseDaemonLock(daemonLock);
             }
         }
+    }
+
+    // wait for a released native background sync to finish refreshing, e.g. processing the tx pool
+    private void awaitBackgroundRefresh() {
+        CountDownLatch latch = backgroundRefreshLatch;
+        if (latch == null || latch.getCount() == 0 || backgroundRefreshWallet != wallet) return; // a stale refresh belongs to a replaced wallet
+        log.info("Waiting for background sync to finish before syncing");
+        long startTime = System.currentTimeMillis();
+        try {
+            if (!latch.await(SYNC_TIMEOUT_MS, TimeUnit.MILLISECONDS)) log.warn("Timed out waiting for background sync to finish before syncing");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for background sync to finish", e); // abort instead of starting a sync which can race wallet closure
+        }
+        log.info("Done waiting for background sync in {} ms", System.currentTimeMillis() - startTime);
     }
 
     protected void setUnknownSyncProgress() {
@@ -134,20 +171,34 @@ public abstract class XmrWalletBase {
 
     public void syncWithProgress(Long initialSyncTimeoutMs) {
         synchronized (syncWithProgressLock) {
+
+            // drain a released background refresh so this sync does not serialize behind it, snapshotting the wallet afterwards in case it was replaced while waiting
+            awaitBackgroundRefresh();
+
             MoneroWallet sourceWallet = wallet;
             try {
 
                 // set initial state
                 if (isSyncing()) log.warn("Syncing with progress while already syncing. That should never happen.");
+                syncProgressLatch = new CountDownLatch(1);
                 resetSyncProgressTimeout(initialSyncTimeoutMs);
                 isSyncingWithProgress = true;
                 syncStartHeight = null;
                 syncProgressError = null;
                 syncProgressTargetHeight = xmrConnectionService.getTargetHeight();
-                updateSyncProgress(wallet.getHeight(), syncProgressTargetHeight);
+                syncFromHeight = getSyncFromHeight();
+                // coordinate short RPC calls with password-change reopen without holding walletLock through sync
+                if (sourceWallet instanceof MoneroWalletRpc) {
+                    synchronized (sourceWallet) {
+                        lastReportedHeight = sourceWallet.getHeight(); // seed so the initial update keeps the initial timeout until the height advances
+                    }
+                } else {
+                    lastReportedHeight = sourceWallet.getHeight();
+                }
+                updateSyncProgress(lastReportedHeight, syncProgressTargetHeight);
 
                 // done if already synced
-                if (wallet.getHeight() >= syncProgressTargetHeight - 1) {
+                if (lastReportedHeight >= syncProgressTargetHeight - 1) {
                     onDoneSyncWithProgress();
                     return;
                 }
@@ -165,18 +216,39 @@ public abstract class XmrWalletBase {
                 // native wallet provides sync notifications
                 if (wallet instanceof MoneroWalletFull) {
                     if (testReconnectOnStartup) HavenoUtils.waitFor(1000); // delay sync to test
-                    wallet.sync(new MoneroWalletListener() {
-                        @Override
-                        public void onSyncProgress(long height, long startHeight, long endHeight, double percentDone, String message) {
-                            updateSyncProgress(height, endHeight);
+
+                    // sync in background thread so waiting can time out like rpc wallets
+                    CountDownLatch latch = syncProgressLatch;
+                    CountDownLatch refreshLatch = new CountDownLatch(1);
+                    backgroundRefreshWallet = sourceWallet;
+                    backgroundRefreshLatch = refreshLatch;
+                    TaskLooper saveProgressLooper = startSaveOnScanProgressLooper(); // saves interleave at native sync chunk boundaries
+                    ThreadUtils.submitToPool(() -> {
+                        try {
+                            sourceWallet.sync(new MoneroWalletListener() {
+                                @Override
+                                public void onSyncProgress(long height, long startHeight, long endHeight, double percentDone, String message) {
+                                    if (syncProgressLatch != latch || latch.getCount() == 0) return; // skip stale updates after release
+                                    updateSyncProgress(height, endHeight);
+                                    if (height >= endHeight - 1) latch.countDown(); // release at target height like rpc wallets instead of waiting for refresh to return
+                                }
+                            });
+                        } catch (Exception e) {
+                            if (latch.getCount() > 0 && syncProgressLatch == latch && syncProgressError == null && !isShutDownStarted) syncProgressError = e; // errors after release are moot
+                        } finally {
+                            saveProgressLooper.stop();
+                            refreshLatch.countDown();
+                            latch.countDown();
                         }
                     });
+
+                    // wait for sync to complete or timeout
+                    HavenoUtils.awaitLatch(latch);
                     onDoneSyncWithProgress();
                     return;
                 }
 
                 // start polling wallet for progress
-                syncProgressLatch = new CountDownLatch(1);
                 syncProgressLooper = new TaskLooper(() -> {
 
                     // stop if wallet has changed
@@ -189,7 +261,9 @@ public abstract class XmrWalletBase {
                     // get height
                     long height;
                     try {
-                        height = wallet.getHeight(); // can get read timeout while syncing
+                        synchronized (sourceWallet) {
+                            height = sourceWallet.getHeight(); // can get read timeout while syncing
+                        }
                     } catch (Exception e) {
                         if (syncProgressError == null && wallet != null && !isShutDownStarted) {
                             log.warn("Error getting wallet height while syncing with progress: " + e.getMessage());
@@ -211,19 +285,14 @@ public abstract class XmrWalletBase {
                     // update target height after each update to prevent stalling on new blocks
                     syncProgressTargetHeight = xmrConnectionService.getTargetHeight();
                 });
-                wallet.startSyncing(xmrConnectionService.getRefreshPeriodMs());
+                long refreshPeriodMs = xmrConnectionService.getRefreshPeriodMs();
+                synchronized (sourceWallet) {
+                    sourceWallet.startSyncing(refreshPeriodMs);
+                }
                 syncProgressLooper.start(1000);
 
-                // save wallet periodically
-                TaskLooper saveProgressLooper = new TaskLooper(() -> {
-                    if (syncProgressError != null) return; // skip if sync errored
-                    try {
-                        saveWalletIfElapsedTime(false);
-                    } catch (Exception e) {
-                        if (syncProgressError == null) log.warn("Error periodically saving wallet during sync with progress: {}", e.getMessage());
-                    }
-                });
-                saveProgressLooper.start(SAVE_PROGRESS_CHECK_PERIOD_MS);
+                // save wallet when height advances so scanned blocks are kept if the wallet is force closed
+                TaskLooper saveProgressLooper = startSaveOnScanProgressLooper();
 
                 // wait for sync to complete
                 try {
@@ -308,29 +377,101 @@ public abstract class XmrWalletBase {
         return getRefreshPeriodMs() + 5000; // add padding to guarantee a sync cycle with monero-wallet-rpc (200 ms refresh evaluation period + sync time)
     }
 
+    // returns whether the wallet has failed to connect to the daemon beyond a grace period, warranting a connection switch
+    protected boolean isSustainedDisconnection(Throwable e) {
+        if (!HavenoUtils.isNotConnectedToDaemon(e)) return false;
+        if (firstDisconnectionTimestamp == null) firstDisconnectionTimestamp = System.currentTimeMillis();
+        return System.currentTimeMillis() - firstDisconnectionTimestamp >= SUSTAINED_DISCONNECTION_MS;
+    }
+
+    protected void resetDisconnectionTracking() {
+        firstDisconnectionTimestamp = null;
+    }
+
+    // records a disconnection and returns whether the wallet should restart to replace its native client, which can become stuck while connections are otherwise healthy
+    protected boolean shouldRestartFromDisconnections() {
+        long now = System.currentTimeMillis();
+        if (disconnectionWindowTimestamp == null || now - disconnectionWindowTimestamp > WALLET_RESTART_DISCONNECTION_WINDOW_MS) {
+            disconnectionWindowTimestamp = now;
+            numWindowDisconnections = 0;
+        }
+        numWindowDisconnections++;
+        if (numWindowDisconnections < WALLET_RESTART_NUM_DISCONNECTIONS) return false;
+        if (lastWalletRestartTimestamp != null && now - lastWalletRestartTimestamp < WALLET_RESTART_BACKOFF_MS) return false;
+        lastWalletRestartTimestamp = now;
+        disconnectionWindowTimestamp = null;
+        return true;
+    }
+
+    // height syncing effectively begins from, used to floor reported progress; 0 for no floor
+    protected long getSyncFromHeight() {
+        return 0;
+    }
+
+    // marks the daemon trusted if applicable, which monero-wallet-rpc requires for commands like rescan spent
+    protected void setDaemonConnection(MoneroWallet wallet, MoneroRpcConnection connection, boolean trustDaemon) {
+        if (wallet instanceof MoneroWalletRpc) ((MoneroWalletRpc) wallet).setDaemonConnection(connection, trustDaemon, null);
+        else wallet.setDaemonConnection(connection); // native wallets infer trust from a local address
+    }
+
     // --------------------------------- ABSTRACT -----------------------------
 
     protected abstract void saveWalletNoSync();
 
     // ------------------------------ PRIVATE HELPERS -------------------------
 
+    // save the wallet as the scanned height advances so a force close loses less work
+    private TaskLooper startSaveOnScanProgressLooper() {
+        AtomicLong lastSaveHeight = new AtomicLong(walletHeight.get());
+        AtomicLong minSaveIntervalMs = new AtomicLong();
+        TaskLooper saveProgressLooper = new TaskLooper(() -> {
+            if (syncProgressError != null) return; // skip if sync errored
+            long height = walletHeight.get();
+            if (height <= lastSaveHeight.get()) return; // skip unless height advanced, so saves cannot queue on a stalled wallet
+            if (System.currentTimeMillis() - lastSaveTimeMs < minSaveIntervalMs.get()) return;
+            try {
+                long startTime = System.currentTimeMillis();
+                MoneroWallet sourceWallet = wallet;
+                if (sourceWallet == null) return;
+                if (sourceWallet instanceof MoneroWalletRpc) {
+                    synchronized (sourceWallet) {
+                        if (wallet != sourceWallet) return;
+                        saveWalletNoSync(); // skip walletLock, which the syncing thread may hold
+                    }
+                } else {
+                    saveWalletNoSync(); // native saves synchronize with sync chunks
+                }
+                minSaveIntervalMs.set(wallet instanceof MoneroWalletFull ? SAVE_PROGRESS_NATIVE_INTERVAL_MS : (System.currentTimeMillis() - startTime) * SAVE_MAX_SYNC_TIME_FRACTION); // native save duration mostly awaits the current chunk, so back off a fixed interval; rpc backs off on slow saves to bound overhead
+                lastSaveHeight.set(height);
+            } catch (Exception e) {
+                if (syncProgressError == null) log.warn("Error periodically saving wallet during sync with progress: {}", e.getMessage());
+            }
+        });
+        saveProgressLooper.start(SAVE_PROGRESS_CHECK_PERIOD_MS);
+        return saveProgressLooper;
+    }
+
     private void updateSyncProgress(Long height, long targetHeight) {
+        if (syncProgressError != null) return; // ignore late updates after this sync attempt already failed
 
-        // use last height if no update
-        long appliedHeight = height == null ? walletHeight.get() : height;
+        // use last height if no update, floored at the restore height while the wallet skips ahead to it
+        long rawHeight = height == null ? walletHeight.get() : height;
+        long appliedHeight = Math.max(rawHeight, syncFromHeight);
 
-        // reset progress timeout if height advanced
-        if (appliedHeight != walletHeight.get()) {
+        // reset progress timeout if the wallet's reported height advanced
+        if (height != null && !height.equals(lastReportedHeight)) {
+            lastReportedHeight = height;
             resetSyncProgressTimeout(SYNC_TIMEOUT_MS); // revert to default timeout after any change
+            xmrConnectionService.reportWalletSyncProgress(this);
         }
 
         // set wallet height
         walletHeight.set(appliedHeight);
 
-        // calculate progress
-        long blocksRemaining = appliedHeight <= 1 ? -1 : targetHeight - 1 - appliedHeight; // unknown blocks left if height <= 1
-        if (syncStartHeight == null && appliedHeight > 1) syncStartHeight = appliedHeight;
-        double percent = syncStartHeight == null || appliedHeight <= 1 ? 0.0 : Math.min(1.0, syncStartHeight >= targetHeight - 1  ? 1.0 : ((double) appliedHeight - syncStartHeight) / (double) (targetHeight - 1 - syncStartHeight));
+        // calculate progress from the reported height, which advances through the hash skip to the restore height
+        long blocksRemaining = rawHeight <= 1 ? -1 : targetHeight - 1 - rawHeight; // unknown blocks left if height <= 1
+        if (rawHeight > 1 && (syncStartHeight == null || rawHeight < syncStartHeight)) syncStartHeight = rawHeight; // rebase to the lowest reported height
+        double percent = syncStartHeight == null || rawHeight <= 1 ? 0.0 : Math.min(1.0, syncStartHeight >= targetHeight - 1  ? 1.0 : ((double) rawHeight - syncStartHeight) / (double) (targetHeight - 1 - syncStartHeight));
         if (percent >= 1.0) wasWalletSynced = true; // set synced state before announcing progress
 
         // notify progress listener on user thread
@@ -355,11 +496,18 @@ public abstract class XmrWalletBase {
         if (syncProgressError == null) wasWalletSynced = true; // this is redundant but conservative to set again
 
         // stop syncing and save wallet if elapsed time
-        if (wallet != null) { // can become null if interrupted by force close
+        MoneroWallet sourceWallet = wallet;
+        if (sourceWallet != null) { // can become null if interrupted by force close
 
             // TODO: skipping stop sync if unresponsive because wallet will hang. if unresponsive, wallet is assumed to be force restarted by caller, but that should be done internally here instead of externally?
             if (syncProgressError == null || !HavenoUtils.isUnresponsive(syncProgressError)) {
-                wallet.stopSyncing();
+                if (sourceWallet instanceof MoneroWalletRpc) {
+                    synchronized (sourceWallet) {
+                        sourceWallet.stopSyncing();
+                    }
+                } else {
+                    sourceWallet.stopSyncing();
+                }
                 saveWalletIfElapsedTime();
             }
         }
@@ -368,6 +516,6 @@ public abstract class XmrWalletBase {
     }
 
     protected boolean isExpectedWalletError(Exception e) {
-        return e.getMessage() != null && (HavenoUtils.isUnresponsive(e) || e.getMessage().contains(RECEIVED_ERROR_RESPONSE_MSG)); // TODO: why does this error happen "normally"?
+        return e.getMessage() != null && (HavenoUtils.isUnresponsive(e) || HavenoUtils.isNotConnectedToDaemon(e) || e.getMessage().contains(RECEIVED_ERROR_RESPONSE_MSG)); // TODO: why does this error happen "normally"?
     }
 }

@@ -20,11 +20,8 @@ package haveno.desktop.util;
 import com.jfoenix.controls.JFXComboBox;
 //import com.jfoenix.controls.JFXDatePicker;
 import com.jfoenix.controls.JFXTextArea;
-import com.jfoenix.controls.JFXToggleButton;
-import de.jensd.fx.fontawesome.AwesomeDude;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import de.jensd.fx.glyphs.GlyphIcons;
-import de.jensd.fx.glyphs.materialdesignicons.utils.MaterialDesignIconFactory;
 import haveno.common.util.Tuple2;
 import haveno.common.util.Tuple3;
 import haveno.common.util.Tuple4;
@@ -40,6 +37,7 @@ import haveno.desktop.components.AutoTooltipTextField;
 import haveno.desktop.components.AutocompleteComboBox;
 import haveno.desktop.components.BalanceTextField;
 import haveno.desktop.components.BusyAnimation;
+import haveno.desktop.components.ChatIcon;
 import haveno.desktop.components.ExplorerAddressTextField;
 import haveno.desktop.components.ExternalHyperlink;
 import haveno.desktop.components.FundsTextField;
@@ -55,6 +53,7 @@ import haveno.desktop.components.TextFieldWithCopyIcon;
 import haveno.desktop.components.TextFieldWithIcon;
 import haveno.desktop.components.TitledGroupBg;
 import haveno.desktop.components.TxIdTextField;
+import javafx.css.PseudoClass;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -73,6 +72,7 @@ import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.ToggleGroup;
+import javafx.scene.control.Tooltip;
 import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
@@ -388,7 +388,10 @@ public class FormBuilder {
 
         VBox vbox = getTopLabelVBox(0);
         vbox.setSpacing(2);
-        vbox.getChildren().addAll(getTopLabel(title), hbox);
+        Label label = getTopLabel(title);
+        Accessibility.setLabel(label, textField);
+        Accessibility.setName(button, Res.get("shared.edit"));
+        vbox.getChildren().addAll(label, hbox);
 
         gridPane.getChildren().add(vbox);
         GridPane.setRowIndex(vbox, rowIndex);
@@ -431,6 +434,7 @@ public class FormBuilder {
         Label label1 = addLabel(gridPane, rowIndex, title1);
         label1.getStyleClass().add("confirmation-label");
         Label label2 = addLabel(gridPane, rowIndex, title2);
+        Accessibility.setLabel(label1, label2);
         label2.getStyleClass().add("confirmation-value");
         label2.setWrapText(isWrapped);
         GridPane.setColumnIndex(label2, 1);
@@ -459,6 +463,7 @@ public class FormBuilder {
         Label label1 = addLabel(gridPane, rowIndex, title1);
         label1.getStyleClass().add("confirmation-label");
         TextField label2 = new HavenoTextField(title2);
+        Accessibility.setLabel(label1, label2);
         gridPane.getChildren().add(label2);
         label2.getStyleClass().add("confirmation-text-field-as-label");
         label2.setEditable(false);
@@ -964,7 +969,7 @@ public class FormBuilder {
                                                                                                          String toggleButtonTitle) {
 
         InputTextField inputTextField = new InputTextField();
-        ToggleButton toggleButton = new JFXToggleButton();
+        ToggleButton toggleButton = new AutoTooltipSlideToggleButton();
         toggleButton.setText(toggleButtonTitle);
         VBox.setMargin(toggleButton, new Insets(4, 0, 0, 0));
 
@@ -983,7 +988,7 @@ public class FormBuilder {
 
         InputTextField inputTextField = new InputTextField();
         Tuple2<Label, VBox> topLabelWithVBox = addTopLabelWithVBox(gridPane, rowIndex, title, inputTextField, 0);
-        ToggleButton toggleButton = new JFXToggleButton();
+        ToggleButton toggleButton = new AutoTooltipSlideToggleButton();
         toggleButton.setText(toggleButtonTitle);
         HBox hBox = new HBox();
         hBox.getChildren().addAll(topLabelWithVBox.second, toggleButton);
@@ -1330,6 +1335,7 @@ public class FormBuilder {
         comboBox.setPromptText(prompt);
         comboBox.setPadding(new Insets(top, 0, 0, 12));
 
+        Accessibility.setLabel(label, comboBox);
         vBox.getChildren().addAll(label, comboBox);
 
         return new Tuple3<>(vBox, label, comboBox);
@@ -1346,6 +1352,7 @@ public class FormBuilder {
 
         final AutocompleteComboBox<T> comboBox = new AutocompleteComboBox<>();
 
+        Accessibility.setLabel(label, comboBox);
         vBox.getChildren().addAll(label, comboBox);
 
         return new Tuple3<>(vBox, label, comboBox);
@@ -1360,6 +1367,7 @@ public class FormBuilder {
         VBox vBox = getTopLabelVBox(top);
 
         final AutoTooltipTextField textField = new AutoTooltipTextField();
+        Accessibility.setLabel(label, textField);
         vBox.getChildren().addAll(label, textField);
 
         return new Tuple3<>(vBox, label, textField);
@@ -1412,6 +1420,7 @@ public class FormBuilder {
         Label label = getTopLabel(title);
         VBox vBox = getTopLabelVBox(0);
         vBox.getChildren().addAll(label, node);
+        Accessibility.setLabel(label, node);
 
         return new Tuple2<>(label, vBox);
     }
@@ -1457,6 +1466,7 @@ public class FormBuilder {
         comboBox.setLabelFloat(true);
         comboBox.getStyleClass().add("label-float");
         comboBox.setPromptText(title);
+        Accessibility.setHelp(comboBox, title);
         comboBox.setMaxWidth(Double.MAX_VALUE);
 
         // Default ComboBox does not show promptText after clear selection.
@@ -1531,6 +1541,7 @@ public class FormBuilder {
         final VBox topLabelVBox1 = getTopLabelVBox(5);
         final Label topLabel1 = getTopLabel(titleTextfield);
         final TextField textField = new HavenoTextField();
+        Accessibility.setLabel(topLabel1, textField);
         topLabelVBox1.getChildren().addAll(topLabel1, textField);
 
         final VBox topLabelVBox2 = getTopLabelVBox(5);
@@ -1539,6 +1550,7 @@ public class FormBuilder {
         comboBox.setPromptText(titleCombobox);
         comboBox.setLabelFloat(true);
         comboBox.getStyleClass().add("label-float");
+        Accessibility.setLabel(topLabel2, comboBox);
         topLabelVBox2.getChildren().addAll(topLabel2, comboBox);
 
         hBox.getChildren().addAll(topLabelVBox1, topLabelVBox2);
@@ -1600,6 +1612,7 @@ public class FormBuilder {
         JFXComboBox<T> comboBox = new JFXComboBox<>();
         GUIUtil.applyFilledStyle(comboBox);
         comboBox.setPromptText(titleCombobox);
+        Accessibility.setHelp(comboBox, titleCombobox);
         comboBox.setLabelFloat(true);
         comboBox.getStyleClass().add("label-float");
 
@@ -1607,6 +1620,7 @@ public class FormBuilder {
 
         final VBox topLabelVBox = getTopLabelVBox(5);
         final Label topLabel = getTopLabel(titleTextfield);
+        Accessibility.setLabel(topLabel, textField);
         topLabelVBox.getChildren().addAll(topLabel, textField);
 
         hBox.getChildren().addAll(comboBox, topLabelVBox);
@@ -1905,7 +1919,8 @@ public class FormBuilder {
         fundsTextField.getTextField().setPromptText(text);
         GridPane.setRowIndex(fundsTextField, rowIndex);
         GridPane.setColumnIndex(fundsTextField, 0);
-        GridPane.setMargin(fundsTextField, new Insets(top + 20, 0, 0, 0));
+        // the caption floats 16px above the field; +26 lands it where the captioned boxes' labels sit
+        GridPane.setMargin(fundsTextField, new Insets(top + 26, 0, 0, 0));
         gridPane.getChildren().add(fundsTextField);
 
         return fundsTextField;
@@ -2265,6 +2280,7 @@ public class FormBuilder {
         input.setMaxWidth(Double.MAX_VALUE);
         box.setAlignment(Pos.CENTER_LEFT);
         box.getStyleClass().add("offer-input");
+        mirrorInputStateToBox(box, input);
         box.getChildren().addAll(input, label);
         return new Tuple3<>(box, input, label);
     }
@@ -2283,8 +2299,17 @@ public class FormBuilder {
         infoInputTextField.setMaxWidth(Double.MAX_VALUE);
         box.setAlignment(Pos.CENTER_LEFT);
         box.getStyleClass().add("offer-input");
+        mirrorInputStateToBox(box, input);
         box.getChildren().addAll(infoInputTextField, label);
         return new Tuple3<>(box, infoInputTextField, label);
+    }
+
+    // mirror the input's focus and validation state onto the surrounding box for border styling
+    private static void mirrorInputStateToBox(HBox box, InputTextField input) {
+        input.focusedProperty().addListener((o, oldValue, newValue) ->
+                box.pseudoClassStateChanged(PseudoClass.getPseudoClass("focused"), newValue));
+        input.validationResultProperty().addListener((o, oldValue, newValue) ->
+                box.pseudoClassStateChanged(PseudoClass.getPseudoClass("error"), newValue != null && !newValue.isValid));
     }
 
     public static Tuple3<HBox, TextField, Label> getNonEditableValueBox() {
@@ -2392,7 +2417,7 @@ public class FormBuilder {
 
     public static Text getIconForLabel(GlyphIcons icon, String iconSize, Label label, String style) {
         if (icon.fontFamily().equals(MATERIAL_DESIGN_ICONS)) {
-            final Text textIcon = MaterialDesignIconFactory.get().createIcon(icon, iconSize);
+            final Text textIcon = GlyphsDude.createIcon(icon, iconSize);
             textIcon.setOpacity(0.7);
             if (style != null) {
                 textIcon.getStyleClass().add(style);
@@ -2441,7 +2466,7 @@ public class FormBuilder {
         Text textIcon;
 
         if (icon.fontFamily().equals(MATERIAL_DESIGN_ICONS)) {
-            textIcon = MaterialDesignIconFactory.get().createIcon(icon, iconSize);
+            textIcon = GlyphsDude.createIcon(icon, iconSize);
         } else {
             throw new IllegalArgumentException("Not supported icon type");
         }
@@ -2450,23 +2475,35 @@ public class FormBuilder {
     }
 
 
-    public static Label getIcon(AwesomeIcon icon) {
+    public static Label getIcon(FontAwesomeIcon icon) {
         final Label label = new Label();
-        AwesomeDude.setIcon(label, icon);
+        GlyphsDude.setIcon(label, icon);
         return label;
     }
 
-    public static Label getIcon(AwesomeIcon icon, String fontSize) {
+    public static Label getIcon(FontAwesomeIcon icon, String fontSize) {
         return getIconForLabel(icon, new Label(), fontSize);
     }
 
-    public static Label getSmallIcon(AwesomeIcon icon) {
+    public static Label getSmallIcon(FontAwesomeIcon icon) {
         return getIcon(icon, "1em");
     }
 
-    public static Label getIconForLabel(AwesomeIcon icon, Label label, String fontSize) {
-        AwesomeDude.setIcon(label, icon, fontSize);
+    public static Label getIconForLabel(FontAwesomeIcon icon, Label label, String fontSize) {
+        GlyphsDude.setLabelGlyph(label, icon, fontSize);
         return label;
+    }
+
+    public static Button getChatIconButton() {
+        Button button = new Button("", new ChatIcon());
+        button.setId("icon-button");
+        button.getStyleClass().addAll("chat-icon-button", "a11y-focusable");
+        button.setPrefSize(30, 30);
+        button.setPadding(Insets.EMPTY);
+        String text = Res.get("tradeChat.openChat");
+        button.setTooltip(new Tooltip(text));
+        Accessibility.setName(button, text);
+        return button;
     }
 
     public static Button getIconButton(GlyphIcons icon) {
@@ -2487,8 +2524,13 @@ public class FormBuilder {
 
     public static Button getIconButton(GlyphIcons icon, String styleClass, String iconSize) {
         if (icon.fontFamily().equals(MATERIAL_DESIGN_ICONS)) {
-            Button iconButton = MaterialDesignIconFactory.get().createIconButton(icon,
+            Button iconButton = GlyphsDude.createIconButton(icon,
                     "", iconSize, null, ContentDisplay.CENTER);
+            Accessibility.setName(iconButton, Accessibility.iconName(icon));
+            // prefer the localized tooltip as the name once one is set
+            iconButton.tooltipProperty().addListener((o, oldVal, newVal) -> {
+                if (newVal != null) Accessibility.setName(iconButton, newVal.getText());
+            });
             iconButton.setId("icon-button");
             iconButton.getGraphic().getStyleClass().add(styleClass);
             iconButton.setPrefWidth(20);

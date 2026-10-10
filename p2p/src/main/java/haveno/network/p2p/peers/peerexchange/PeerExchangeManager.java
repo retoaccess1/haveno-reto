@@ -171,8 +171,8 @@ public class PeerExchangeManager implements MessageListener, ConnectionListener,
     public void onAwakeFromStandby() {
         closeAllHandlers();
         stopped = false;
-        if (!networkNode.getAllConnections().isEmpty())
-            restart();
+        // restart even if all connections were lost in standby; exchanging peers opens new connections
+        restart();
     }
 
 
@@ -232,6 +232,9 @@ public class PeerExchangeManager implements MessageListener, ConnectionListener,
 
                                 peerManager.handleConnectionFault(nodeAddress);
                                 handlerMap.remove(nodeAddress);
+                                // skip peers connected since the list was built, except seeds as the bootstrap fallback
+                                remainingNodeAddresses.removeIf(e -> peerManager.isPeerUnavailable(e) ||
+                                        (peerManager.isConfirmed(e) && !peerManager.isSeedNode(e)));
                                 if (!remainingNodeAddresses.isEmpty()) {
                                     if (!peerManager.hasSufficientConnections()) {
                                         log.debug("There are remaining nodes available for requesting peers. " +
@@ -356,7 +359,8 @@ public class PeerExchangeManager implements MessageListener, ConnectionListener,
         return collection.stream()
                 .filter(e -> !list.contains(e) &&
                         !peerManager.isSelf(e) &&
-                        !peerManager.isConfirmed(e))
+                        !peerManager.isConfirmed(e) &&
+                        !peerManager.isPeerUnavailable(e))
                 .collect(Collectors.toList());
     }
 

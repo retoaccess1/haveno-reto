@@ -46,6 +46,7 @@ import haveno.core.payment.AliPayAccount;
 import haveno.core.payment.AmazonGiftCardAccount;
 import haveno.core.payment.AustraliaPayidAccount;
 import haveno.core.payment.BizumAccount;
+import haveno.core.payment.BlikAccount;
 import haveno.core.payment.CapitualAccount;
 import haveno.core.payment.CashAppAccount;
 import haveno.core.payment.CashAtAtmAccount;
@@ -54,33 +55,51 @@ import haveno.core.payment.PayPalAccount;
 import haveno.core.payment.PaysafeAccount;
 import haveno.core.payment.CashDepositAccount;
 import haveno.core.payment.CelPayAccount;
+import haveno.core.payment.YooMoneyAccount;
 import haveno.core.payment.ZelleAccount;
 import haveno.core.payment.DomesticWireTransferAccount;
+import haveno.core.payment.DuitNowAccount;
 import haveno.core.payment.F2FAccount;
 import haveno.core.payment.FasterPaymentsAccount;
+import haveno.core.payment.FpsAccount;
+import haveno.core.payment.GcashAccount;
 import haveno.core.payment.HalCashAccount;
 import haveno.core.payment.ImpsAccount;
 import haveno.core.payment.InteracETransferAccount;
 import haveno.core.payment.JapanBankAccount;
+import haveno.core.payment.KaspiAccount;
+import haveno.core.payment.MbWayAccount;
+import haveno.core.payment.MercadoPagoAccount;
+import haveno.core.payment.MomoAccount;
+import haveno.core.payment.MirAccount;
 import haveno.core.payment.MoneseAccount;
 import haveno.core.payment.MoneyBeamAccount;
 import haveno.core.payment.MoneyGramAccount;
+import haveno.core.payment.MpesaAccount;
 import haveno.core.payment.NationalBankAccount;
 import haveno.core.payment.NeftAccount;
 import haveno.core.payment.NequiAccount;
+import haveno.core.payment.NipAccount;
+import haveno.core.payment.PagoMovilAccount;
+import haveno.core.payment.PaparaAccount;
 import haveno.core.payment.PaxumAccount;
+import haveno.core.payment.PayNowAccount;
+import haveno.core.payment.PayPayAccount;
 import haveno.core.payment.PayseraAccount;
 import haveno.core.payment.PaytmAccount;
 import haveno.core.payment.PerfectMoneyAccount;
 import haveno.core.payment.PixAccount;
-import haveno.core.payment.PopmoneyAccount;
 import haveno.core.payment.PromptPayAccount;
+import haveno.core.payment.QrisAccount;
+import haveno.core.payment.RaastAccount;
 import haveno.core.payment.RevolutAccount;
 import haveno.core.payment.RtgsAccount;
 import haveno.core.payment.SameBankAccount;
 import haveno.core.payment.SatispayAccount;
+import haveno.core.payment.SbpAccount;
 import haveno.core.payment.SepaAccount;
 import haveno.core.payment.SepaInstantAccount;
+import haveno.core.payment.SpeiAccount;
 import haveno.core.payment.SpecificBanksAccount;
 import haveno.core.payment.StrikeAccount;
 import haveno.core.payment.SwiftAccount;
@@ -89,12 +108,16 @@ import haveno.core.payment.TikkieAccount;
 import haveno.core.payment.TradeLimits;
 import haveno.core.payment.TransferwiseAccount;
 import haveno.core.payment.TransferwiseUsdAccount;
+import haveno.core.payment.TwintAccount;
 import haveno.core.payment.USPostalMoneyOrderAccount;
+import haveno.core.payment.UkraineCardAccount;
 import haveno.core.payment.UpholdAccount;
 import haveno.core.payment.UpiAccount;
 import haveno.core.payment.VenmoAccount;
 import haveno.core.payment.VerseAccount;
+import haveno.core.payment.VippsMobilePayAccount;
 import haveno.core.payment.WeChatPayAccount;
+import haveno.core.payment.WeroAccount;
 import haveno.core.payment.WesternUnionAccount;
 import haveno.core.trade.HavenoUtils;
 import lombok.EqualsAndHashCode;
@@ -134,12 +157,15 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
 
     public static final String UPHOLD_ID = "UPHOLD";
     public static final String MONEY_BEAM_ID = "MONEY_BEAM";
-    public static final String POPMONEY_ID = "POPMONEY";
+    @Deprecated
+    public static final String POPMONEY_ID = "POPMONEY"; // Removed due to Popmoney being discontinued
     public static final String REVOLUT_ID = "REVOLUT";
     public static final String PERFECT_MONEY_ID = "PERFECT_MONEY";
     public static final String SEPA_ID = "SEPA";
     public static final String SEPA_INSTANT_ID = "SEPA_INSTANT";
+    public static final String SPEI_ID = "SPEI";
     public static final String FASTER_PAYMENTS_ID = "FASTER_PAYMENTS";
+    public static final String GCASH_ID = "GCASH";
     public static final String NATIONAL_BANK_ID = "NATIONAL_BANK";
     public static final String JAPAN_BANK_ID = "JAPAN_BANK";
     public static final String AUSTRALIA_PAYID_ID = "AUSTRALIA_PAYID";
@@ -156,6 +182,8 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static final String INTERAC_E_TRANSFER_ID = "INTERAC_E_TRANSFER";
     public static final String US_POSTAL_MONEY_ORDER_ID = "US_POSTAL_MONEY_ORDER";
     public static final String CASH_DEPOSIT_ID = "CASH_DEPOSIT";
+    public static final String MERCADO_PAGO_ID = "MERCADO_PAGO";
+    public static final String MOMO_ID = "MOMO";
     public static final String MONEY_GRAM_ID = "MONEY_GRAM";
     public static final String WESTERN_UNION_ID = "WESTERN_UNION";
     public static final String HAL_CASH_ID = "HAL_CASH";
@@ -182,6 +210,7 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static final String CAPITUAL_ID = "CAPITUAL";
     public static final String CELPAY_ID = "CELPAY";
     public static final String MONESE_ID = "MONESE";
+    public static final String MPESA_ID = "MPESA";
     public static final String SATISPAY_ID = "SATISPAY";
     public static final String TIKKIE_ID = "TIKKIE";
     public static final String VERSE_ID = "VERSE";
@@ -195,6 +224,25 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static final String VENMO_ID = "VENMO";
     public static final String PAYPAL_ID = "PAYPAL";
     public static final String PAYSAFE_ID = "PAYSAFE";
+    public static final String BLIK_ID = "BLIK";
+    public static final String VIPPS_MOBILEPAY_ID = "VIPPS_MOBILEPAY";
+    public static final String TWINT_ID = "TWINT";
+    public static final String NIP_ID = "NIP";
+    public static final String PAGO_MOVIL_ID = "PAGO_MOVIL";
+    public static final String QRIS_ID = "QRIS";
+    public static final String PAPARA_ID = "PAPARA";
+    public static final String RAAST_ID = "RAAST";
+    public static final String PAYNOW_ID = "PAYNOW";
+    public static final String WERO_ID = "WERO";
+    public static final String FPS_ID = "FPS";
+    public static final String DUITNOW_ID = "DUITNOW";
+    public static final String MB_WAY_ID = "MB_WAY";
+    public static final String PAYPAY_ID = "PAYPAY";
+    public static final String SBP_ID = "SBP";
+    public static final String MIR_ID = "MIR";
+    public static final String YOOMONEY_ID = "YOOMONEY";
+    public static final String UKRAINE_CARD_ID = "UKRAINE_CARD";
+    public static final String KASPI_ID = "KASPI";
 
     public static PaymentMethod UPHOLD;
     public static PaymentMethod MONEY_BEAM;
@@ -202,8 +250,10 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static PaymentMethod REVOLUT;
     public static PaymentMethod PERFECT_MONEY;
     public static PaymentMethod SEPA;
+    public static PaymentMethod SPEI;
     public static PaymentMethod SEPA_INSTANT;
     public static PaymentMethod FASTER_PAYMENTS;
+    public static PaymentMethod GCASH;
     public static PaymentMethod NATIONAL_BANK;
     public static PaymentMethod JAPAN_BANK;
     public static PaymentMethod AUSTRALIA_PAYID;
@@ -217,6 +267,8 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static PaymentMethod INTERAC_E_TRANSFER;
     public static PaymentMethod US_POSTAL_MONEY_ORDER;
     public static PaymentMethod CASH_DEPOSIT;
+    public static PaymentMethod MERCADO_PAGO;
+    public static PaymentMethod MOMO;
     public static PaymentMethod MONEY_GRAM;
     public static PaymentMethod WESTERN_UNION;
     public static PaymentMethod F2F;
@@ -243,6 +295,7 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static PaymentMethod CAPITUAL;
     public static PaymentMethod CELPAY;
     public static PaymentMethod MONESE;
+    public static PaymentMethod MPESA;
     public static PaymentMethod SATISPAY;
     public static PaymentMethod TIKKIE;
     public static PaymentMethod VERSE;
@@ -255,6 +308,25 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     public static PaymentMethod CASH_APP;
     public static PaymentMethod VENMO;
     public static PaymentMethod PAYSAFE;
+    public static PaymentMethod BLIK;
+    public static PaymentMethod VIPPS_MOBILEPAY;
+    public static PaymentMethod TWINT;
+    public static PaymentMethod NIP;
+    public static PaymentMethod PAGO_MOVIL;
+    public static PaymentMethod QRIS;
+    public static PaymentMethod PAPARA;
+    public static PaymentMethod RAAST;
+    public static PaymentMethod PAYNOW;
+    public static PaymentMethod WERO;
+    public static PaymentMethod FPS;
+    public static PaymentMethod DUITNOW;
+    public static PaymentMethod MB_WAY;
+    public static PaymentMethod PAYPAY;
+    public static PaymentMethod SBP;
+    public static PaymentMethod MIR;
+    public static PaymentMethod YOOMONEY;
+    public static PaymentMethod UKRAINE_CARD;
+    public static PaymentMethod KASPI;
 
     // Cannot be deleted as it would break old trade history entries
     @Deprecated
@@ -275,9 +347,58 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
             // Sweden
             SWISH = new PaymentMethod(SWISH_ID, DAY, DEFAULT_TRADE_LIMIT_LOW_RISK, getAssetCodes(SwishAccount.SUPPORTED_CURRENCIES)),
 
+            // Norway, Denmark, Finland
+            VIPPS_MOBILEPAY = new PaymentMethod(VIPPS_MOBILEPAY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(VippsMobilePayAccount.SUPPORTED_CURRENCIES)),
+
+            // Switzerland
+            TWINT = new PaymentMethod(TWINT_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(TwintAccount.SUPPORTED_CURRENCIES)),
+
+            // Nigeria
+            NIP = new PaymentMethod(NIP_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(NipAccount.SUPPORTED_CURRENCIES)),
+
+            // Venezuela
+            PAGO_MOVIL = new PaymentMethod(PAGO_MOVIL_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(PagoMovilAccount.SUPPORTED_CURRENCIES)),
+
+            // Indonesia
+            QRIS = new PaymentMethod(QRIS_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(QrisAccount.SUPPORTED_CURRENCIES)),
+
+            // Turkey
+            PAPARA = new PaymentMethod(PAPARA_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(PaparaAccount.SUPPORTED_CURRENCIES)),
+
+            // Pakistan
+            RAAST = new PaymentMethod(RAAST_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(RaastAccount.SUPPORTED_CURRENCIES)),
+
+            // Singapore
+            PAYNOW = new PaymentMethod(PAYNOW_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(PayNowAccount.SUPPORTED_CURRENCIES)),
+
+            // Europe
+            WERO = new PaymentMethod(WERO_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(WeroAccount.SUPPORTED_CURRENCIES)),
+
+            // Hong Kong
+            FPS = new PaymentMethod(FPS_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(FpsAccount.SUPPORTED_CURRENCIES)),
+
+            // Malaysia
+            DUITNOW = new PaymentMethod(DUITNOW_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(DuitNowAccount.SUPPORTED_CURRENCIES)),
+
+            // Portugal
+            MB_WAY = new PaymentMethod(MB_WAY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(MbWayAccount.SUPPORTED_CURRENCIES)),
+
+            // Japan
+            PAYPAY = new PaymentMethod(PAYPAY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(PayPayAccount.SUPPORTED_CURRENCIES)),
+
+            // Russia
+            SBP = new PaymentMethod(SBP_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(SbpAccount.SUPPORTED_CURRENCIES)),
+            MIR = new PaymentMethod(MIR_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(MirAccount.SUPPORTED_CURRENCIES)),
+            YOOMONEY = new PaymentMethod(YOOMONEY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(YooMoneyAccount.SUPPORTED_CURRENCIES)),
+
+            // Ukraine
+            UKRAINE_CARD = new PaymentMethod(UKRAINE_CARD_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(UkraineCardAccount.SUPPORTED_CURRENCIES)),
+
+            // Kazakhstan
+            KASPI = new PaymentMethod(KASPI_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(KaspiAccount.SUPPORTED_CURRENCIES)),
+
             // US
             ZELLE = new PaymentMethod(ZELLE_ID, 4 * DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(ZelleAccount.SUPPORTED_CURRENCIES)),
-            POPMONEY = new PaymentMethod(POPMONEY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(PopmoneyAccount.SUPPORTED_CURRENCIES)),
             US_POSTAL_MONEY_ORDER = new PaymentMethod(US_POSTAL_MONEY_ORDER_ID, 8 * DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(USPostalMoneyOrderAccount.SUPPORTED_CURRENCIES)),
             VENMO = new PaymentMethod(VENMO_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(VenmoAccount.SUPPORTED_CURRENCIES)),
 
@@ -316,6 +437,11 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
             CAPITUAL = new PaymentMethod(CAPITUAL_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(CapitualAccount.SUPPORTED_CURRENCIES)),
             CELPAY = new PaymentMethod(CELPAY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(CelPayAccount.SUPPORTED_CURRENCIES)),
             MONESE = new PaymentMethod(MONESE_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(MoneseAccount.SUPPORTED_CURRENCIES)),
+            MPESA = new PaymentMethod(MPESA_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(MpesaAccount.SUPPORTED_CURRENCIES)),
+            MERCADO_PAGO = new PaymentMethod(MERCADO_PAGO_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(MercadoPagoAccount.SUPPORTED_CURRENCIES)),
+            GCASH = new PaymentMethod(GCASH_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(GcashAccount.SUPPORTED_CURRENCIES)),
+            MOMO = new PaymentMethod(MOMO_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(MomoAccount.SUPPORTED_CURRENCIES)),
+            SPEI = new PaymentMethod(SPEI_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(SpeiAccount.SUPPORTED_CURRENCIES)),
             SATISPAY = new PaymentMethod(SATISPAY_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(SatispayAccount.SUPPORTED_CURRENCIES)),
             TIKKIE = new PaymentMethod(TIKKIE_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(TikkieAccount.SUPPORTED_CURRENCIES)),
             VERSE = new PaymentMethod(VERSE_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(VerseAccount.SUPPORTED_CURRENCIES)),
@@ -340,6 +466,9 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
             // Thailand
             PROMPT_PAY = new PaymentMethod(PROMPT_PAY_ID, DAY, DEFAULT_TRADE_LIMIT_LOW_RISK, getAssetCodes(PromptPayAccount.SUPPORTED_CURRENCIES)),
 
+            // Poland
+            BLIK = new PaymentMethod(BLIK_ID, DAY, DEFAULT_TRADE_LIMIT_HIGH_RISK, getAssetCodes(BlikAccount.SUPPORTED_CURRENCIES)),
+
             // Cryptos
             BLOCK_CHAINS = new PaymentMethod(BLOCK_CHAINS_ID, DAY, DEFAULT_TRADE_LIMIT_CRYPTO, Arrays.asList()),
             
@@ -350,25 +479,55 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
     // TODO: delete this override method, which overrides the paymentMethods variable, when all payment methods supported using structured form api, and make paymentMethods private
     public static List<PaymentMethod> getPaymentMethods() {
         List<String> paymentMethodIds = List.of(
+                ADVANCED_CASH_ID,
+                BIZUM_ID,
                 BLOCK_CHAINS_ID,
+                CAPITUAL_ID,
                 CASH_AT_ATM_ID,
+                CASH_DEPOSIT_ID,
+                CELPAY_ID,
+                DOMESTIC_WIRE_TRANSFER_ID,
+                HAL_CASH_ID,
                 FASTER_PAYMENTS_ID,
                 F2F_ID,
+                GCASH_ID,
+                IMPS_ID,
+                JAPAN_BANK_ID,
+                MERCADO_PAGO_ID,
+                MOMO_ID,
+                MONESE_ID,
+                MONEY_BEAM_ID,
                 MONEY_GRAM_ID,
+                MPESA_ID,
+                NATIONAL_BANK_ID,
+                SAME_BANK_ID,
+                SPECIFIC_BANKS_ID,
+                NEFT_ID,
+                NEQUI_ID,
                 PAXUM_ID,
                 PAY_BY_MAIL_ID,
+                PAYSERA_ID,
+                PAYTM_ID,
+                PERFECT_MONEY_ID,
+                PROMPT_PAY_ID,
                 REVOLUT_ID,
+                RTGS_ID,
+                SATISPAY_ID,
                 SEPA_ID,
                 SEPA_INSTANT_ID,
+                SPEI_ID,
                 STRIKE_ID,
                 SWIFT_ID,
+                TIKKIE_ID,
                 TRANSFERWISE_ID,
                 UPHOLD_ID,
+                UPI_ID,
                 ZELLE_ID,
                 AUSTRALIA_PAYID_ID,
                 CASH_APP_ID,
                 PAYPAL_ID,
                 VENMO_ID,
+                VERSE_ID,
                 PAYSAFE_ID,
                 WECHAT_PAY_ID,
                 ALI_PAY_ID,
@@ -378,7 +537,27 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
                 ACH_TRANSFER_ID,
                 INTERAC_E_TRANSFER_ID,
                 US_POSTAL_MONEY_ORDER_ID,
-                PIX_ID);
+                PIX_ID,
+                WESTERN_UNION_ID,
+                BLIK_ID,
+                VIPPS_MOBILEPAY_ID,
+                TWINT_ID,
+                NIP_ID,
+                PAGO_MOVIL_ID,
+                QRIS_ID,
+                PAPARA_ID,
+                RAAST_ID,
+                PAYNOW_ID,
+                WERO_ID,
+                FPS_ID,
+                DUITNOW_ID,
+                MB_WAY_ID,
+                PAYPAY_ID,
+                SBP_ID,
+                MIR_ID,
+                YOOMONEY_ID,
+                UKRAINE_CARD_ID,
+                KASPI_ID);
         return paymentMethods.stream().filter(paymentMethod -> paymentMethodIds.contains(paymentMethod.getId())).collect(Collectors.toList());
     }
 
@@ -603,7 +782,26 @@ public final class PaymentMethod implements PersistablePayload, Comparable<Payme
                 id.equals(PaymentMethod.CASH_APP_ID) ||
                 id.equals(PaymentMethod.PAYPAL_ID) ||
                 id.equals(PaymentMethod.VENMO_ID) ||
-                id.equals(PaymentMethod.PAYSAFE_ID);
+                id.equals(PaymentMethod.PAYSAFE_ID) ||
+                id.equals(PaymentMethod.BLIK_ID) ||
+                id.equals(PaymentMethod.VIPPS_MOBILEPAY_ID) ||
+                id.equals(PaymentMethod.TWINT_ID) ||
+                id.equals(PaymentMethod.NIP_ID) ||
+                id.equals(PaymentMethod.PAGO_MOVIL_ID) ||
+                id.equals(PaymentMethod.QRIS_ID) ||
+                id.equals(PaymentMethod.PAPARA_ID) ||
+                id.equals(PaymentMethod.RAAST_ID) ||
+                id.equals(PaymentMethod.PAYNOW_ID) ||
+                id.equals(PaymentMethod.WERO_ID) ||
+                id.equals(PaymentMethod.FPS_ID) ||
+                id.equals(PaymentMethod.DUITNOW_ID) ||
+                id.equals(PaymentMethod.MB_WAY_ID) ||
+                id.equals(PaymentMethod.PAYPAY_ID) ||
+                id.equals(PaymentMethod.SBP_ID) ||
+                id.equals(PaymentMethod.MIR_ID) ||
+                id.equals(PaymentMethod.YOOMONEY_ID) ||
+                id.equals(PaymentMethod.UKRAINE_CARD_ID) ||
+                id.equals(PaymentMethod.KASPI_ID);
     }
 
     public static boolean isRoundedForAtmCash(String id) {

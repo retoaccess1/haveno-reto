@@ -17,6 +17,10 @@
 package haveno.common.util;
 
 import lombok.extern.slf4j.Slf4j;
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.function.Predicate;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -96,14 +100,20 @@ public class ZipUtils {
      * @param dir The directory to write to.
      * @param inputStream The raw stream assumed to be in zip format.
      * @param bufferSize The buffer used to read from efficiently.
+     * @param skipEntry Entries whose name (with '/' separators) matches are not extracted, or null to extract all.
      */
-    public static void unzipToDir(File dir, InputStream inputStream, int bufferSize) throws Exception {
+    public static void unzipToDir(File dir, InputStream inputStream, int bufferSize, @Nullable Predicate<String> skipEntry) throws Exception {
         try (ZipInputStream zipStream = new ZipInputStream(inputStream)) {
             ZipEntry entry;
             byte[] buffer = new byte[bufferSize];
             int count;
+            Path dirPath = dir.toPath().toAbsolutePath().normalize(); // absolute so a relative dir like "." still prefixes its entries
             while ((entry = zipStream.getNextEntry()) != null) {
-                File file = new File(dir, entry.getName());
+                Path path = dirPath.resolve(entry.getName().replace('\\', '/')).normalize(); // zips created on Windows use '\' separators
+                if (!path.startsWith(dirPath)) throw new IOException("Zip entry is outside of the target dir: " + entry.getName());
+                String entryName = dirPath.relativize(path).toString().replace(File.separatorChar, '/'); // normalized so skipEntry cannot be bypassed
+                if (skipEntry != null && skipEntry.test(entryName)) continue;
+                File file = path.toFile();
                 if (entry.isDirectory()) {
                     file.mkdirs();
                 } else {

@@ -21,6 +21,7 @@ package haveno.desktop.main.overlays.windows;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import haveno.common.UserThread;
+import haveno.common.handlers.ErrorMessageHandler;
 import haveno.common.util.Tuple2;
 import haveno.common.util.Tuple4;
 import haveno.common.util.Utilities;
@@ -33,7 +34,6 @@ import haveno.desktop.components.TitledGroupBg;
 import haveno.desktop.main.overlays.Overlay;
 import haveno.desktop.main.overlays.popups.Popup;
 import static haveno.desktop.util.FormBuilder.addButtonBusyAnimationLabelAfterGroup;
-import static haveno.desktop.util.FormBuilder.addComboBox;
 import static haveno.desktop.util.FormBuilder.addLabel;
 import static haveno.desktop.util.FormBuilder.addRadioButton;
 import static haveno.desktop.util.FormBuilder.addTitledGroupBg;
@@ -43,15 +43,16 @@ import haveno.network.p2p.network.DefaultPluggableTransports;
 import haveno.network.p2p.network.NetworkNode;
 import java.io.IOException;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
-import javafx.collections.FXCollections;
+import java.util.stream.Collectors;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.VPos;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
-import javafx.scene.control.ComboBox;
 import javafx.scene.control.Label;
 import javafx.scene.control.RadioButton;
 import javafx.scene.control.TextArea;
@@ -61,7 +62,6 @@ import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
-import javafx.util.StringConverter;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -70,25 +70,17 @@ public class TorNetworkSettingsWindow extends Overlay<TorNetworkSettingsWindow> 
 
     public enum BridgeOption {
         NONE,
-        PROVIDED,
+        SNOWFLAKE,
         CUSTOM
-    }
-
-    public enum Transport {
-        OBFS_4,
-        OBFS_3,
-        MEEK_AMAZON,
-        MEEK_AZURE
     }
 
     private final Preferences preferences;
     private final NetworkNode networkNode;
     private final TorSetup torSetup;
     private Label enterBridgeLabel;
-    private ComboBox<Transport> transportTypeComboBox;
     private TextArea bridgeEntriesTextArea;
+    private Label bridgeValidationLabel;
     private BridgeOption selectedBridgeOption = BridgeOption.NONE;
-    private Transport selectedTorTransportOrdinal = Transport.OBFS_4;
     private String customBridges = "";
 
     @Inject
@@ -217,6 +209,13 @@ public class TorNetworkSettingsWindow extends Overlay<TorNetworkSettingsWindow> 
                         .useShutDownButton()
                         .hideCloseButton()
                         .show();
+            }, errorMessage -> {
+                tuple.second.stop();
+                tuple.third.setText("");
+                new Popup().error(errorMessage)
+                        .useShutDownButton()
+                        .hideCloseButton()
+                        .show();
             });
         });
 
@@ -238,36 +237,9 @@ public class TorNetworkSettingsWindow extends Overlay<TorNetworkSettingsWindow> 
         noBridgesRadioButton.setUserData(BridgeOption.NONE);
         GridPane.setMargin(noBridgesRadioButton, new Insets(20, 0, 0, 0));
 
-        // providedBridges
-        RadioButton providedBridgesRadioButton = addRadioButton(gridPane, ++rowIndex, toggleGroup, Res.get("torNetworkSettingWindow.providedBridges"));
-        providedBridgesRadioButton.setUserData(BridgeOption.PROVIDED);
-        transportTypeComboBox = addComboBox(gridPane, ++rowIndex, Res.get("torNetworkSettingWindow.transportType"));
-        transportTypeComboBox.setItems(FXCollections.observableArrayList(Arrays.asList(
-                Transport.OBFS_4,
-                Transport.OBFS_3,
-                Transport.MEEK_AMAZON,
-                Transport.MEEK_AZURE)));
-        transportTypeComboBox.setConverter(new StringConverter<>() {
-            @Override
-            public String toString(Transport transport) {
-                switch (transport) {
-                    case OBFS_3:
-                        return Res.get("torNetworkSettingWindow.obfs3");
-                    case MEEK_AMAZON:
-                        return Res.get("torNetworkSettingWindow.meekAmazon");
-                    case MEEK_AZURE:
-                        return Res.get("torNetworkSettingWindow.meekAzure");
-                    default:
-                    case OBFS_4:
-                        return Res.get("torNetworkSettingWindow.obfs4");
-                }
-            }
-
-            @Override
-            public Transport fromString(String string) {
-                return null;
-            }
-        });
+        // snowflake (the only bundled transport: a single self-renewing config, nothing to maintain)
+        RadioButton snowflakeRadioButton = addRadioButton(gridPane, ++rowIndex, toggleGroup, Res.get("torNetworkSettingWindow.snowflake"));
+        snowflakeRadioButton.setUserData(BridgeOption.SNOWFLAKE);
 
         // customBridges
         RadioButton customBridgesRadioButton = addRadioButton(gridPane, ++rowIndex, toggleGroup, Res.get("torNetworkSettingWindow.customBridges"));
@@ -276,7 +248,13 @@ public class TorNetworkSettingsWindow extends Overlay<TorNetworkSettingsWindow> 
         final Tuple2<Label, TextArea> labelTextAreaTuple2 = addTopLabelTextArea(gridPane, ++rowIndex, Res.get("torNetworkSettingWindow.enterBridge"), Res.get("torNetworkSettingWindow.enterBridgePrompt"));
         enterBridgeLabel = labelTextAreaTuple2.first;
         bridgeEntriesTextArea = labelTextAreaTuple2.second;
+        GridPane.setColumnSpan(bridgeEntriesTextArea.getParent(), 2); // full width for long bridge lines
         bridgeEntriesTextArea.setPrefHeight(60);
+
+        bridgeValidationLabel = addLabel(gridPane, ++rowIndex, "");
+        bridgeValidationLabel.setWrapText(true);
+        GridPane.setColumnSpan(bridgeValidationLabel, 2);
+        GridPane.setHalignment(bridgeValidationLabel, HPos.LEFT);
 
         Label label2 = addLabel(gridPane, ++rowIndex, Res.get("torNetworkSettingWindow.restartInfo"));
         label2.setWrapText(true);
@@ -285,11 +263,24 @@ public class TorNetworkSettingsWindow extends Overlay<TorNetworkSettingsWindow> 
         GridPane.setValignment(label2, VPos.TOP);
         GridPane.setMargin(label2, new Insets(10, 10, 20, 0));
 
-        // init persisted values
-        selectedBridgeOption = BridgeOption.values()[preferences.getBridgeOptionOrdinal()];
+        // init persisted values (set the text before adding listeners so they don't fire during setup)
+        customBridges = preferences.getCustomBridges();
+        bridgeEntriesTextArea.setText(customBridges == null ? "" : customBridges);
+
+        int persistedOrdinal = preferences.getBridgeOptionOrdinal();
+        selectedBridgeOption = persistedOrdinal >= 0 && persistedOrdinal < BridgeOption.values().length
+                ? BridgeOption.values()[persistedOrdinal]
+                : BridgeOption.NONE;
+
+        // fall back to no bridges if custom was selected but no usable bridges are entered
+        if (selectedBridgeOption == BridgeOption.CUSTOM && getEnteredBridgeLines().isEmpty()) {
+            selectedBridgeOption = BridgeOption.NONE;
+            preferences.setBridgeOptionOrdinal(BridgeOption.NONE.ordinal());
+        }
+
         switch (selectedBridgeOption) {
-            case PROVIDED:
-                toggleGroup.selectToggle(providedBridgesRadioButton);
+            case SNOWFLAKE:
+                toggleGroup.selectToggle(snowflakeRadioButton);
                 break;
             case CUSTOM:
                 toggleGroup.selectToggle(customBridgesRadioButton);
@@ -301,87 +292,99 @@ public class TorNetworkSettingsWindow extends Overlay<TorNetworkSettingsWindow> 
         }
         applyToggleSelection();
 
-        selectedTorTransportOrdinal = Transport.values()[preferences.getTorTransportOrdinal()];
-        transportTypeComboBox.getSelectionModel().select(selectedTorTransportOrdinal);
-
-        customBridges = preferences.getCustomBridges();
-        bridgeEntriesTextArea.setText(customBridges);
-
         toggleGroup.selectedToggleProperty().addListener((observable, oldValue, newValue) -> {
             selectedBridgeOption = (BridgeOption) newValue.getUserData();
             preferences.setBridgeOptionOrdinal(selectedBridgeOption.ordinal());
             applyToggleSelection();
         });
-        transportTypeComboBox.getSelectionModel().selectedItemProperty().addListener((observable, oldValue, newValue) -> {
-            selectedTorTransportOrdinal = newValue;
-            preferences.setTorTransportOrdinal(selectedTorTransportOrdinal.ordinal());
-            setBridgeAddressesByTransport();
-        });
         bridgeEntriesTextArea.textProperty().addListener((observable, oldValue, newValue) -> {
-                    customBridges = newValue;
-                    preferences.setCustomBridges(customBridges);
-                    setBridgeAddressesByCustomBridges();
-                }
-        );
+            customBridges = newValue;
+            preferences.setCustomBridges(customBridges);
+            if (selectedBridgeOption == BridgeOption.CUSTOM) setBridgeAddressesByCustomBridges();
+        });
     }
 
-    private void cleanTorDir(Runnable resultHandler) {
+    private void cleanTorDir(Runnable resultHandler, ErrorMessageHandler errorMessageHandler) {
         // We shut down Tor to be able to delete locked files (Windows locks files used by a process)
         networkNode.shutDown(() -> {
             // We give it a bit extra time to be sure that OS locks are removed
             UserThread.runAfter(() -> {
-                torSetup.cleanupTorFiles(resultHandler, errorMessage -> new Popup().error(errorMessage).show());
+                torSetup.cleanupTorFiles(resultHandler, errorMessageHandler);
             }, 3);
+        }, errorMessage -> {
+            log.warn("Cannot delete Tor files: {}", errorMessage);
+            errorMessageHandler.handleErrorMessage(Res.get("torNetworkSettingWindow.deleteFiles.shutdownFailed"));
         });
     }
 
     private void applyToggleSelection() {
         switch (selectedBridgeOption) {
-            case PROVIDED:
-                transportTypeComboBox.setDisable(false);
+            case SNOWFLAKE:
                 enterBridgeLabel.setDisable(true);
                 bridgeEntriesTextArea.setDisable(true);
 
-                setBridgeAddressesByTransport();
+                preferences.setBridgeAddresses(DefaultPluggableTransports.SNOWFLAKE);
+                updateBridgeValidationFeedback();
                 break;
             case CUSTOM:
                 enterBridgeLabel.setDisable(false);
                 bridgeEntriesTextArea.setDisable(false);
-                transportTypeComboBox.setDisable(true);
 
                 setBridgeAddressesByCustomBridges();
                 break;
             default:
             case NONE:
-                transportTypeComboBox.setDisable(true);
                 enterBridgeLabel.setDisable(true);
                 bridgeEntriesTextArea.setDisable(true);
 
                 preferences.setBridgeAddresses(null);
-                break;
-        }
-    }
-
-    private void setBridgeAddressesByTransport() {
-        switch (selectedTorTransportOrdinal) {
-            case OBFS_3:
-                preferences.setBridgeAddresses(DefaultPluggableTransports.OBFS_3);
-                break;
-            case MEEK_AMAZON:
-                preferences.setBridgeAddresses(DefaultPluggableTransports.MEEK_AMAZON);
-                break;
-            case MEEK_AZURE:
-                preferences.setBridgeAddresses(DefaultPluggableTransports.MEEK_AZURE);
-                break;
-            default:
-            case OBFS_4:
-                preferences.setBridgeAddresses(DefaultPluggableTransports.OBFS_4);
+                updateBridgeValidationFeedback();
                 break;
         }
     }
 
     private void setBridgeAddressesByCustomBridges() {
-        preferences.setBridgeAddresses(customBridges != null ? Arrays.asList(customBridges.split("\\n")) : null);
+        // Only pass bridges the bundled Tor can actually run. A single unsupported line (e.g. obfs3
+        // or meek) makes Tor reject the whole config, so unsupported lines are excluded here while
+        // the user's raw text is preserved via Preferences.setCustomBridges().
+        List<String> usableBridges = getEnteredBridgeLines().stream()
+                .filter(DefaultPluggableTransports::isSupportedBridge)
+                .collect(Collectors.toList());
+        preferences.setBridgeAddresses(usableBridges.isEmpty() ? null : usableBridges);
+        updateBridgeValidationFeedback();
+    }
+
+    private List<String> getEnteredBridgeLines() {
+        if (customBridges == null) return new ArrayList<>();
+        return Arrays.stream(customBridges.split("\\R"))
+                .map(String::trim)
+                .filter(line -> !line.isEmpty() && !line.startsWith("#"))
+                .collect(Collectors.toList());
+    }
+
+    private void updateBridgeValidationFeedback() {
+        if (bridgeValidationLabel == null) return;
+
+        String message = "";
+        if (selectedBridgeOption == BridgeOption.CUSTOM) {
+            List<String> unsupportedTransports = getEnteredBridgeLines().stream()
+                    .filter(line -> !DefaultPluggableTransports.isSupportedBridge(line))
+                    .map(DefaultPluggableTransports::transportOf)
+                    .distinct()
+                    .collect(Collectors.toList());
+            if (!unsupportedTransports.isEmpty()) {
+                String supported = String.join(", ", DefaultPluggableTransports.SUPPORTED_TRANSPORTS);
+                message = Res.get("torNetworkSettingWindow.bridges.unsupported",
+                        String.join(", ", unsupportedTransports), supported);
+            }
+        }
+
+        bridgeValidationLabel.setText(message);
+        if (!message.isEmpty()) {
+            if (!bridgeValidationLabel.getStyleClass().contains("error-text")) bridgeValidationLabel.getStyleClass().add("error-text");
+        } else {
+            bridgeValidationLabel.getStyleClass().remove("error-text");
+        }
     }
 
     private void saveAndShutDown() {

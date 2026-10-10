@@ -21,10 +21,10 @@ import com.google.common.base.Charsets;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
-import com.googlecode.jcsv.CSVStrategy;
-import com.googlecode.jcsv.writer.CSVEntryConverter;
-import com.googlecode.jcsv.writer.CSVWriter;
-import com.googlecode.jcsv.writer.internal.CSVWriterBuilder;
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.client.j2se.MatrixToImageWriter;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
 
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIconView;
@@ -42,12 +42,15 @@ import haveno.core.account.witness.AccountAgeWitnessService;
 import haveno.core.api.XmrConnectionService;
 import haveno.core.locale.Country;
 import haveno.core.locale.CountryUtil;
+import haveno.core.locale.CryptoCurrency;
 import haveno.core.locale.CurrencyUtil;
+import haveno.core.locale.GlobalSettings;
 import haveno.core.locale.Res;
 import haveno.core.locale.TradeCurrency;
 import haveno.core.payment.PaymentAccount;
 import haveno.core.payment.PaymentAccountList;
 import haveno.core.payment.payload.PaymentMethod;
+import haveno.core.provider.price.PriceFeedService;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.trade.Trade;
 import haveno.core.user.DontShowAgainLookup;
@@ -58,7 +61,6 @@ import haveno.core.util.coin.CoinFormatter;
 import haveno.core.xmr.wallet.XmrWalletService;
 import haveno.desktop.Navigation;
 import haveno.desktop.components.AutoTooltipLabel;
-import haveno.desktop.components.HavenoTextArea;
 import haveno.desktop.components.InfoAutoTooltipLabel;
 import haveno.desktop.components.indicator.TxConfidenceIndicator;
 import haveno.desktop.main.MainView;
@@ -66,76 +68,113 @@ import haveno.desktop.main.account.AccountView;
 import haveno.desktop.main.account.content.traditionalaccounts.TraditionalAccountsView;
 import haveno.desktop.main.overlays.popups.Popup;
 import haveno.network.p2p.P2PService;
+import javafx.animation.AnimationTimer;
+import javafx.animation.PauseTransition;
 import javafx.application.Platform;
+import javafx.beans.InvalidationListener;
 import javafx.beans.binding.Bindings;
 import javafx.beans.value.ChangeListener;
+import javafx.beans.value.WeakChangeListener;
 import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
+import javafx.collections.transformation.FilteredList;
+import javafx.css.PseudoClass;
+import javafx.event.ActionEvent;
+import javafx.event.EventHandler;
+import javafx.geometry.Bounds;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
+import javafx.geometry.Rectangle2D;
+import javafx.scene.AccessibleRole;
 import javafx.scene.Cursor;
 import javafx.scene.Node;
 import javafx.scene.Scene;
+import javafx.scene.control.ButtonBase;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContentDisplay;
+import javafx.scene.control.DatePicker;
 import javafx.scene.control.Label;
 import javafx.scene.control.Labeled;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ScrollBar;
 import javafx.scene.control.ScrollPane;
-import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.Tooltip;
+import javafx.scene.control.skin.DatePickerSkin;
+import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
+import javafx.scene.image.PixelFormat;
+import javafx.scene.image.PixelWriter;
+import javafx.scene.image.WritableImage;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.ColumnConstraints;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Rectangle;
+import javafx.scene.text.Text;
 import javafx.stage.DirectoryChooser;
 import javafx.stage.FileChooser;
-import javafx.stage.Modality;
+import javafx.stage.Screen;
 import javafx.stage.Stage;
-import javafx.stage.StageStyle;
+import javafx.stage.Window;
+import javafx.stage.WindowEvent;
 import javafx.util.Callback;
+import javafx.util.Duration;
 import javafx.util.StringConverter;
 import lombok.extern.slf4j.Slf4j;
 import monero.common.MoneroUtils;
 import monero.daemon.model.MoneroTx;
 import monero.wallet.model.MoneroTxConfig;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
 import org.apache.commons.lang3.StringUtils;
 import org.bitcoinj.core.Coin;
 import org.jetbrains.annotations.NotNull;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStreamWriter;
+import java.lang.reflect.Field;
 import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Currency;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static haveno.desktop.util.FormBuilder.addTopLabelComboBoxComboBox;
@@ -253,25 +292,31 @@ public class GUIUtil {
     }
 
 
-    public static <T> void exportCSV(String fileName, CSVEntryConverter<T> headerConverter,
-                                     CSVEntryConverter<T> contentConverter, T emptyItem,
+    public static byte[] generateQrCodePng(String data, int width, int height) {
+        try {
+            QRCodeWriter qrCodeWriter = new QRCodeWriter();
+            BitMatrix bitMatrix = qrCodeWriter.encode(data, BarcodeFormat.QR_CODE, width, height);
+            ByteArrayOutputStream pngOutputStream = new ByteArrayOutputStream();
+            MatrixToImageWriter.writeToStream(bitMatrix, "PNG", pngOutputStream);
+            return pngOutputStream.toByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to generate QR code", e);
+        }
+    }
+
+    public static <T> void exportCSV(String fileName, Function<T, String[]> headerConverter,
+                                     Function<T, String[]> contentConverter, T emptyItem,
                                      List<T> list, Stage stage) {
         FileChooser fileChooser = new FileChooser();
         fileChooser.setInitialFileName(fileName);
         File file = fileChooser.showSaveDialog(stage);
         if (file != null) {
-            try (OutputStreamWriter outputStreamWriter = new OutputStreamWriter(new FileOutputStream(file, false), Charsets.UTF_8)) {
-                CSVWriter<T> headerWriter = new CSVWriterBuilder<T>(outputStreamWriter)
-                        .strategy(CSVStrategy.UK_DEFAULT)
-                        .entryConverter(headerConverter)
-                        .build();
-                headerWriter.write(emptyItem);
-
-                CSVWriter<T> contentWriter = new CSVWriterBuilder<T>(outputStreamWriter)
-                        .strategy(CSVStrategy.UK_DEFAULT)
-                        .entryConverter(contentConverter)
-                        .build();
-                contentWriter.writeAll(list);
+            try (OutputStreamWriter outputStreamWriter = new OutputStreamWriter(new FileOutputStream(file, false), Charsets.UTF_8);
+                 CSVPrinter printer = new CSVPrinter(outputStreamWriter, CSVFormat.DEFAULT)) {
+                printer.printRecord((Object[]) headerConverter.apply(emptyItem));
+                for (T item : list) {
+                    printer.printRecord((Object[]) contentConverter.apply(item));
+                }
             } catch (RuntimeException | IOException e) {
                 e.printStackTrace();
                 log.error(e.getMessage());
@@ -313,9 +358,32 @@ public class GUIUtil {
         }
     }
 
+    // graphic-only cells announce blank, so voice the row text on the cell and on its first child
+    // (and that child's graphic), where VoiceOver lands when arrowing through rows
+    private static void setAccessibleRowText(ListCell<?> cell, Pane pane, String text) {
+        cell.setAccessibleText(text);
+        if (pane.getChildren().isEmpty()) return;
+        Node first = pane.getChildren().get(0);
+        first.setAccessibleText(text);
+        if (first instanceof Labeled && ((Labeled) first).getGraphic() != null) {
+            Node graphic = ((Labeled) first).getGraphic();
+            graphic.setAccessibleRole(AccessibleRole.TEXT);
+            graphic.setAccessibleText(text);
+        }
+    }
+
+    // row text from the visible labels, for cells without a more readable phrasing of their own
+    private static void setAccessibleTextFromLabels(ListCell<?> cell, Pane pane) {
+        String joined = pane.getChildren().stream()
+                .filter(node -> node instanceof Labeled)
+                .map(node -> ((Labeled) node).getText())
+                .filter(t -> t != null && !t.isEmpty())
+                .collect(Collectors.joining(", "));
+        setAccessibleRowText(cell, pane, joined.isEmpty() ? null : joined);
+    }
+
     public static Callback<ListView<CurrencyListItem>, ListCell<CurrencyListItem>> getCurrencyListItemCellFactory(String postFixSingle,
-                                                                                                                  String postFixMulti,
-                                                                                                                  Preferences preferences) {
+                                                                                                                  String postFixMulti) {
         return p -> new ListCell<>() {
             @Override
             protected void updateItem(CurrencyListItem item, boolean empty) {
@@ -325,51 +393,64 @@ public class GUIUtil {
 
                     String code = item.tradeCurrency.getCode();
 
+                    boolean isCrypto = CurrencyUtil.isCryptoCurrency(code);
+
                     HBox box = new HBox();
                     box.setSpacing(20);
                     box.setAlignment(Pos.CENTER_LEFT);
                     Label label1 = new AutoTooltipLabel(getCurrencyType(code));
                     label1.getStyleClass().add("currency-label-small");
-                    Label label2 = new AutoTooltipLabel(CurrencyUtil.isCryptoCurrency(code) ? item.tradeCurrency.getNameAndCode() : code);
+                    Label label2 = new AutoTooltipLabel(isCrypto ? item.tradeCurrency.getNameAndCode() : code);
                     label2.getStyleClass().add("currency-label");
-                    Label label3 = new AutoTooltipLabel(CurrencyUtil.isCryptoCurrency(code) ? "" : item.tradeCurrency.getName());
-                    if (!CurrencyUtil.isCryptoCurrency(code)) label3.getStyleClass().add("currency-label");
+                    Label label3 = new AutoTooltipLabel(isCrypto ? "" : item.tradeCurrency.getName());
+                    if (!isCrypto) label3.getStyleClass().add("currency-label");
                     Label label4 = new AutoTooltipLabel();
 
-                    box.getChildren().addAll(label1, label2, label3);
-                    if (!CurrencyUtil.isCryptoCurrency(code)) box.getChildren().add(label4);
+                    boolean showOfferCount = false;
+                    String announced; // name-first for screen readers; the visible row leads with the code
 
                     switch (code) {
                         case GUIUtil.SHOW_ALL_FLAG:
                             label1.setText(Res.get("shared.all"));
                             label2.setText(Res.get("list.currency.showAll"));
+                            announced = Res.get("list.currency.showAll");
                             break;
                         case GUIUtil.EDIT_FLAG:
                             label1.setText(Res.get("shared.edit"));
                             label2.setText(Res.get("list.currency.editList"));
+                            announced = Res.get("list.currency.editList");
                             break;
                         default:
 
                             // use icon if available
-                            StackPane currencyIcon = getCurrencyIcon(code);
+                            Node currencyIcon = getCurrencyGraphic(code, CURRENCY_GRAPHIC_ROW_SIZE);
                             if (currencyIcon != null) {
                                 label1.setText("");
                                 label1.setGraphic(currencyIcon);
                             }
 
-                            if (preferences.isSortMarketCurrenciesNumerically() && item.numTrades > 0) {
-                                boolean isCrypto = CurrencyUtil.isCryptoCurrency(code);
+                            if (item.numTrades > 0) {
                                 Label offersTarget = isCrypto ? label3 : label4;
                                 HBox.setMargin(offersTarget, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
                                 offersTarget.getStyleClass().add("offer-label");
                                 offersTarget.setText(item.numTrades + " " + (item.numTrades == 1 ? postFixSingle : postFixMulti));
+                                showOfferCount = true;
                             }
+                            announced = item.tradeCurrency.getName() + ", " + Accessibility.spellOut(code)
+                                    + (showOfferCount ? ", " + (isCrypto ? label3 : label4).getText() : "");
                     }
 
+                    // append the offer pill only when present so the row ends at real content
+                    box.getChildren().addAll(label1, label2);
+                    if (!isCrypto) box.getChildren().add(label3);
+                    if (showOfferCount) box.getChildren().add(isCrypto ? label3 : label4);
+
                     setGraphic(box);
+                    setAccessibleRowText(this, box, announced);
 
                 } else {
                     setGraphic(null);
+                    setAccessibleText(null);
                 }
             }
         };
@@ -415,9 +496,11 @@ public class GUIUtil {
 
                     setGraphic(pane);
                     setText("");
+                    setAccessibleTextFromLabels(this, pane);
                 } else {
                     setGraphic(null);
                     setText("");
+                    setAccessibleText(null);
                 }
             }
         };
@@ -434,55 +517,64 @@ public class GUIUtil {
                 if (item != null && !empty) {
 
                     String code = item.getCode();
+                    boolean isCrypto = CurrencyUtil.isCryptoCurrency(code);
 
                     HBox box = new HBox();
                     box.setSpacing(20);
                     box.setAlignment(Pos.CENTER_LEFT);
 
-                    Label label1 = new AutoTooltipLabel(getCurrencyType(item.getCode()));
+                    Label label1 = new AutoTooltipLabel(getCurrencyType(code));
                     label1.getStyleClass().add("currency-label-small");
-                    Label label2 = new AutoTooltipLabel(CurrencyUtil.isCryptoCurrency(code) ? item.getNameAndCode() : code);
+                    Label label2 = new AutoTooltipLabel(isCrypto ? item.getNameAndCode() : code);
                     label2.getStyleClass().add("currency-label");
-                    Label label3 = new AutoTooltipLabel(CurrencyUtil.isCryptoCurrency(code) ? "" : item.getName());
-                    if (!CurrencyUtil.isCryptoCurrency(code)) label3.getStyleClass().add("currency-label");
+                    Label label3 = new AutoTooltipLabel(isCrypto ? "" : item.getName());
+                    if (!isCrypto) label3.getStyleClass().add("currency-label");
                     Label label4 = new AutoTooltipLabel();
 
                     Optional<Integer> offerCountOptional = Optional.ofNullable(offerCounts.get(code));
+                    String announced; // name-first for screen readers; the visible row leads with the code
 
                     switch (code) {
                         case GUIUtil.SHOW_ALL_FLAG:
                             label1.setText(Res.get("shared.all"));
                             label2.setText(Res.get("list.currency.showAll"));
+                            announced = Res.get("list.currency.showAll");
                             break;
                         case GUIUtil.EDIT_FLAG:
                             label1.setText(Res.get("shared.edit"));
                             label2.setText(Res.get("list.currency.editList"));
+                            announced = Res.get("list.currency.editList");
                             break;
                         default:
 
                             // use icon if available
-                            StackPane currencyIcon = getCurrencyIcon(code);
+                            Node currencyIcon = getCurrencyGraphic(code, CURRENCY_GRAPHIC_ROW_SIZE);
                             if (currencyIcon != null) {
                                 label1.setText("");
                                 label1.setGraphic(currencyIcon);
                             }
 
-                            boolean isCrypto = CurrencyUtil.isCryptoCurrency(code);
                             Label offersTarget = isCrypto ? label3 : label4;
                             offerCountOptional.ifPresent(numOffers -> {
                                 HBox.setMargin(offersTarget, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
                                 offersTarget.getStyleClass().add("offer-label");
                                 offersTarget.setText(numOffers + " " + (numOffers == 1 ? postFixSingle : postFixMulti));
                             });
+                            announced = item.getName() + ", " + Accessibility.spellOut(code)
+                                    + (offerCountOptional.isPresent() ? ", " + offersTarget.getText() : "");
                     }
 
-                    box.getChildren().addAll(label1, label2, label3);
-                    if (!CurrencyUtil.isCryptoCurrency(code)) box.getChildren().add(label4);
+                    // append the offer pill only when present so the row ends at real content
+                    box.getChildren().addAll(label1, label2);
+                    if (!isCrypto) box.getChildren().add(label3);
+                    if (offerCountOptional.isPresent()) box.getChildren().add(isCrypto ? label3 : label4);
 
                     setGraphic(box);
+                    setAccessibleRowText(this, box, announced);
 
                 } else {
                     setGraphic(null);
+                    setAccessibleText(null);
                 }
             }
         };
@@ -505,7 +597,7 @@ public class GUIUtil {
                     label2.getStyleClass().add("currency-label");
 
                     // use icon if available
-                    StackPane currencyIcon = getCurrencyIcon(item.getCode());
+                    Node currencyIcon = getCurrencyGraphic(item.getCode(), CURRENCY_GRAPHIC_ROW_SIZE);
                     if (currencyIcon != null) {
                         label1.setText("");
                         label1.setGraphic(currencyIcon);
@@ -514,9 +606,11 @@ public class GUIUtil {
                     box.getChildren().addAll(label1, label2);
 
                     setGraphic(box);
+                    setAccessibleRowText(this, box, item.getName() + ", " + Accessibility.spellOut(item.getCode()));
 
                 } else {
                     setGraphic(null);
+                    setAccessibleText(null);
                 }
             }
         };
@@ -532,10 +626,6 @@ public class GUIUtil {
         } else {
             return "";
         }
-    }
-
-    private static String getCurrencyType(PaymentMethod method) {
-        return method.isTraditional() ? Res.get("shared.traditional") : Res.get("shared.crypto");
     }
 
     public static ListCell<PaymentMethod> getPaymentMethodButtonCell() {
@@ -563,6 +653,12 @@ public class GUIUtil {
     }
 
     public static Callback<ListView<PaymentMethod>, ListCell<PaymentMethod>> getPaymentMethodCellFactory() {
+        return getPaymentMethodCellFactory("", "", Map.of());
+    }
+
+    public static Callback<ListView<PaymentMethod>, ListCell<PaymentMethod>> getPaymentMethodCellFactory(String postFixSingle,
+                                                                                                         String postFixMulti,
+                                                                                                         Map<String, Integer> offerCounts) {
         return p -> new ListCell<>() {
             @Override
             protected void updateItem(PaymentMethod method, boolean empty) {
@@ -573,24 +669,40 @@ public class GUIUtil {
 
                     HBox box = new HBox();
                     box.setSpacing(20);
-                    Label paymentType = new AutoTooltipLabel(getCurrencyType(method));
-                    paymentType.getStyleClass().add("currency-label-small");
+                    box.setAlignment(Pos.CENTER_LEFT);
+                    box.setPadding(new Insets(0, 0, 0, (CURRENCY_LABEL_SMALL_WIDTH - CURRENCY_GRAPHIC_ROW_SIZE) / 2)); // match the currency list's leftmost inset (logo centered in its label)
                     Label paymentMethod = new AutoTooltipLabel(Res.get(id));
                     paymentMethod.getStyleClass().add("currency-label");
-                    box.getChildren().addAll(paymentType, paymentMethod);
+                    Label offerCount = new AutoTooltipLabel();
+                    box.getChildren().addAll(paymentMethod, offerCount);
 
                     if (id.equals(GUIUtil.SHOW_ALL_FLAG)) {
-                        paymentType.setText(Res.get("shared.all"));
                         paymentMethod.setText(Res.get("list.currency.showAll"));
+                    } else {
+                        Optional.ofNullable(offerCounts.get(id)).ifPresent(numOffers -> {
+                            HBox.setMargin(offerCount, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
+                            offerCount.getStyleClass().add("offer-label");
+                            offerCount.setText(numOffers + " " + (numOffers == 1 ? postFixSingle : postFixMulti));
+                        });
                     }
 
                     setGraphic(box);
+                    setAccessibleTextFromLabels(this, box);
 
                 } else {
                     setGraphic(null);
+                    setAccessibleText(null);
                 }
             }
         };
+    }
+
+    // the amount approximated in the user's preferred currency, or null while no price is available
+    public static String getFiatText(BigInteger atomicAmount, PriceFeedService priceFeedService, Preferences preferences) {
+        if (atomicAmount == null || atomicAmount.signum() <= 0 || priceFeedService == null || preferences == null) return null;
+        TradeCurrency currency = preferences.getPreferredTradeCurrency();
+        if (currency == null) return null;
+        return DisplayUtils.formatBalanceEstimate(atomicAmount, priceFeedService.getMarketPrice(currency.getCode()));
     }
 
     public static void updateConfidence(MoneroTx tx,
@@ -653,7 +765,7 @@ public class GUIUtil {
 
         if (DontShowAgainLookup.showAgain(OPEN_WEB_PAGE_KEY)) {
             final String finalTarget = target;
-            new Popup().information(Res.get("guiUtil.openWebBrowser.warning", target))
+            new Popup().nested().information(Res.get("guiUtil.openWebBrowser.warning", target))
                     .actionButtonText(Res.get("guiUtil.openWebBrowser.doOpen"))
                     .onAction(() -> {
                         DontShowAgainLookup.dontShowAgain(OPEN_WEB_PAGE_KEY, true);
@@ -776,6 +888,15 @@ public class GUIUtil {
         return MoneroUtils.getPaymentUri(txConfig);
     }
 
+    // A popup stealing window focus or a click on cancel fires focus-out on the edited field;
+    // skip validation then, since the user has not left the field or the input is discarded.
+    public static boolean skipFocusOutValidation(Node field, Node cancelButton, boolean oldValue, boolean newValue) {
+        if (!oldValue || newValue || field.getScene() == null) return false;
+        Window window = field.getScene().getWindow();
+        return (window != null && !window.isFocused())
+                || (cancelButton != null && field.getScene().getFocusOwner() == cancelButton);
+    }
+
     public static boolean isBootstrappedOrShowPopup(P2PService p2PService) {
         if (p2PService.isBootstrapped() && p2PService.getNumConnectedPeers().get() > 0) {
             return true;
@@ -864,22 +985,110 @@ public class GUIUtil {
         }
     }
 
-    public static void showSelectableTextModal(String title, String text) {
-        TextArea textArea = new HavenoTextArea();
-        textArea.setText(text);
-        textArea.setEditable(false);
-        textArea.setWrapText(true);
-        textArea.setPrefSize(800, 600);
+    // apply the theme to a window's scene and follow theme toggles until the window hides
+    public static void loadWindowStyles(Stage stage, Preferences preferences, boolean devHeader) {
+        Scene scene = stage.getScene();
+        ChangeListener<Number> themeListener = (ov, o, n) -> {
+            CssTheme.loadSceneStyles(scene, n.intValue(), devHeader);
+            scene.setFill(CssTheme.isDarkTheme() ? Color.BLACK : Color.WHITE);
+        };
+        CssTheme.loadSceneStyles(scene, preferences.getCssTheme(), devHeader);
+        preferences.getCssThemeProperty().addListener(themeListener);
+        stage.addEventHandler(WindowEvent.WINDOW_HIDDEN, e -> preferences.getCssThemeProperty().removeListener(themeListener));
+    }
 
-        Scene scene = new Scene(textArea);
-        Stage stage = new Stage();
-        if (null != title) {
-            stage.setTitle(title);
-        }
-        stage.setScene(scene);
-        stage.initModality(Modality.NONE);
-        stage.initStyle(StageStyle.UTILITY);
+    public static void showCenteredChatWindow(Stage stage, Scene rootScene) {
+        Window rootSceneWindow = rootScene.getWindow();
+        // use the screen containing the largest part of the application window
+        Rectangle2D screenBounds = Screen.getScreensForRectangle(rootSceneWindow.getX(), rootSceneWindow.getY(),
+                rootSceneWindow.getWidth(), rootSceneWindow.getHeight())
+                .stream().max(Comparator.comparingDouble(screen -> {
+                    Rectangle2D bounds = screen.getBounds();
+                    double width = Math.min(rootSceneWindow.getX() + rootSceneWindow.getWidth(), bounds.getMaxX())
+                            - Math.max(rootSceneWindow.getX(), bounds.getMinX());
+                    double height = Math.min(rootSceneWindow.getY() + rootSceneWindow.getHeight(), bounds.getMaxY())
+                            - Math.max(rootSceneWindow.getY(), bounds.getMinY());
+                    return Math.max(0, width) * Math.max(0, height);
+                })).orElse(Screen.getPrimary()).getVisualBounds();
+        double width = Math.min(Layout.CHAT_WINDOW_WIDTH, Math.min(rootScene.getWidth(), screenBounds.getWidth()));
+        double height = Math.min(Layout.CHAT_WINDOW_HEIGHT, Math.min(rootScene.getHeight(), screenBounds.getHeight()));
+        boolean linux = Utilities.isLinux();
+        // GTK needs a real resize after mapping before the opening minimum can be released
+        double openingWidth = linux ? width - 1 : width;
+        stage.setWidth(width);
+        stage.setHeight(height);
+        stage.setMinWidth(linux ? openingWidth : Layout.CHAT_WINDOW_MIN_WIDTH);
+        stage.setMinHeight(linux ? height : Layout.CHAT_WINDOW_MIN_HEIGHT);
+        // set the native window background before the first frame is rendered
+        stage.getScene().setFill(CssTheme.isDarkTheme() ? Color.BLACK : Color.WHITE);
+
+        // center each new chat over the current application window and keep it on-screen
+        double x = Math.round(rootSceneWindow.getX() + rootScene.getX() + (rootScene.getWidth() - width) / 2);
+        double y = Math.round(rootSceneWindow.getY() + rootScene.getY() + (rootScene.getHeight() - height) / 2);
+        stage.setX(Math.max(screenBounds.getMinX(), Math.min(x, screenBounds.getMaxX() - width)));
+        stage.setY(Math.max(screenBounds.getMinY(), Math.min(y, screenBounds.getMaxY() - height)));
+        // let the chat render before revealing the native window
+        stage.setOpacity(0);
         stage.show();
+        new AnimationTimer() {
+            private int pulses;
+
+            @Override
+            public void handle(long now) {
+                if (!stage.isShowing()) {
+                    stop();
+                    return;
+                }
+                if (++pulses < 3) return;
+                stop();
+                stage.setOpacity(1);
+            }
+        }.start();
+        if (!linux) return;
+
+        PauseTransition settleDelay = new PauseTransition(Duration.millis(300));
+        ChangeListener<Number> boundsListener = (observable, oldValue, newValue) -> settleDelay.playFromStart();
+        EventHandler<WindowEvent> hiddenHandler = new EventHandler<>() {
+            @Override
+            public void handle(WindowEvent event) {
+                settleDelay.stop();
+                stage.widthProperty().removeListener(boundsListener);
+                stage.heightProperty().removeListener(boundsListener);
+                stage.removeEventHandler(WindowEvent.WINDOW_HIDDEN, this);
+                stage.setMinWidth(Layout.CHAT_WINDOW_MIN_WIDTH);
+                stage.setMinHeight(Layout.CHAT_WINDOW_MIN_HEIGHT);
+            }
+        };
+        settleDelay.setOnFinished(new EventHandler<>() {
+            private boolean openingSizeApplied;
+
+            @Override
+            public void handle(ActionEvent event) {
+                boolean restoreOpeningSize = !stage.isMaximized() && !stage.isFullScreen()
+                        && Math.abs(stage.getWidth() - width) <= 1 && Math.abs(stage.getHeight() - height) <= 1;
+                if (restoreOpeningSize && !openingSizeApplied) {
+                    openingSizeApplied = true;
+                    stage.setWidth(width);
+                    stage.setHeight(height);
+                    settleDelay.playFromStart();
+                    return;
+                }
+                stage.widthProperty().removeListener(boundsListener);
+                stage.heightProperty().removeListener(boundsListener);
+                stage.removeEventHandler(WindowEvent.WINDOW_HIDDEN, hiddenHandler);
+                stage.setMinWidth(Layout.CHAT_WINDOW_MIN_WIDTH);
+                stage.setMinHeight(Layout.CHAT_WINDOW_MIN_HEIGHT);
+                // leave any user resize or maximize in place
+                if (restoreOpeningSize) {
+                    stage.setWidth(width);
+                    stage.setHeight(height);
+                }
+            }
+        });
+        stage.widthProperty().addListener(boundsListener);
+        stage.heightProperty().addListener(boundsListener);
+        stage.addEventHandler(WindowEvent.WINDOW_HIDDEN, hiddenHandler);
+        settleDelay.play();
     }
 
     public static StringConverter<PaymentAccount> getPaymentAccountsComboBoxStringConverter() {
@@ -1153,14 +1362,182 @@ public class GUIUtil {
         }
     }
 
+    private static final String CURSOR_REFRESH = "haveno.cursorRefresh";
+    private static Field mouseHandlerField, currCursorField, currCursorFrameField;
+    private static boolean cursorCacheUnavailable;
+
+    // A scene pushes the OS cursor only when it differs from its cached last-applied value, so resets by
+    // other windows/popups stick; clearing the cache on pointer entry and move forces a correcting re-push.
+    public static void syncCursorAcrossWindows() {
+        Window.getWindows().forEach(GUIUtil::installWindowCursorRefresh);
+        Window.getWindows().addListener((ListChangeListener<Window>) change -> {
+            while (change.next()) change.getAddedSubList().forEach(GUIUtil::installWindowCursorRefresh);
+        });
+    }
+
+    private static void installWindowCursorRefresh(Window window) {
+        if (window.getProperties().put(CURSOR_REFRESH, Boolean.TRUE) != null) return;
+        window.sceneProperty().addListener((obs, oldScene, scene) -> installSceneCursorRefresh(scene));
+        installSceneCursorRefresh(window.getScene());
+    }
+
+    private static void installSceneCursorRefresh(Scene scene) {
+        if (scene == null || scene.getProperties().put(CURSOR_REFRESH, Boolean.TRUE) != null) return;
+        scene.addEventFilter(MouseEvent.MOUSE_ENTERED_TARGET, e -> clearAppliedCursorCache(scene));
+        scene.addEventFilter(MouseEvent.MOUSE_MOVED, e -> clearAppliedCursorCache(scene));
+    }
+
+    // Nulls Scene.mouseHandler.currCursor(Frame) so the running mouse event's tail cursor update
+    // re-applies the resolved cursor natively. Needs --add-opens javafx.graphics/javafx.scene.
+    private static void clearAppliedCursorCache(Scene scene) {
+        if (cursorCacheUnavailable) return;
+        try {
+            if (mouseHandlerField == null) {
+                mouseHandlerField = Scene.class.getDeclaredField("mouseHandler");
+                mouseHandlerField.setAccessible(true);
+            }
+            Object mouseHandler = mouseHandlerField.get(scene);
+            if (mouseHandler == null) return;
+            if (currCursorField == null) {
+                currCursorField = mouseHandler.getClass().getDeclaredField("currCursor");
+                currCursorField.setAccessible(true);
+                currCursorFrameField = mouseHandler.getClass().getDeclaredField("currCursorFrame");
+                currCursorFrameField.setAccessible(true);
+            }
+            currCursorField.set(mouseHandler, null);
+            currCursorFrameField.set(mouseHandler, null);
+        } catch (Exception e) {
+            cursorCacheUnavailable = true;
+            log.warn("Cannot clear the scene cursor cache, windows may keep a stale cursor", e);
+        }
+    }
+
+    /** Show a no-match placeholder while a non-empty filter hides all rows of a non-empty list. */
+    public static void updateFilterPlaceholder(TableView<?> tableView, FilteredList<?> filteredList, String filterString) {
+        updateFilterPlaceholder(tableView, !filterString.isEmpty() && filteredList.isEmpty() && !filteredList.getSource().isEmpty());
+    }
+
+    /** Overload for views that determine externally whether the filter hides all rows. */
+    public static void updateFilterPlaceholder(TableView<?> tableView, boolean showNoMatch) {
+        Map<Object, Object> props = tableView.getProperties();
+        Node noMatch = (Node) props.computeIfAbsent("filterNoMatchPlaceholder", k -> new AutoTooltipLabel(Res.get("table.placeholder.noFilterMatch")));
+        if (showNoMatch && tableView.getPlaceholder() != noMatch) {
+            props.put("filterDefaultPlaceholder", tableView.getPlaceholder());
+            tableView.setPlaceholder(noMatch);
+        } else if (!showNoMatch && tableView.getPlaceholder() == noMatch) {
+            tableView.setPlaceholder((Node) props.get("filterDefaultPlaceholder"));
+        }
+    }
+
     public static void applyTableStyle(TableView<?> tableView) {
         applyTableStyle(tableView, true);
     }
 
     public static void applyTableStyle(TableView<?> tableView, boolean applyRoundedArc) {
         if (applyRoundedArc) applyRoundedArc(tableView);
-        addSpacerColumns(tableView);
         applyEdgeColumnStyleClasses(tableView);
+    }
+
+    // scrolls a constrained-resize table horizontally in its wrapping scroll pane on narrow windows: the table's min
+    // width follows the sum of visible column min widths, so the pane pans header and rows together instead of clipping
+    public static <T> void applyTableHorizontalScroll(ScrollPane scrollPane, TableView<T> tableView) {
+        AtomicReference<ScrollBar> verticalBar = new AtomicReference<>();
+        InvalidationListener updater = obs -> {
+            ScrollBar bar = verticalBar.get();
+            double scrollbarWidth = bar != null && bar.isVisible() ? bar.getWidth() : 0;
+            double oldMinWidth = tableView.getMinWidth();
+            tableView.setMinWidth(
+                    tableView.getItems() == null || tableView.getItems().isEmpty() ? 0 :
+                            tableView.getColumns().stream()
+                                    .filter(TableColumn::isVisible)
+                                    .mapToDouble(TableColumn::getMinWidth)
+                                    .sum() + scrollbarWidth + tableView.snappedLeftInset() + tableView.snappedRightInset());
+            // min width changes during the table's layout do not reliably reach the pane skin;
+            // force a pane layout pass when columns or the vertical scrollbar change the required width
+            if (tableView.getMinWidth() != oldMinWidth) UserThread.execute(() -> {
+                if (tableView.getParent() != null) tableView.getParent().requestLayout();
+                scrollPane.requestLayout();
+                scrollPane.layout();
+            });
+        };
+        for (TableColumn<T, ?> column : tableView.getColumns()) {
+            column.visibleProperty().addListener(updater);
+            column.minWidthProperty().addListener(updater);
+        }
+        tableView.insetsProperty().addListener(updater);
+
+        // follow rows across items list swaps; change listeners cannot be used here because they
+        // are suppressed when an empty items list is replaced by another empty list
+        ListChangeListener<T> rowListener = change -> updater.invalidated(null);
+        AtomicReference<ObservableList<T>> wiredItems = new AtomicReference<>();
+        InvalidationListener itemsSwapListener = obs -> {
+            ObservableList<T> items = tableView.getItems();
+            ObservableList<T> wired = wiredItems.getAndSet(items);
+            if (wired != items) {
+                if (wired != null) wired.removeListener(rowListener);
+                if (items != null) items.addListener(rowListener);
+            }
+            updater.invalidated(null);
+        };
+        tableView.itemsProperty().addListener(itemsSwapListener);
+        itemsSwapListener.invalidated(null);
+
+        // the constrained resize policy skips tables at their min width, leaving columns at stale
+        // stretched widths that clip the trailing ones; squeeze them to their mins explicitly
+        tableView.widthProperty().addListener((observable, oldWidth, newWidth) -> {
+            if (newWidth.doubleValue() <= tableView.getMinWidth()) {
+                TableView.ResizeFeatures<T> features = new TableView.ResizeFeatures<>(tableView, null, 0.0);
+                for (TableColumn<T, ?> column : tableView.getVisibleLeafColumns()) {
+                    features.setColumnWidth(column, column.getMinWidth());
+                }
+            }
+        });
+
+        // route horizontal scroll deltas to the scroll pane; the table consumes scroll events but cannot pan sideways
+        scrollPane.addEventFilter(ScrollEvent.SCROLL, event -> {
+            if (Math.abs(event.getDeltaX()) <= Math.abs(event.getDeltaY())) return;
+            double scrollable = tableView.getWidth() - scrollPane.getViewportBounds().getWidth();
+            if (scrollable <= 0) return;
+            double delta = event.getDeltaX() * (scrollPane.getHmax() - scrollPane.getHmin()) / scrollable;
+            scrollPane.setHvalue(Math.max(scrollPane.getHmin(),
+                    Math.min(scrollPane.getHmax(), scrollPane.getHvalue() - delta)));
+            event.consume();
+        });
+
+        // keep the table's vertical bar at the viewport edge instead of panning off screen with the table
+        InvalidationListener vbarPinner = obs -> {
+            double scrollable = tableView.getWidth() - scrollPane.getViewportBounds().getWidth();
+            double range = scrollPane.getHmax() - scrollPane.getHmin();
+            double shift = scrollable <= 0 || range <= 0 ? 0 :
+                    -(scrollPane.getHmax() - scrollPane.getHvalue()) / range * scrollable;
+            for (Node node : tableView.lookupAll(".scroll-bar")) {
+                if (node instanceof ScrollBar bar && bar.getOrientation() == Orientation.VERTICAL) bar.setTranslateX(shift);
+            }
+        };
+        scrollPane.hvalueProperty().addListener(vbarPinner);
+        scrollPane.viewportBoundsProperty().addListener(vbarPinner);
+        tableView.widthProperty().addListener(vbarPinner);
+
+        // reserve the vertical bar's lane even at the table's min width, and follow skin replacements
+        InvalidationListener skinListener = obs -> {
+            ScrollBar oldBar = verticalBar.getAndSet(null);
+            if (oldBar != null) {
+                oldBar.visibleProperty().removeListener(updater);
+                oldBar.widthProperty().removeListener(updater);
+            }
+            for (Node node : tableView.lookupAll(".scroll-bar")) {
+                if (node instanceof ScrollBar bar && bar.getOrientation() == Orientation.VERTICAL) {
+                    verticalBar.set(bar);
+                    bar.visibleProperty().addListener(updater);
+                    bar.widthProperty().addListener(updater);
+                    break;
+                }
+            }
+            updater.invalidated(null);
+            vbarPinner.invalidated(null);
+        };
+        tableView.skinProperty().addListener(skinListener);
+        skinListener.invalidated(null);
     }
 
     private static void applyRoundedArc(TableView<?> tableView) {
@@ -1174,119 +1551,103 @@ public class GUIUtil {
         });
     }
 
-    private static <T> void addSpacerColumns(TableView<T> tableView) {
-        TableColumn<T, Void> leftSpacer = new TableColumn<>();
-        TableColumn<T, Void> rightSpacer = new TableColumn<>();
-
-        configureSpacerColumn(leftSpacer);
-        configureSpacerColumn(rightSpacer);
-
-        tableView.getColumns().add(0, leftSpacer);
-        tableView.getColumns().add(rightSpacer);
-    }
-
-    private static void configureSpacerColumn(TableColumn<?, ?> column) {
-        column.setPrefWidth(15);
-        column.setMaxWidth(15);
-        column.setMinWidth(15);
-        column.setReorderable(false);
-        column.setResizable(false);
-        column.setSortable(false);
-        column.setCellFactory(col -> new TableCell<>()); // empty cell
-    }
+    // side indentation carried by the edge columns' css padding (.first-column/.last-column)
+    private static final double EDGE_COLUMN_PADDING = 15;
+    // avatar columns center their content with inherent slack, so their edges need less
+    private static final double AVATAR_EDGE_COLUMN_PADDING = 5;
+    private static final String EDGE_COLUMN_BASE_WIDTH = "edgeColumnBaseWidth";
 
     private static <T> void applyEdgeColumnStyleClasses(TableView<T> tableView) {
-        ListChangeListener<TableColumn<T, ?>> columnListener = change -> {
-            UserThread.execute(() -> {
-                updateEdgeColumnStyleClasses(tableView);
-            });
-        };
-
-        tableView.getColumns().addListener(columnListener);
-        tableView.skinProperty().addListener((obs, oldSkin, newSkin) -> {
-            if (newSkin != null) {
-                UserThread.execute(() -> {
-                    updateEdgeColumnStyleClasses(tableView);
-                });
+        InvalidationListener updateListener = obs -> updateEdgeColumnStyleClasses(tableView);
+        for (TableColumn<T, ?> col : tableView.getColumns()) {
+            col.visibleProperty().addListener(updateListener);
+            col.getStyleClass().addListener(updateListener); // views may tag avatar-column after table styling
+        }
+        tableView.getColumns().addListener((ListChangeListener<TableColumn<T, ?>>) change -> {
+            while (change.next()) {
+                for (TableColumn<T, ?> col : change.getRemoved()) {
+                    col.visibleProperty().removeListener(updateListener);
+                    col.getStyleClass().removeListener(updateListener);
+                }
+                for (TableColumn<T, ?> col : change.getAddedSubList()) {
+                    col.visibleProperty().addListener(updateListener);
+                    col.getStyleClass().addListener(updateListener);
+                }
             }
+            updateEdgeColumnStyleClasses(tableView);
         });
-
-        // react to size changes
-        ChangeListener<Number> sizeListener = (obs, oldVal, newVal) -> updateEdgeColumnStyleClasses(tableView);
-        tableView.heightProperty().addListener(sizeListener);
-        tableView.widthProperty().addListener(sizeListener);
-
         updateEdgeColumnStyleClasses(tableView);
     }
 
     private static <T> void updateEdgeColumnStyleClasses(TableView<T> tableView) {
-        ObservableList<TableColumn<T, ?>> columns = tableView.getColumns();
-
-        // find columns with "first-column" and "last-column" classes
-        TableColumn<T, ?> firstCol = null;
-        TableColumn<T, ?> lastCol = null;
-        for (TableColumn<T, ?> col : columns) {
-            if (col.getStyleClass().contains("first-column")) {
-                firstCol = col;
-            } else if (col.getStyleClass().contains("last-column")) {
-                lastCol = col;
-            }
+        TableColumn<T, ?> first = null;
+        TableColumn<T, ?> last = null;
+        for (TableColumn<T, ?> col : tableView.getColumns()) {
+            if (!col.isVisible()) continue;
+            if (first == null) first = col;
+            last = col;
         }
-
-        // handle if columns do not exist
-        if (firstCol == null || lastCol == null) {
-            if (firstCol != null) throw new IllegalStateException("Missing column with 'last-column'");
-            if (lastCol != null) throw new IllegalStateException("Missing column with 'first-column'");
-
-            // remove all classes
-            for (TableColumn<T, ?> col : columns) {
-                col.getStyleClass().removeAll("first-column", "last-column");
-            }
-
-            // apply first and last classes
-            if (!columns.isEmpty()) {
-                TableColumn<T, ?> first = columns.get(0);
-                TableColumn<T, ?> last = columns.get(columns.size() - 1);
-
-                if (!first.getStyleClass().contains("first-column")) {
-                    first.getStyleClass().add("first-column");
-                }
-
-                if (!last.getStyleClass().contains("last-column")) {
-                    last.getStyleClass().add("last-column");
-                }
-            }
-        } else {
-
-            // done if correct order
-            if (columns.get(0) == firstCol && columns.get(columns.size() - 1) == lastCol) {
-                return;
-            }
-
-            // set first and last columns
-            if (columns.get(0) != firstCol) {
-                columns.remove(firstCol);
-                columns.add(0, firstCol);
-            }
-            if (columns.get(columns.size() - 1) != lastCol) {
-                columns.remove(lastCol);
-                columns.add(firstCol == lastCol ? columns.size() - 1 : columns.size(), lastCol);
-            }
+        for (TableColumn<T, ?> col : tableView.getColumns()) {
+            setEdgeColumnClass(col, "first-column", col == first);
+            setEdgeColumnClass(col, "last-column", col == last);
+            updateEdgeColumnWidth(col);
         }
     }
 
-    public static <T> ObservableList<TableColumn<T, ?>> getContentColumns(TableView<T> tableView) {
-        ObservableList<TableColumn<T, ?>> contentColumns = FXCollections.observableArrayList();
-        for (TableColumn<T, ?> column : tableView.getColumns()) {
-            if (!column.getStyleClass().contains("first-column") && !column.getStyleClass().contains("last-column")) {
-                contentColumns.add(column);
-            }
-        }
-        return contentColumns;
+    private static void setEdgeColumnClass(TableColumn<?, ?> column, String styleClass, boolean apply) {
+        boolean applied = column.getStyleClass().contains(styleClass);
+        if (apply && !applied) column.getStyleClass().add(styleClass);
+        else if (!apply && applied) column.getStyleClass().remove(styleClass);
     }
+
+    public static void setFixedColumnWidth(TableColumn<?, ?> column, double width) {
+        column.getProperties().put(EDGE_COLUMN_BASE_WIDTH, width);
+        updateEdgeColumnWidth(column);
+    }
+
+    // fixed-width edge columns widen by the css padding so their content area is unchanged
+    private static void updateEdgeColumnWidth(TableColumn<?, ?> column) {
+        int pads = (column.getStyleClass().contains("first-column") ? 1 : 0) +
+                (column.getStyleClass().contains("last-column") ? 1 : 0);
+        Double base = (Double) column.getProperties().get(EDGE_COLUMN_BASE_WIDTH);
+        if (base == null) {
+            if (pads == 0 || column.getMinWidth() != column.getMaxWidth()) return;
+            base = column.getMinWidth();
+            column.getProperties().put(EDGE_COLUMN_BASE_WIDTH, base);
+        }
+        double padding = column.getStyleClass().contains("avatar-column") ? AVATAR_EDGE_COLUMN_PADDING : EDGE_COLUMN_PADDING;
+        column.setMinWidth(base + pads * padding);
+        column.setMaxWidth(base + pads * padding);
+        if (pads == 0) column.getProperties().remove(EDGE_COLUMN_BASE_WIDTH);
+    }
+
+    private static final double CURRENCY_LOGO_DEFAULT_SIZE = 24; // currency logo size (px) outside list rows
 
     private static ImageView getCurrencyImageView(String currencyCode) {
-        return getCurrencyImageView(currencyCode, 24);
+        return getCurrencyImageView(currencyCode, CURRENCY_LOGO_DEFAULT_SIZE);
+    }
+
+    // crypto logos decoded once per device-pixel size and shared across icons; concurrent for the background pre-warm
+    private static final Map<String, Image> currencyImageCache = new ConcurrentHashMap<>();
+    private static final Set<String> currencyImageMisses = ConcurrentHashMap.newKeySet(); // codes without a decodable logo
+
+    // Pre-decode all crypto logos at the sizes lists use, off the FX thread (safe while the images are
+    // unattached), so pulldowns render from cache instead of stalling on PNG decodes, whose inflate cost
+    // is O(native pixels) no matter how small the target.
+    public static void warmCurrencyIconCache() {
+        double scale = Screen.getPrimary().getOutputScaleX();
+        Thread warmer = new Thread(() -> {
+            try {
+                for (CryptoCurrency currency : CurrencyUtil.getAllSortedCryptoCurrencies()) {
+                    getCurrencyImage(currency.getCode(), currencyIconBoxPx(CURRENCY_GRAPHIC_ROW_SIZE, scale), currencyIconMarginPx(scale));
+                    getCurrencyImage(currency.getCode(), Math.ceil(CURRENCY_LOGO_DEFAULT_SIZE * scale));
+                }
+            } catch (Exception e) {
+                log.warn("Error pre-warming currency icon cache: {}", e.getMessage());
+            }
+        }, "currency-icon-warmer");
+        warmer.setDaemon(true);
+        warmer.start();
     }
 
     private static ImageView getCurrencyImageView(String currencyCode, double size) {
@@ -1297,9 +1658,133 @@ public class GUIUtil {
         icon.setFitWidth(size);
         icon.setPreserveRatio(true);
         icon.setSmooth(true);
-        icon.setCache(true);
-        icon.setId(imageId);
+
+        // decode crypto logos at device-pixel size for crisp HiDPI downscaling; fall back to CSS-supplied image
+        Image image = getCurrencyImage(currencyCode, Math.ceil(size * Screen.getPrimary().getOutputScaleX()));
+        if (image != null) icon.setImage(image);
+        else icon.setId(imageId);
         return icon;
+    }
+
+    private static Image getCurrencyImage(String currencyCode, double px) {
+        return getCurrencyImage(currencyCode, (int) px, 0);
+    }
+
+    // decode the logo at native size (decoding at target size instead would flat-cut the right/bottom
+    // edge AA), then area-average it into a transparent box inset by a margin so the antialiased edge
+    // never snaps against the icon bounds and looks clipped
+    private static Image getCurrencyImage(String currencyCode, int boxPx, int marginPx) {
+        if (!CurrencyUtil.isCryptoCurrency(currencyCode)) return null;
+        String code = currencyCode.toLowerCase();
+        if (currencyImageMisses.contains(code)) return null; // avoid re-probing the classpath per cell update
+        Image image = currencyImageCache.computeIfAbsent(code + "@" + boxPx + "+" + marginPx, k -> {
+            try (InputStream in = GUIUtil.class.getResourceAsStream("/images/" + code + "_logo.png")) {
+                if (in == null) return null;
+                Image logo = new Image(in);
+                return logo.isError() ? null : downscaleCentered(logo, boxPx, marginPx);
+            } catch (IOException e) {
+                return null;
+            }
+        });
+        if (image == null) currencyImageMisses.add(code);
+        return image;
+    }
+
+    // area-averaged downscale of src centered in a transparent boxPx square, inset by marginPx per side
+    private static Image downscaleCentered(Image src, int boxPx, int marginPx) {
+        int sw = (int) src.getWidth(), sh = (int) src.getHeight();
+        int contentPx = Math.max(1, boxPx - 2 * marginPx);
+        double scale = Math.min(1, Math.min(contentPx / (double) sw, contentPx / (double) sh));
+        int dw = Math.max(1, (int) Math.round(sw * scale)), dh = Math.max(1, (int) Math.round(sh * scale));
+        int[] pixels = new int[sw * sh];
+        src.getPixelReader().getPixels(0, 0, sw, sh, PixelFormat.getIntArgbInstance(), pixels, 0, sw);
+        WritableImage out = new WritableImage(boxPx, boxPx);
+        PixelWriter writer = out.getPixelWriter();
+        int ox = (boxPx - dw) / 2, oy = (boxPx - dh) / 2;
+        double xr = sw / (double) dw, yr = sh / (double) dh;
+        for (int y = 0; y < dh; y++) {
+            double sy0 = y * yr, sy1 = Math.min(sh, sy0 + yr);
+            for (int x = 0; x < dw; x++) {
+                double sx0 = x * xr, sx1 = Math.min(sw, sx0 + xr);
+                double a = 0, r = 0, g = 0, b = 0, area = 0;
+                for (int sy = (int) sy0; sy < sy1; sy++) {
+                    double wy = Math.min(sy + 1, sy1) - Math.max(sy, sy0);
+                    for (int sx = (int) sx0; sx < sx1; sx++) {
+                        double w = (Math.min(sx + 1, sx1) - Math.max(sx, sx0)) * wy;
+                        int argb = pixels[sy * sw + sx];
+                        double wa = (argb >>> 24) * w;
+                        a += wa;
+                        r += ((argb >> 16) & 0xFF) * wa;
+                        g += ((argb >> 8) & 0xFF) * wa;
+                        b += (argb & 0xFF) * wa;
+                        area += w;
+                    }
+                }
+                int alpha = (int) Math.round(a / area);
+                writer.setArgb(ox + x, oy + y, alpha == 0 ? 0 : (alpha << 24)
+                        | ((int) Math.round(r / a) << 16) | ((int) Math.round(g / a) << 8) | (int) Math.round(b / a));
+            }
+        }
+        return out;
+    }
+
+    // PNG pixel dimensions read from the IHDR header, avoiding a full decode
+    private static int[] pngSize(String resourcePath) {
+        try (InputStream in = GUIUtil.class.getResourceAsStream(resourcePath)) {
+            if (in == null) return null;
+            byte[] h = in.readNBytes(24);
+            if (h.length < 24) return null;
+            int w = ((h[16] & 0xff) << 24) | ((h[17] & 0xff) << 16) | ((h[18] & 0xff) << 8) | (h[19] & 0xff);
+            int ht = ((h[20] & 0xff) << 24) | ((h[21] & 0xff) << 16) | ((h[22] & 0xff) << 8) | (h[23] & 0xff);
+            return w > 0 && ht > 0 ? new int[]{w, ht} : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    // branding logos decoded once per theme + device-pixel size (never above native), kept in sync with the theme
+    private static final Map<String, Image> brandingImageCache = new HashMap<>();
+
+    // Render a branding logo crisply on HiDPI: decode the theme's PNG at device-pixel size, capped at the
+    // source so it is never upscaled, and swap it on theme toggle. Pass the fixed dimension in fitWidth or
+    // fitHeight and 0 for the other. The CSS id drives the logo only if a PNG can't be decoded.
+    public static void setBrandingLogo(ImageView logo, Preferences preferences, String lightPath, String darkPath, double fitWidth, double fitHeight) {
+        double scale = Screen.getPrimary().getOutputScaleX();
+        double pxW = fitWidth <= 0 ? 0 : Math.ceil(fitWidth * scale);
+        double pxH = fitHeight <= 0 ? 0 : Math.ceil(fitHeight * scale);
+        ChangeListener<Number> themeListener = (ov, o, n) -> updateBrandingLogo(logo, n.intValue() == 1 ? darkPath : lightPath, pxW, pxH);
+        updateBrandingLogo(logo, preferences.getCssTheme() == 1 ? darkPath : lightPath, pxW, pxH);
+
+        // replace any previous branding listener so the same view can be repointed at other assets or sizes
+        @SuppressWarnings("unchecked")
+        ChangeListener<Number> prevListener = (ChangeListener<Number>) logo.getProperties().get("brandingThemeListenerWeak");
+        if (prevListener != null) preferences.getCssThemeProperty().removeListener(prevListener);
+
+        // weak listener (strong ref held on the ImageView) lets the logo be GC'd with its scene without leaking
+        WeakChangeListener<Number> weakListener = new WeakChangeListener<>(themeListener);
+        logo.getProperties().put("brandingThemeListener", themeListener);
+        logo.getProperties().put("brandingThemeListenerWeak", weakListener);
+        preferences.getCssThemeProperty().addListener(weakListener);
+    }
+
+    private static void updateBrandingLogo(ImageView logo, String resourcePath, double pxW, double pxH) {
+        Image image = brandingImageCache.computeIfAbsent(resourcePath + "@" + (int) pxW + "x" + (int) pxH, k -> {
+            int[] source = pngSize(resourcePath);
+            double w = source != null && pxW > source[0] ? source[0] : pxW;
+            double h = source != null && pxH > source[1] ? source[1] : pxH;
+            try (InputStream in = GUIUtil.class.getResourceAsStream(resourcePath)) {
+                if (in == null) return null;
+                Image img = new Image(in, w, h, true, true);
+                return img.isError() ? null : img;
+            } catch (IOException e) {
+                return null;
+            }
+        });
+        // drop the CSS id once decoded so the native-size -fx-image is never also loaded
+        if (image != null) {
+            logo.setImage(image);
+            logo.setId(null);
+        }
     }
 
     public static StackPane getCurrencyIcon(String currencyCode) {
@@ -1307,9 +1792,76 @@ public class GUIUtil {
         return icon == null ? null : new StackPane(icon);
     }
 
+    public static final double CURRENCY_GRAPHIC_ROW_SIZE = 25; // currency logo size (px) in list rows; adjust to resize
+    private static final double CURRENCY_LABEL_SMALL_WIDTH = 45; // .currency-label-small -fx-pref-width
+    private static final double CURRENCY_ICON_MARGIN = 1; // transparent margin (logical px) bled just outside list logos
+
+    public static Node getCurrencyGraphic(String currencyCode, double size) {
+        if (currencyCode == null) return null;
+        if (CurrencyUtil.isFiatCurrency(currencyCode)) return getFiatCurrencyBadge(currencyCode, size);
+        return getCurrencyIcon(currencyCode, size);
+    }
+
+    private static Node getFiatCurrencyBadge(String currencyCode, double size) {
+        String symbol;
+        try {
+            symbol = Currency.getInstance(currencyCode).getSymbol(GlobalSettings.getLocale());
+        } catch (Exception e) {
+            symbol = currencyCode;
+        }
+        if (symbol == null || symbol.isEmpty()) symbol = currencyCode;
+        if (symbol.length() > 3) symbol = symbol.substring(0, 3);
+
+        Label label = new Label(symbol);
+        label.getStyleClass().add("fiat-currency-symbol");
+        double fontSize = symbol.length() >= 3 ? size * 0.34 : symbol.length() == 2 ? size * 0.5 : size * 0.72;
+        label.setStyle("-fx-font-size: " + fontSize + "px;");
+
+        StackPane badge = new StackPane(label);
+        badge.getStyleClass().add("fiat-currency-badge");
+        badge.setMinSize(size, size);
+        badge.setPrefSize(size, size);
+        badge.setMaxSize(size, size);
+        return badge;
+    }
+
     public static StackPane getCurrencyIcon(String currencyCode, double size) {
-        ImageView icon = getCurrencyImageView(currencyCode, size);
-        return icon == null ? null : new StackPane(icon);
+        ImageView icon = getCurrencyIconImageView(currencyCode, size);
+        if (icon == null) return null;
+        StackPane pane = new StackPane(icon);
+        pane.setMinSize(size, size);
+        pane.setPrefSize(size, size);
+        pane.setMaxSize(size, size);
+        return pane;
+    }
+
+    // list icon: the logo fills `size` while its transparent anti-clip margin bleeds just outside those
+    // bounds (the oversized ImageView overflows the size-clamped StackPane), so the full-bleed logo
+    // renders at full size yet its antialiased edge is never clipped
+    private static ImageView getCurrencyIconImageView(String currencyCode, double size) {
+        if (currencyCode == null) return null;
+        String imageId = getImageId(currencyCode);
+        if (imageId == null) return null;
+        double box = size + 2 * CURRENCY_ICON_MARGIN; // margin bleeds outside `size` instead of shrinking the logo
+        ImageView icon = new ImageView();
+        icon.setFitWidth(box);
+        icon.setFitHeight(box);
+        icon.setPreserveRatio(true);
+        icon.setSmooth(true);
+        double scale = Screen.getPrimary().getOutputScaleX();
+        Image image = getCurrencyImage(currencyCode, currencyIconBoxPx(size, scale), currencyIconMarginPx(scale));
+        if (image != null) icon.setImage(image);
+        else icon.setId(imageId);
+        return icon;
+    }
+
+    // device-pixel box and margin for a list icon; shared with the cache pre-warm so keys always match
+    private static int currencyIconBoxPx(double size, double scale) {
+        return (int) Math.ceil((size + 2 * CURRENCY_ICON_MARGIN) * scale);
+    }
+
+    private static int currencyIconMarginPx(double scale) {
+        return (int) Math.ceil(CURRENCY_ICON_MARGIN * scale);
     }
 
     public static StackPane getCurrencyIconWithBorder(String currencyCode) {
@@ -1348,22 +1900,35 @@ public class GUIUtil {
         return null;
     }
 
+    private static final PseudoClass CAPPED = PseudoClass.getPseudoClass("capped");
+
     public static void adjustHeightAutomatically(TextArea textArea) {
         adjustHeightAutomatically(textArea, null);
     }
 
     public static void adjustHeightAutomatically(TextArea textArea, Double maxHeight) {
+        adjustHeightAutomatically(textArea, maxHeight, true);
+    }
+
+    public static void adjustHeightAutomatically(TextArea textArea, Double maxHeight, boolean loadSceneStyles) {
+        adjustHeightAutomatically(textArea, maxHeight, loadSceneStyles, null);
+    }
+
+    public static void adjustHeightAutomatically(TextArea textArea, Double maxHeight, boolean loadSceneStyles, Double extraHeight) {
+        if (maxHeight != null) textArea.prefHeightProperty().addListener((o, oldHeight, newHeight) ->
+                textArea.pseudoClassStateChanged(CAPPED, newHeight.doubleValue() >= maxHeight));
         textArea.sceneProperty().addListener((o, oldScene, newScene) -> {
             if (newScene != null) {
                 // avoid javafx css warning
-                CssTheme.loadSceneStyles(newScene, CssTheme.getCurrentTheme(), false);
+                if (loadSceneStyles) CssTheme.loadSceneStyles(newScene, CssTheme.getCurrentTheme(), false);
                 textArea.applyCss();
                 var text = textArea.lookup(".text");
 
                 textArea.prefHeightProperty().bind(Bindings.createDoubleBinding(() -> {
                     Insets padding = textArea.getInsets();
                     double topBottomPadding = padding.getTop() + padding.getBottom();
-                    double prefHeight = textArea.getFont().getSize() + text.getBoundsInLocal().getHeight() + topBottomPadding;
+                    double prefHeight = (extraHeight == null ? textArea.getFont().getSize() : extraHeight) +
+                            text.getBoundsInLocal().getHeight() + topBottomPadding;
                     return maxHeight == null ? prefHeight : Math.min(prefHeight, maxHeight);
                 }, text.boundsInLocalProperty()));
 
@@ -1377,36 +1942,158 @@ public class GUIUtil {
     public static Label getLockLabel() {
         MaterialDesignIconView lockIcon = new MaterialDesignIconView(MaterialDesignIcon.LOCK, "16px");
         lockIcon.setFill(Color.WHITE);
+        Accessibility.mute(lockIcon);
         Label lockLabel = new Label();
         lockLabel.setGraphic(lockIcon);
+        Accessibility.asText(lockLabel, Res.get("shared.privateOffer"));
         return lockLabel;
     }
 
-    public static MaterialDesignIconView getLockIcon(Labeled colorSource, String glyphSize) {
+    public static MaterialDesignIconView getLockIcon(String glyphSize) {
         MaterialDesignIconView lockIcon = new MaterialDesignIconView(MaterialDesignIcon.LOCK, glyphSize);
-        lockIcon.fillProperty().bind(colorSource.textFillProperty());
+        lockIcon.getStyleClass().add("lock-icon");
+        Accessibility.mute(lockIcon);
         return lockIcon;
     }
 
+    private static final double PRIVATE_OFFER_LOCK_ICON_OPACITY = 0.7;
+
     public static void addPrivateOfferLockIcon(Label label) {
-        MaterialDesignIconView lockIcon = getLockIcon(label, "1.2em");
-        lockIcon.setOpacity(0.7); // match the muted weight of other inline icons (e.g. the info icon)
+        addPrivateOfferLockIcon(label, "1.231em", PRIVATE_OFFER_LOCK_ICON_OPACITY);
+    }
+
+    public static void addCompactPrivateOfferLockIcon(Label label) {
+        addPrivateOfferLockIcon(label, "1.2em", PRIVATE_OFFER_LOCK_ICON_OPACITY);
+    }
+
+    private static void addPrivateOfferLockIcon(Label label, String glyphSize, double opacity) {
+        MaterialDesignIconView lockIcon = getLockIcon(glyphSize);
+        lockIcon.setOpacity(opacity);
         label.setGraphic(lockIcon);
         label.setContentDisplay(ContentDisplay.RIGHT);
         label.setGraphicTextGap(6);
+        Accessibility.setHelp(label, Res.get("shared.privateOffer"));
     }
 
     public static MaterialDesignIconView getCopyIcon() {
-        return new MaterialDesignIconView(MaterialDesignIcon.CONTENT_COPY, "1.35em");
+        MaterialDesignIconView copyIcon = new MaterialDesignIconView(MaterialDesignIcon.CONTENT_COPY, "1.35em");
+        Accessibility.mute(copyIcon);
+        return copyIcon;
     }
 
+    public static void configureCopyIcon(Labeled control, Supplier<String> contents) {
+        control.setGraphic(getCopyIcon());
+        Tooltip hover = new Tooltip(Res.get("shared.copyToClipboard"));
+        Tooltip feedback = new Tooltip(Res.get("shared.copiedToClipboard"));
+        control.setTooltip(hover);
+        PauseTransition timeout = new PauseTransition(Duration.seconds(1));
+        Runnable reset = () -> {
+            timeout.stop();
+            feedback.hide();
+            control.setTooltip(hover);
+        };
+        timeout.setOnFinished(event -> reset.run());
+        control.sceneProperty().addListener((observable, oldScene, newScene) -> reset.run());
+        Runnable copy = () -> {
+            String text = contents.get();
+            if (text == null || text.isEmpty()) return;
+            Utilities.copyToClipboard(text);
+            // anchor feedback to the glyph even when the copy label stretches to fit a field
+            Node graphic = control.getGraphic();
+            Bounds bounds = graphic.localToScreen(graphic.getBoundsInLocal());
+            if (bounds != null) {
+                control.setTooltip(null);
+                hover.hide();
+                feedback.show(control, bounds.getCenterX() + Layout.PADDING, bounds.getCenterY() + Layout.PADDING);
+                timeout.playFromStart();
+            }
+        };
+        if (control instanceof ButtonBase button) {
+            button.setAccessibleText(Res.get("shared.copyToClipboard"));
+            button.setOnAction(event -> copy.run());
+        } else {
+            control.setOnMouseClicked(event -> copy.run());
+            Accessibility.asButton(control, Res.get("shared.copyToClipboard"));
+        }
+    }
 
     public static Tuple2<StackPane, ImageView> getSmallXmrQrCodePane() {
         return getXmrQrCodePane(150, disablePaymentUriLabel ? 32 : 28, 2);
     }
 
+    private static final int BIG_QR_CODE_SIZE = 250;
+
     public static Tuple2<StackPane, ImageView> getBigXmrQrCodePane() {
-        return getXmrQrCodePane(250, disablePaymentUriLabel ? 47 : 45, 3);
+        return getBigXmrQrCodePane(BIG_QR_CODE_SIZE);
+    }
+
+    public static Tuple2<StackPane, ImageView> getBigXmrQrCodePane(int qrCodeSize) {
+        int baseLogoSize = disablePaymentUriLabel ? 47 : 45; // logo size at the default code size
+        int logoSize = (int) Math.round((double) baseLogoSize * qrCodeSize / BIG_QR_CODE_SIZE);
+        return getXmrQrCodePane(qrCodeSize, logoSize, 3);
+    }
+
+    /** Overlays a calendar icon on a text field which opens a date picker popup, writing the picked date as YYYY-MM-DD. */
+    public static StackPane wrapWithCalendarPicker(TextField field) {
+        // host the calendar in our own popup instead of the skin's, so its position is fully ours
+        DatePicker picker = new DatePicker();
+        Node calendar = new DatePickerSkin(picker).getPopupContent();
+        javafx.stage.Popup popup = new javafx.stage.Popup();
+        popup.setAutoHide(true);
+        popup.getContent().add(calendar);
+        popup.widthProperty().addListener((observable, oldValue, newValue) -> positionCalendarPopup(field, popup, calendar));
+        popup.heightProperty().addListener((observable, oldValue, newValue) -> positionCalendarPopup(field, popup, calendar));
+
+        picker.valueProperty().addListener((observable, oldValue, newValue) -> {
+            if (newValue != null) field.setText(newValue.toString());
+            popup.hide();
+        });
+        calendar.addEventHandler(MouseEvent.MOUSE_CLICKED, event -> { // also close on re-picking the selected day
+            for (Node node = event.getTarget() instanceof Node ? (Node) event.getTarget() : null; node != null; node = node.getParent()) {
+                if (node.getStyleClass().contains("day-cell")) {
+                    popup.hide();
+                    break;
+                }
+            }
+        });
+
+        Text icon = FormBuilder.getIcon(MaterialDesignIcon.CALENDAR, "1.2em");
+        icon.getStyleClass().add("calendar-picker-icon");
+        StackPane iconButton = new StackPane(icon);
+        iconButton.getStyleClass().add("calendar-picker-button");
+        iconButton.setCursor(Cursor.HAND);
+        iconButton.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        iconButton.setPadding(new Insets(4, 12, 4, 12));
+        StackPane.setAlignment(iconButton, Pos.CENTER_RIGHT);
+        iconButton.setOnMouseClicked(event -> {
+            try {
+                picker.setValue(LocalDate.parse(field.getText().trim()));
+            } catch (Exception e) {
+                picker.setValue(null);
+            }
+            popup.getScene().getStylesheets().setAll(field.getScene().getStylesheets()); // popup scenes do not inherit styles
+            popup.show(field, 0, 0);
+            positionCalendarPopup(field, popup, calendar);
+        });
+
+        StackPane pane = new StackPane(field, iconButton);
+        pane.setMaxWidth(field.getMaxWidth()); // size with the field
+        return pane;
+    }
+
+    // pin the calendar card's right edge under the field's calendar icon, kept inside the window; below the field, or
+    // above when there is no room. Positions by the card's bounds since the drop shadow inflates the popup window.
+    private static void positionCalendarPopup(TextField field, javafx.stage.Popup popup, Node calendar) {
+        if (!popup.isShowing() || field.getScene() == null) return;
+        Bounds fieldBounds = field.localToScreen(field.getLayoutBounds());
+        Bounds cardBounds = calendar.localToScreen(calendar.getLayoutBounds());
+        Window window = field.getScene().getWindow();
+        double cardY = fieldBounds.getMaxY() + 4;
+        if (cardY + cardBounds.getHeight() > window.getY() + window.getHeight() - 5)
+            cardY = fieldBounds.getMinY() - cardBounds.getHeight() - 4;
+        double cardX = Math.max(fieldBounds.getMaxX() - cardBounds.getWidth(), window.getX() + 5);
+        popup.setX(popup.getX() + cardX - cardBounds.getMinX());
+        popup.setY(popup.getY() + cardY - cardBounds.getMinY());
     }
 
     private static Tuple2<StackPane, ImageView> getXmrQrCodePane(int qrCodeSize, int logoSize, int logoBorderWidth) {
@@ -1420,6 +2107,15 @@ public class GUIUtil {
         qrCodePane.setCursor(Cursor.HAND);
         qrCodePane.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
 
-        return new Tuple2<>(qrCodePane, qrCodeImageView);
+        // round the corners, with the shadow on a wrapper so the clip does not cut it off
+        Rectangle clip = new Rectangle(qrCodeSize, qrCodeSize);
+        clip.setArcWidth(Layout.ROUNDED_ARC);
+        clip.setArcHeight(Layout.ROUNDED_ARC);
+        qrCodePane.setClip(clip);
+        StackPane qrCodeWrapper = new StackPane(qrCodePane);
+        qrCodeWrapper.getStyleClass().add("qr-code-pane");
+        qrCodeWrapper.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+
+        return new Tuple2<>(qrCodeWrapper, qrCodeImageView);
     }
 }

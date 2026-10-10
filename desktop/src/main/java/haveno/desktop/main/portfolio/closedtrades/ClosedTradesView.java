@@ -19,19 +19,24 @@ package haveno.desktop.main.portfolio.closedtrades;
 
 import com.google.inject.Inject;
 import com.google.inject.name.Named;
-import com.googlecode.jcsv.writer.CSVEntryConverter;
+import java.util.function.Function;
 import com.jfoenix.controls.JFXButton;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
+import haveno.common.ThreadUtils;
 import haveno.common.config.Config;
 import haveno.common.crypto.KeyRing;
+import haveno.common.util.Utilities;
 import haveno.core.alert.PrivateNotificationManager;
 import haveno.core.locale.Res;
 import haveno.core.offer.Offer;
 import haveno.core.offer.OfferPayload;
 import haveno.core.offer.OpenOffer;
+import haveno.core.support.traderchat.TradeChatSession;
+import haveno.core.support.traderchat.TraderChatManager;
 import haveno.core.trade.Tradable;
 import haveno.core.trade.Trade;
+import haveno.core.trade.TradeManager;
 import haveno.core.user.Preferences;
 import haveno.desktop.Navigation;
 import haveno.desktop.common.view.ActivatableViewAndModel;
@@ -42,16 +47,18 @@ import haveno.desktop.components.AutoTooltipTableColumn;
 import haveno.desktop.components.HyperlinkWithIcon;
 import haveno.desktop.components.PeerInfoIconTrading;
 import haveno.desktop.components.list.FilterBox;
+import haveno.desktop.main.overlays.notifications.NotificationCenter;
 import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.main.overlays.windows.ClosedTradesSummaryWindow;
 import haveno.desktop.main.overlays.windows.OfferDetailsWindow;
 import haveno.desktop.main.overlays.windows.TradeDetailsWindow;
 import haveno.desktop.main.portfolio.presentation.PortfolioUtil;
+import haveno.desktop.main.shared.ChatView;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.FormBuilder;
 import haveno.desktop.util.GUIUtil;
 import haveno.network.p2p.NodeAddress;
 import java.util.Comparator;
-import java.util.function.Function;
 import javafx.beans.binding.Bindings;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.beans.value.ChangeListener;
@@ -61,15 +68,22 @@ import javafx.event.ActionEvent;
 import javafx.fxml.FXML;
 import javafx.geometry.Insets;
 import javafx.scene.Node;
+import javafx.scene.Scene;
 import javafx.scene.control.Button;
+import javafx.scene.control.ButtonBase;
 import javafx.scene.control.ContextMenu;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableRow;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.TableView;
 import javafx.scene.control.Tooltip;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
+import javafx.scene.input.MouseButton;
+import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
@@ -80,6 +94,7 @@ import javafx.util.Callback;
 @FxmlView
 public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTradesViewModel> {
     private final boolean useDevPrivilegeKeys;
+    private final boolean useDevModeHeader;
 
     private enum ColumnNames {
         TRADE_ID(Res.get("shared.tradeId")),
@@ -110,12 +125,14 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
     }
 
     @FXML
+    ScrollPane tableScrollPane;
+    @FXML
     TableView<ClosedTradesListItem> tableView;
     @FXML
     TableColumn<ClosedTradesListItem, ClosedTradesListItem> priceColumn, deviationColumn, amountColumn, volumeColumn,
             tradeFeeColumn, buyerSecurityDepositColumn, sellerSecurityDepositColumn,
             marketColumn, directionColumn, dateColumn, tradeIdColumn, stateColumn, removeTradeColumn,
-            duplicateColumn, avatarColumn;
+            duplicateColumn, avatarColumn, chatColumn;
     @FXML
     FilterBox filterBox;
     @FXML
@@ -134,6 +151,10 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
     private SortedList<ClosedTradesListItem> sortedList;
     private FilteredList<ClosedTradesListItem> filteredList;
     private ChangeListener<Number> widthListener;
+    private final TraderChatManager traderChatManager;
+    private final TradeManager tradeManager;
+    private final NotificationCenter notificationCenter;
+    private Stage chatPopupStage;
 
     @Inject
     public ClosedTradesView(ClosedTradesViewModel model,
@@ -143,7 +164,11 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
                             Preferences preferences,
                             TradeDetailsWindow tradeDetailsWindow,
                             PrivateNotificationManager privateNotificationManager,
-                            @Named(Config.USE_DEV_PRIVILEGE_KEYS) boolean useDevPrivilegeKeys) {
+                            TraderChatManager traderChatManager,
+                            TradeManager tradeManager,
+                            NotificationCenter notificationCenter,
+                            @Named(Config.USE_DEV_PRIVILEGE_KEYS) boolean useDevPrivilegeKeys,
+                            @Named(Config.USE_DEV_MODE_HEADER) boolean useDevModeHeader) {
         super(model);
         this.offerDetailsWindow = offerDetailsWindow;
         this.navigation = navigation;
@@ -152,10 +177,15 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         this.tradeDetailsWindow = tradeDetailsWindow;
         this.privateNotificationManager = privateNotificationManager;
         this.useDevPrivilegeKeys = useDevPrivilegeKeys;
+        this.useDevModeHeader = useDevModeHeader;
+        this.traderChatManager = traderChatManager;
+        this.tradeManager = tradeManager;
+        this.notificationCenter = notificationCenter;
     }
 
     @Override
     public void initialize() {
+        filterBox.setInputFillWidth(0);
         GUIUtil.applyTableStyle(tableView);
 
         widthListener = (observable, oldValue, newValue) -> onWidthChange((double) newValue);
@@ -177,6 +207,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
 
         tableView.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
         tableView.setPlaceholder(new AutoTooltipLabel(Res.get("table.placeholder.noItems", Res.get("shared.trades"))));
+        GUIUtil.applyTableHorizontalScroll(tableScrollPane, tableView);
 
         setTradeIdColumnCellFactory();
         setDirectionColumnCellFactory();
@@ -193,6 +224,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         setRemoveTradeColumnCellFactory();
         setDuplicateColumnCellFactory();
         setAvatarColumnCellFactory();
+        setChatColumnCellFactory();
 
         tradeIdColumn.setComparator(Comparator.comparing(ClosedTradesListItem::getTradeId));
         dateColumn.setComparator(Comparator.comparing(ClosedTradesListItem::getDate));
@@ -225,6 +257,15 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         tableView.setRowFactory(
                 tableView -> {
                     TableRow<ClosedTradesListItem> row = new TableRow<>();
+                    row.setOnMouseClicked(event -> {
+                        if (event.getButton() != MouseButton.PRIMARY || event.getClickCount() != 2 || row.isEmpty()) return;
+                        for (Node node = (Node) event.getTarget(); node != null && node != row; node = node.getParent()) {
+                            // row actions keep their own behavior
+                            if (node instanceof ButtonBase || node instanceof PeerInfoIconTrading) return;
+                        }
+                        showDetails(row.getItem().getTradable());
+                        event.consume();
+                    });
                     ContextMenu rowMenu = new ContextMenu();
                     MenuItem duplicateItem = new MenuItem(Res.get("portfolio.context.offerLikeThis"));
                     duplicateItem.setOnAction((ActionEvent event) -> onDuplicateOffer(row.getItem().getTradable().getOffer()));
@@ -244,6 +285,10 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         summaryButton.updateText(Res.get("shared.summary"));
     }
 
+    public Region getHeaderControls() {
+        return filterBox;
+    }
+
     @Override
     protected void activate() {
         filteredList = new FilteredList<>(model.dataModel.getList());
@@ -253,20 +298,23 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
 
         tableView.setItems(sortedList);
 
+        removeTradeColumn.visibleProperty().bind(Bindings.createBooleanBinding(() -> filteredList.stream()
+                .anyMatch(item -> item.getTradable() instanceof Trade trade && !trade.isPayoutConfirmed()), filteredList));
+
         filterBox.initialize(filteredList, tableView); // here because filteredList is instantiated here
         filterBox.setPromptText(Res.get("shared.filter"));
         filterBox.activate();
 
         numItems.setText(Res.get("shared.numItemsLabel", sortedList.size()));
         exportButton.setOnAction(event -> {
-            CSVEntryConverter<ClosedTradesListItem> headerConverter = item -> {
+            Function<ClosedTradesListItem, String[]> headerConverter = item -> {
                 String[] columns = new String[ColumnNames.values().length];
                 for (ColumnNames m : ColumnNames.values()) {
                     columns[m.ordinal()] = m.toString();
                 }
                 return columns;
             };
-            CSVEntryConverter<ClosedTradesListItem> contentConverter = item -> {
+            Function<ClosedTradesListItem, String[]> contentConverter = item -> {
                 String[] columns = new String[ColumnNames.values().length];
                 columns[ColumnNames.TRADE_ID.ordinal()] = item.getTradeId();
                 columns[ColumnNames.DATE.ordinal()] = item.getDateAsString();
@@ -301,7 +349,9 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
 
     @Override
     protected void deactivate() {
+        if (chatPopupStage != null) chatPopupStage.hide();
         sortedList.comparatorProperty().unbind();
+        removeTradeColumn.visibleProperty().unbind();
         exportButton.setOnAction(null);
         summaryButton.setOnAction(null);
 
@@ -328,6 +378,74 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         sellerSecurityDepositColumn.setVisible(width > 1500);
     }
 
+    private void showDetails(Tradable tradable) {
+        if (tradable instanceof Trade) {
+            tradeDetailsWindow.show((Trade) tradable);
+        } else if (tradable instanceof OpenOffer) {
+            offerDetailsWindow.show(tradable.getOffer());
+        }
+    }
+
+    private void setChatColumnCellFactory() {
+        chatColumn.setCellValueFactory(item -> new ReadOnlyObjectWrapper<>(item.getValue()));
+        chatColumn.getStyleClass().add("avatar-column");
+        chatColumn.setCellFactory(column -> new TableCell<>() {
+            @Override
+            protected void updateItem(ClosedTradesListItem item, boolean empty) {
+                super.updateItem(item, empty);
+                setGraphic(null);
+                if (!empty && item != null && item.getTradable() instanceof Trade trade &&
+                        !trade.isArbitrator() && !trade.getChatMessages().isEmpty()) {
+                    Button button = FormBuilder.getChatIconButton();
+                    button.setOnAction(event -> openChat(trade));
+                    setGraphic(button);
+                }
+            }
+        });
+    }
+
+    private void openChat(Trade trade) {
+        if (trade.isArbitrator() || trade.getChatMessages().isEmpty()) return;
+        if (chatPopupStage != null) chatPopupStage.hide();
+
+        ChatView chatView = new ChatView(traderChatManager, Res.get("offerbook.trader"));
+        chatView.setAllowAttachments(false);
+        chatView.setDisplayHeader(false);
+        chatView.initialize();
+        AnchorPane pane = new AnchorPane(chatView);
+        AnchorPane.setLeftAnchor(chatView, 0d);
+        AnchorPane.setRightAnchor(chatView, 0d);
+        AnchorPane.setTopAnchor(chatView, 0d);
+        AnchorPane.setBottomAnchor(chatView, 0d);
+        chatView.display(new TradeChatSession(trade, trade.isTaker()), pane.widthProperty());
+        chatView.activate();
+        chatView.scrollToBottom();
+
+        Stage stage = new Stage();
+        chatPopupStage = stage;
+        Runnable persist = () -> ThreadUtils.submitToPool(() -> tradeManager.requestPersistence(trade));
+        ChangeListener<Boolean> focusListener = (observable, oldValue, focused) ->
+                notificationCenter.onChatFocusChanged(trade.getChatMessages(), focused, persist);
+        stage.focusedProperty().addListener(focusListener);
+        stage.setTitle(Res.get("tradeChat.chatWindowTitle", trade.getShortId()));
+        stage.setOnHiding(event -> {
+            chatView.deactivate();
+            stage.focusedProperty().removeListener(focusListener);
+            notificationCenter.onChatFocusChanged(trade.getChatMessages(), false, persist);
+            chatPopupStage = null;
+        });
+        Scene scene = new Scene(pane);
+        scene.addEventHandler(KeyEvent.KEY_RELEASED, event -> {
+            if (event.getCode() == KeyCode.ESCAPE || Utilities.isCtrlPressed(KeyCode.W, event)) {
+                event.consume();
+                stage.hide();
+            }
+        });
+        stage.setScene(scene);
+        GUIUtil.loadWindowStyles(stage, preferences, useDevModeHeader);
+        GUIUtil.showCenteredChatWindow(stage, root.getScene());
+    }
+
     private void setTradeIdColumnCellFactory() {
         tradeIdColumn.setCellValueFactory((offerListItem) -> new ReadOnlyObjectWrapper<>(offerListItem.getValue()));
         tradeIdColumn.setCellFactory(
@@ -344,14 +462,9 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
                                 super.updateItem(item, empty);
                                 if (item != null && !empty) {
                                     field = new HyperlinkWithIcon(item.getTradeId());
-                                    field.setOnAction(event -> {
-                                        Tradable tradable = item.getTradable();
-                                        if (tradable instanceof Trade) {
-                                            tradeDetailsWindow.show((Trade) tradable);
-                                        } else if (tradable instanceof OpenOffer) {
-                                            offerDetailsWindow.show(tradable.getOffer());
-                                        }
-                                    });
+                                    field.hideIcon();
+                                    Accessibility.setName(field, Accessibility.spellOut(item.getTradeId()));
+                                    field.setOnAction(event -> showDetails(item.getTradable()));
                                     field.setTooltip(new Tooltip(Res.get("tooltip.openPopupForDetails")));
                                     setGraphic(field);
                                 } else {
@@ -602,7 +715,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
                                 super.updateItem(item, empty);
                                 if (item != null && !empty) {
                                     AutoTooltipLabel directionLabel = new AutoTooltipLabel(item.getDirectionLabel());
-                                    if (item.isPrivateOffer()) GUIUtil.addPrivateOfferLockIcon(directionLabel);
+                                    if (item.isPrivateOffer()) GUIUtil.addCompactPrivateOfferLockIcon(directionLabel);
                                     setGraphic(directionLabel);
                                 } else {
                                     setGraphic(null);
@@ -698,11 +811,12 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
                                 Trade trade = (Trade) newItem.getTradable();
                                 super.updateItem(newItem, empty);
                                 if (!empty && newItem != null && !trade.isPayoutConfirmed()) {
-                                    Label icon = FormBuilder.getIcon(AwesomeIcon.UNDO);
+                                    Label icon = FormBuilder.getIcon(FontAwesomeIcon.UNDO);
                                     JFXButton iconButton = new JFXButton("", icon);
-                                    iconButton.setStyle("-fx-cursor: hand; -fx-padding: 0 10 0 10;");
+                                    iconButton.setStyle("-fx-cursor: hand;");
                                     iconButton.getStyleClass().add("hidden-icon-button");
                                     iconButton.setTooltip(new Tooltip(Res.get("portfolio.failed.revertToPending")));
+                                    Accessibility.nameFromTooltip(iconButton);
                                     iconButton.setOnAction(e -> onRevertTrade(trade));
                                     setGraphic(iconButton);
                                 } else {

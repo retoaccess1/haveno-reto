@@ -17,55 +17,57 @@
 
 package haveno.desktop.main.overlays.windows;
 
+import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
 import haveno.core.locale.Res;
-import haveno.desktop.components.TxIdTextField;
-import haveno.desktop.main.overlays.Overlay;
-import javafx.scene.layout.GridPane;
-import javafx.scene.layout.Region;
+import haveno.core.trade.HavenoUtils;
+import haveno.core.user.Preferences;
+import haveno.core.xmr.wallet.XmrWalletService;
+import javafx.scene.Node;
 
-import static haveno.desktop.util.FormBuilder.addConfirmationLabelLabel;
-import static haveno.desktop.util.FormBuilder.addConfirmationLabelTextFieldWithCopyIcon;
-import static haveno.desktop.util.FormBuilder.addLabelTxIdTextField;
-import static haveno.desktop.util.FormBuilder.addMultilineLabel;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Function;
 
-public class TxWithdrawWindow extends Overlay<TxWithdrawWindow> {
+/** Success dialog after a withdrawal, showing the sent amount, destination, fee and tx id. */
+public class TxWithdrawWindow extends TxHeroWindow<TxWithdrawWindow> {
 
-    protected String txId, address, amount, fee, memo;
-    protected TxIdTextField txIdTextField;
+    private final String txId;
+    private final String address;
+    private final BigInteger amount;
+    private final BigInteger fee;
+    private final String memo;
+    private final Function<BigInteger, String> fiatText; // approximate fiat for an amount, or null while no price
+    private final XmrWalletService xmrWalletService;
+    private final Preferences preferences;
 
-    public TxWithdrawWindow(String txId, String address, String amount, String fee, String memo) {
-        type = Type.Attention;
+    public TxWithdrawWindow(String txId, String address, BigInteger amount, BigInteger fee, String memo,
+                            Function<BigInteger, String> fiatText, XmrWalletService xmrWalletService, Preferences preferences) {
         this.txId = txId;
         this.address = address;
         this.amount = amount;
         this.fee = fee;
         this.memo = memo;
+        this.fiatText = fiatText;
+        this.xmrWalletService = xmrWalletService;
+        this.preferences = preferences;
     }
 
+    @Override
     public void show() {
-        rowIndex = -1;
-        width = 918;
-        if (headLine == null)
-            headLine = Res.get("txDetailsWindow.headline");
-        createGridPane();
-        gridPane.setHgap(15);
-        addHeadLine();
-        addContent();
-        addButtons();
-        applyStyles();
-        display();
+        showHeroWindow();
     }
 
+    @Override
     protected void addContent() {
-        GridPane.setColumnSpan(
-                addMultilineLabel(gridPane, ++rowIndex, Res.get("txDetailsWindow.xmr.noteSent"), 0), 2);
-        Region spacer = new Region();
-        spacer.setMinHeight(20);
-        gridPane.add(spacer, 0, ++rowIndex);
-        addConfirmationLabelTextFieldWithCopyIcon(gridPane, ++rowIndex, Res.get("txDetailsWindow.sentTo"), address);
-        addConfirmationLabelLabel(gridPane, ++rowIndex, Res.get("shared.amount"), amount);
-        addConfirmationLabelLabel(gridPane, ++rowIndex, Res.get("shared.txFee"), fee);
-        if (memo != null && !"".equals(memo)) addConfirmationLabelLabel(gridPane, ++rowIndex, Res.get("funds.withdrawal.memoLabel"), memo);
-        txIdTextField = addLabelTxIdTextField(gridPane, ++rowIndex, Res.get("txDetailsWindow.txId"), txId).second;
+        List<Node> groups = new ArrayList<>();
+        groups.add(sheetGroup(Res.get("funds.withdrawal.confirm.to"), selectableLabel(address, "confirm-send-address"), copyIcon(address)));
+        groups.add(detailRow(Res.get("funds.withdrawal.confirm.networkFee"), selectableValue(HavenoUtils.formatXmr(fee, true))));
+        if (memo != null && !memo.isEmpty()) groups.add(sheetGroup(Res.get("funds.withdrawal.sent.note"), selectableLabel(memo, "confirm-send-row-value"), copyIcon(memo)));
+        groups.add(txIdGroup(txId, xmrWalletService, preferences));
+
+        addHeroContent(
+                hero(MaterialDesignIcon.CHECK, "tx-sent-icon", Res.get("funds.withdrawal.sent.headline"), amount, fiatText.apply(amount)),
+                sheet(groups.toArray(new Node[0])));
     }
 }

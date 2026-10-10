@@ -32,6 +32,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 
 import haveno.core.trade.HavenoUtils;
 
@@ -121,7 +122,10 @@ public class XmrKeyImagePoller {
      * @param refreshPeriodMs - the refresh period in milliseconds
      */
     public void setRefreshPeriodMs(long refreshPeriodMs) {
-        this.refreshPeriodMs = refreshPeriodMs;
+        synchronized (lock) {
+            this.refreshPeriodMs = refreshPeriodMs;
+            refreshPolling(); // apply the new period
+        }
     }
 
     /**
@@ -266,7 +270,15 @@ public class XmrKeyImagePoller {
             }
 
             // query key images
-            spentStatuses = keyImages.isEmpty() ? new ArrayList<MoneroKeyImageSpentStatus>() : monerod.getKeyImageSpentStatuses(keyImages); // TODO monero-java: if order of getKeyImageSpentStatuses is guaranteed, then it should take list parameter
+            if (keyImages.isEmpty()) spentStatuses = new ArrayList<MoneroKeyImageSpentStatus>();
+            else {
+                ReentrantLock daemonLock = HavenoUtils.acquireDaemonLock();
+                try {
+                    spentStatuses = monerod.getKeyImageSpentStatuses(keyImages); // TODO monero-java: if order of getKeyImageSpentStatuses is guaranteed, then it should take list parameter
+                } finally {
+                    HavenoUtils.releaseDaemonLock(daemonLock);
+                }
+            }
         } catch (Exception e) {
 
             // limit error logging
@@ -312,13 +324,14 @@ public class XmrKeyImagePoller {
 
     private void refreshPolling() {
         synchronized (lock) {
-            setIsPolling(!getKeyImages().isEmpty() && listeners.size() > 0);
+            setIsPolling(!getKeyImages().isEmpty() && listeners.size() > 0 && refreshPeriodMs > 0);
         }
     }
 
     private synchronized void setIsPolling(boolean enabled) {
         if (enabled) {
-            if (!isPolling) {
+            if (isPolling) looper.setPeriodInMs(refreshPeriodMs); // apply a changed period while running
+            else {
                 isPolling = true; // TODO: use looper.isStarted(), synchronize
                 looper.start(refreshPeriodMs);
             }

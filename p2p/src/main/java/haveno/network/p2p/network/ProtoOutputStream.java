@@ -37,6 +37,7 @@ import javax.annotation.concurrent.ThreadSafe;
 @ThreadSafe
 class ProtoOutputStream {
     private static final Logger log = LoggerFactory.getLogger(ProtoOutputStream.class);
+    private static final long WRITE_LOCK_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(120);
 
     private final OutputStream outputStream;
     private final Statistic statistic;
@@ -49,11 +50,17 @@ class ProtoOutputStream {
         this.statistic = statistic;
     }
 
-    void writeEnvelope(NetworkEnvelope envelope) {
-        lock.lock();
+    void writeEnvelope(NetworkEnvelope envelope, protobuf.NetworkEnvelope proto) {
+        // Bound the lock wait so senders cannot pile up behind a write stalled on a dead socket.
+        if (!tryToAcquireLock(WRITE_LOCK_TIMEOUT_MS)) {
+            if (!isConnectionActive.get()) {
+                return;
+            }
+            throw new HavenoRuntimeException("Timed out waiting to write " + envelope.getClass().getSimpleName() + ", connection write side appears stalled");
+        }
 
         try {
-            writeEnvelopeOrThrow(envelope);
+            writeEnvelopeOrThrow(envelope, proto);
         } catch (IOException e) {
             if (!isConnectionActive.get()) {
                 // Connection was closed by us.
@@ -71,7 +78,7 @@ class ProtoOutputStream {
     void onConnectionShutdown() {
         isConnectionActive.set(false);
 
-        boolean acquiredLock = tryToAcquireLock();
+        boolean acquiredLock = tryToAcquireLock(Connection.getShutdownTimeout());
         if (!acquiredLock) {
             return;
         }
@@ -86,9 +93,9 @@ class ProtoOutputStream {
         }
     }
 
-    private void writeEnvelopeOrThrow(NetworkEnvelope envelope) throws IOException {
+    // The caller already converted the envelope for its size metrics, so we take the proto to avoid a second conversion.
+    private void writeEnvelopeOrThrow(NetworkEnvelope envelope, protobuf.NetworkEnvelope proto) throws IOException {
         long ts = System.currentTimeMillis();
-        protobuf.NetworkEnvelope proto = envelope.toProtoNetworkEnvelope();
         proto.writeDelimitedTo(outputStream);
         outputStream.flush();
         long duration = System.currentTimeMillis() - ts;
@@ -103,11 +110,11 @@ class ProtoOutputStream {
         }
     }
 
-    private boolean tryToAcquireLock() {
-        long shutdownTimeout = Connection.getShutdownTimeout();
+    private boolean tryToAcquireLock(long timeoutMs) {
         try {
-            return lock.tryLock(shutdownTimeout, TimeUnit.MILLISECONDS);
+            return lock.tryLock(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return false;
         }
     }

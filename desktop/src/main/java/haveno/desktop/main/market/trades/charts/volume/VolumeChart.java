@@ -18,14 +18,15 @@
 package haveno.desktop.main.market.trades.charts.volume;
 
 import haveno.desktop.main.market.trades.charts.CandleData;
+import haveno.desktop.main.market.trades.charts.PlotAreaTooltip;
 import javafx.animation.FadeTransition;
-import javafx.animation.KeyFrame;
-import javafx.animation.Timeline;
-import javafx.event.ActionEvent;
 import javafx.scene.Node;
 import javafx.scene.chart.Axis;
 import javafx.scene.chart.NumberAxis;
 import javafx.scene.chart.XYChart;
+import javafx.scene.control.Label;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.layout.Pane;
 import javafx.util.Duration;
 import javafx.util.StringConverter;
 
@@ -36,6 +37,9 @@ import java.util.List;
 public class VolumeChart extends XYChart<Number, Number> {
 
     private final StringConverter<Number> toolTipStringConverter;
+    private final Label volumeTooltipContent = new Label();
+    private final PlotAreaTooltip tooltip = new PlotAreaTooltip(volumeTooltipContent);
+    private Pane tooltipOverlayPane;
 
     public VolumeChart(Axis<Number> xAxis, Axis<Number> yAxis, StringConverter<Number> toolTipStringConverter) {
         super(xAxis, yAxis);
@@ -99,19 +103,9 @@ public class VolumeChart extends XYChart<Number, Number> {
 
     @Override
     protected void dataItemRemoved(XYChart.Data<Number, Number> item, XYChart.Series<Number, Number> series) {
-        final Node node = item.getNode();
-        if (shouldAnimate()) {
-            FadeTransition ft = new FadeTransition(Duration.millis(500), node);
-            ft.setToValue(0);
-            ft.setOnFinished((ActionEvent actionEvent) -> {
-                getPlotChildren().remove(node);
-                removeDataItemFromDisplay(series, item);
-            });
-            ft.play();
-        } else {
-            getPlotChildren().remove(node);
-            removeDataItemFromDisplay(series, item);
-        }
+        // remove immediately; fading out would render stale bars against the new axis range
+        getPlotChildren().remove(item.getNode());
+        removeDataItemFromDisplay(series, item);
     }
 
     @Override
@@ -133,22 +127,11 @@ public class VolumeChart extends XYChart<Number, Number> {
 
     @Override
     protected void seriesRemoved(XYChart.Series<Number, Number> series) {
+        // remove immediately; fading out would render stale bars against the new axis range
         for (XYChart.Data<Number, Number> d : series.getData()) {
-            final Node volumeBar = d.getNode();
-            if (shouldAnimate()) {
-                FadeTransition ft = new FadeTransition(Duration.millis(500), volumeBar);
-                ft.setToValue(0);
-                ft.setOnFinished((ActionEvent actionEvent) -> getPlotChildren().remove(volumeBar));
-                ft.play();
-            } else {
-                getPlotChildren().remove(volumeBar);
-            }
+            getPlotChildren().remove(d.getNode());
         }
-        if (shouldAnimate()) {
-            new Timeline(new KeyFrame(Duration.millis(500), event -> removeSeriesFromDisplay(series))).play();
-        } else {
-            removeSeriesFromDisplay(series);
-        }
+        removeSeriesFromDisplay(series);
     }
 
     private Node createCandle(int seriesIndex, final XYChart.Data<Number, Number> item, int itemIndex) {
@@ -156,10 +139,31 @@ public class VolumeChart extends XYChart<Number, Number> {
         if (volumeBar instanceof VolumeBar) {
             ((VolumeBar) volumeBar).setSeriesAndDataStyleClasses("series" + seriesIndex, "data" + itemIndex);
         } else {
-            volumeBar = new VolumeBar("series" + seriesIndex, "data" + itemIndex, toolTipStringConverter);
-            item.setNode(volumeBar);
+            VolumeBar newVolumeBar = new VolumeBar("series" + seriesIndex, "data" + itemIndex, toolTipStringConverter);
+            registerTooltip(newVolumeBar);
+            item.setNode(newVolumeBar);
+            volumeBar = newVolumeBar;
         }
         return volumeBar;
+    }
+
+    private void registerTooltip(VolumeBar volumeBar) {
+        volumeBar.setOnMouseEntered(e -> showTooltip(volumeBar, e));
+        volumeBar.setOnMouseMoved(e -> showTooltip(volumeBar, e));
+        volumeBar.setOnMouseExited(e -> tooltip.hide());
+    }
+
+    private void showTooltip(VolumeBar volumeBar, MouseEvent e) {
+        volumeTooltipContent.setText(volumeBar.getTooltipText());
+        tooltip.show(volumeBar, e.getSceneY(), tooltipOverlayPane);
+    }
+
+    /**
+     * Sets the pane the hover tooltip is rendered in. It must sit above the chart and outside the
+     * plot area's clip so the tooltip is not cut off by the axes.
+     */
+    public void setTooltipOverlayPane(Pane tooltipOverlayPane) {
+        this.tooltipOverlayPane = tooltipOverlayPane;
     }
 
     @Override

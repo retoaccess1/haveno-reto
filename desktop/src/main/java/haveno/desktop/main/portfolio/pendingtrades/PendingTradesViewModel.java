@@ -24,6 +24,9 @@ import haveno.common.ClockWatcher;
 import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.core.account.witness.AccountAgeWitnessService;
+import haveno.core.locale.GlobalSettings;
+import haveno.core.locale.Res;
+import haveno.core.monetary.Price;
 import haveno.core.network.MessageState;
 import haveno.core.offer.Offer;
 import haveno.core.offer.OfferUtil;
@@ -44,13 +47,14 @@ import haveno.desktop.util.DisplayUtils;
 import haveno.desktop.util.GUIUtil;
 import haveno.network.p2p.P2PService;
 import java.math.BigInteger;
+import java.text.DateFormat;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.stream.Collectors;
+import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.IntegerProperty;
 import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.ReadOnlyObjectProperty;
+import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleIntegerProperty;
 import javafx.beans.property.SimpleObjectProperty;
 import javax.annotation.Nullable;
@@ -99,6 +103,8 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
     private final ObjectProperty<BuyerState> buyerState = new SimpleObjectProperty<>();
     private final ObjectProperty<SellerState> sellerState = new SimpleObjectProperty<>();
     @Getter
+    private final BooleanProperty chatOpen = new SimpleBooleanProperty();
+    @Getter
     private final ObjectProperty<MessageState> paymentSentMessageStateProperty = new SimpleObjectProperty<>(MessageState.UNDEFINED);
     private Subscription tradeStateSubscription;
     private Subscription paymentAccountDecryptedSubscription;
@@ -106,7 +112,6 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
     private Subscription messageStateSubscription;
     @Getter
     protected final IntegerProperty mempoolStatus = new SimpleIntegerProperty();
-    private transient Map<String, Boolean> showPaymentDetailsEarly = new HashMap<String, Boolean>();
 
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -186,6 +191,7 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
 
             if (messageStateSubscription != null) {
                 messageStateSubscription.unsubscribe();
+                messageStateSubscription = null;
                 paymentSentMessageStateProperty.set(MessageState.UNDEFINED);
             }
 
@@ -200,7 +206,7 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
                 payoutStateSubscription = EasyBind.subscribe(trade.payoutStateProperty(), state -> {
                     onPayoutStateChanged(state);
                 });
-                messageStateSubscription = EasyBind.subscribe(trade.getSeller().getPaymentSentMessageStateProperty(), this::onPaymentSentMessageStateChanged);
+                messageStateSubscription = EasyBind.subscribe(trade.getSeller().getPaymentSentMessageStateProperty(), state -> updatePaymentSentMessageState());
             }
         }
     }
@@ -215,8 +221,12 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
         });
     }
 
-    private void onPaymentSentMessageStateChanged(MessageState messageState) {
-        paymentSentMessageStateProperty.set(messageState);
+    private void updatePaymentSentMessageState() {
+        UserThread.execute(() -> {
+            if (messageStateSubscription != null) {
+                paymentSentMessageStateProperty.set(trade.getSeller().getPaymentSentMessageStateProperty().get());
+            }
+        });
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -241,6 +251,10 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
         return item == null ? "" : tradeUtil.getMarketDescription(item.getTrade());
     }
 
+    public long getRemainingTradeDuration() {
+        return tradeUtil.getRemainingTradeDuration(dataModel.getTrade());
+    }
+
     public String getRemainingTradeDurationAsWords() {
         checkNotNull(dataModel.getTrade(), "model's trade must not be null");
         return tradeUtil.getRemainingTradeDurationAsWords(dataModel.getTrade());
@@ -253,7 +267,9 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
 
     public String getDateForOpenDispute() {
         checkNotNull(dataModel.getTrade(), "model's trade must not be null");
-        return DisplayUtils.formatDateTime(tradeUtil.getDateForOpenDispute(dataModel.getTrade()));
+        return FormattingUtils.formatDateTime(tradeUtil.getDateForOpenDispute(dataModel.getTrade()),
+                DateFormat.getDateInstance(DateFormat.DEFAULT, GlobalSettings.getLocale()),
+                DateFormat.getTimeInstance(DateFormat.SHORT, GlobalSettings.getLocale()));
     }
 
     public boolean showWarning() {
@@ -267,11 +283,11 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
     }
 
     public boolean getShowPaymentDetailsEarly() {
-        return !HavenoUtils.RECOMMEND_CONFIRMATIONS_BEFORE_SENDING_PAYMENT || showPaymentDetailsEarly.getOrDefault(dataModel.getTrade().getId(), false);
+        return !HavenoUtils.RECOMMEND_CONFIRMATIONS_BEFORE_SENDING_PAYMENT || dataModel.showPaymentDetailsEarly.getOrDefault(dataModel.getTrade().getId(), false);
     }
 
     public void setShowPaymentDetailsEarly(boolean show) {
-        showPaymentDetailsEarly.put(dataModel.getTrade().getId(), show);
+        dataModel.showPaymentDetailsEarly.put(dataModel.getTrade().getId(), show);
     }
 
     String getMyRole(PendingTradesListItem item) {
@@ -293,6 +309,14 @@ public class PendingTradesViewModel extends ActivatableWithDataModel<PendingTrad
         return dataModel.getTrade() != null
                 ? VolumeUtil.formatVolumeWithCode(dataModel.getTrade().getVolume())
                 : "";
+    }
+
+    public String getTradePrice() {
+        Trade trade = dataModel.getTrade();
+        Price price = trade == null ? null : trade.getPrice();
+        if (price == null) return Res.get("shared.na");
+        String currencyCode = price.getCurrencyCode();
+        return DisplayUtils.formatTradePrice(price) + " " + currencyCode + "/" + Res.getBaseCurrencyCode();
     }
 
     public String getTradeFee() {

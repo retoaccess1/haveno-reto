@@ -61,7 +61,12 @@ import static haveno.core.payment.payload.PaymentMethod.INTERAC_E_TRANSFER_ID;
 import static haveno.core.payment.payload.PaymentMethod.JAPAN_BANK_ID;
 import static haveno.core.payment.payload.PaymentMethod.MONESE_ID;
 import static haveno.core.payment.payload.PaymentMethod.MONEY_BEAM_ID;
+import static haveno.core.payment.payload.PaymentMethod.GCASH_ID;
+import static haveno.core.payment.payload.PaymentMethod.MERCADO_PAGO_ID;
+import static haveno.core.payment.payload.PaymentMethod.MOMO_ID;
+import static haveno.core.payment.payload.PaymentMethod.SPEI_ID;
 import static haveno.core.payment.payload.PaymentMethod.MONEY_GRAM_ID;
+import static haveno.core.payment.payload.PaymentMethod.MPESA_ID;
 import static haveno.core.payment.payload.PaymentMethod.NATIONAL_BANK_ID;
 import static haveno.core.payment.payload.PaymentMethod.NEFT_ID;
 import static haveno.core.payment.payload.PaymentMethod.NEQUI_ID;
@@ -94,6 +99,25 @@ import static haveno.core.payment.payload.PaymentMethod.VERSE_ID;
 import static haveno.core.payment.payload.PaymentMethod.WECHAT_PAY_ID;
 import static haveno.core.payment.payload.PaymentMethod.WESTERN_UNION_ID;
 import static haveno.core.payment.payload.PaymentMethod.hasChargebackRisk;
+import static haveno.core.payment.payload.PaymentMethod.BLIK_ID;
+import static haveno.core.payment.payload.PaymentMethod.VIPPS_MOBILEPAY_ID;
+import static haveno.core.payment.payload.PaymentMethod.TWINT_ID;
+import static haveno.core.payment.payload.PaymentMethod.NIP_ID;
+import static haveno.core.payment.payload.PaymentMethod.PAGO_MOVIL_ID;
+import static haveno.core.payment.payload.PaymentMethod.QRIS_ID;
+import static haveno.core.payment.payload.PaymentMethod.PAPARA_ID;
+import static haveno.core.payment.payload.PaymentMethod.RAAST_ID;
+import static haveno.core.payment.payload.PaymentMethod.PAYNOW_ID;
+import static haveno.core.payment.payload.PaymentMethod.WERO_ID;
+import static haveno.core.payment.payload.PaymentMethod.FPS_ID;
+import static haveno.core.payment.payload.PaymentMethod.DUITNOW_ID;
+import static haveno.core.payment.payload.PaymentMethod.MB_WAY_ID;
+import static haveno.core.payment.payload.PaymentMethod.PAYPAY_ID;
+import static haveno.core.payment.payload.PaymentMethod.SBP_ID;
+import static haveno.core.payment.payload.PaymentMethod.MIR_ID;
+import static haveno.core.payment.payload.PaymentMethod.YOOMONEY_ID;
+import static haveno.core.payment.payload.PaymentMethod.UKRAINE_CARD_ID;
+import static haveno.core.payment.payload.PaymentMethod.KASPI_ID;
 
 @Slf4j
 public class PaymentAccountUtil {
@@ -138,6 +162,10 @@ public class PaymentAccountUtil {
 
     public static boolean isPaymentAccountValidForOffer(Offer offer, PaymentAccount paymentAccount) {
         return new ReceiptValidator(offer, paymentAccount).isValid();
+    }
+
+    public static boolean isPaymentAccountValidForNewOffer(Offer offer, PaymentAccount paymentAccount) {
+        return new ReceiptValidator(offer, paymentAccount).isValidForNewOffer();
     }
 
     public static Optional<PaymentAccount> getMostMaturePaymentAccountForOffer(Offer offer,
@@ -195,6 +223,16 @@ public class PaymentAccountUtil {
                 return AliPayAccount.SUPPORTED_CURRENCIES;
             case NEQUI_ID:
                 return NequiAccount.SUPPORTED_CURRENCIES;
+            case MPESA_ID:
+                return MpesaAccount.SUPPORTED_CURRENCIES;
+            case MERCADO_PAGO_ID:
+                return MercadoPagoAccount.SUPPORTED_CURRENCIES;
+            case GCASH_ID:
+                return GcashAccount.SUPPORTED_CURRENCIES;
+            case MOMO_ID:
+                return MomoAccount.SUPPORTED_CURRENCIES;
+            case SPEI_ID:
+                return SpeiAccount.SUPPORTED_CURRENCIES;
             case IMPS_ID:
             case NEFT_ID:
             case PAYTM_ID:
@@ -269,6 +307,44 @@ public class PaymentAccountUtil {
                 return TransferwiseUsdAccount.SUPPORTED_CURRENCIES;
             case VERSE_ID:
                 return VerseAccount.SUPPORTED_CURRENCIES;
+            case BLIK_ID:
+                return BlikAccount.SUPPORTED_CURRENCIES;
+            case VIPPS_MOBILEPAY_ID:
+                return VippsMobilePayAccount.SUPPORTED_CURRENCIES;
+            case TWINT_ID:
+                return TwintAccount.SUPPORTED_CURRENCIES;
+            case NIP_ID:
+                return NipAccount.SUPPORTED_CURRENCIES;
+            case PAGO_MOVIL_ID:
+                return PagoMovilAccount.SUPPORTED_CURRENCIES;
+            case QRIS_ID:
+                return QrisAccount.SUPPORTED_CURRENCIES;
+            case PAPARA_ID:
+                return PaparaAccount.SUPPORTED_CURRENCIES;
+            case RAAST_ID:
+                return RaastAccount.SUPPORTED_CURRENCIES;
+            case PAYNOW_ID:
+                return PayNowAccount.SUPPORTED_CURRENCIES;
+            case WERO_ID:
+                return WeroAccount.SUPPORTED_CURRENCIES;
+            case FPS_ID:
+                return FpsAccount.SUPPORTED_CURRENCIES;
+            case DUITNOW_ID:
+                return DuitNowAccount.SUPPORTED_CURRENCIES;
+            case MB_WAY_ID:
+                return MbWayAccount.SUPPORTED_CURRENCIES;
+            case PAYPAY_ID:
+                return PayPayAccount.SUPPORTED_CURRENCIES;
+            case SBP_ID:
+                return SbpAccount.SUPPORTED_CURRENCIES;
+            case MIR_ID:
+                return MirAccount.SUPPORTED_CURRENCIES;
+            case YOOMONEY_ID:
+                return YooMoneyAccount.SUPPORTED_CURRENCIES;
+            case UKRAINE_CARD_ID:
+                return UkraineCardAccount.SUPPORTED_CURRENCIES;
+            case KASPI_ID:
+                return KaspiAccount.SUPPORTED_CURRENCIES;
             default:
                 return Collections.emptyList();
         }

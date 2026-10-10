@@ -67,6 +67,8 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -98,19 +100,23 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
     private final Set<DecryptedDirectMessageListener> decryptedDirectMessageListeners = new CopyOnWriteArraySet<>();
     private final Set<P2PServiceListener> p2pServiceListeners = new CopyOnWriteArraySet<>();
     private final Set<Runnable> shutDownResultHandlers = new CopyOnWriteArraySet<>();
+    private final Object shutDownLock = new Object();
+    private boolean shutDownRequested;
+    private boolean shutDownComplete;
     private final BooleanProperty hiddenServicePublished = new SimpleBooleanProperty();
     private final BooleanProperty preliminaryDataReceived = new SimpleBooleanProperty();
     private final IntegerProperty numConnectedPeers = new SimpleIntegerProperty(0);
 
     private final Subscription networkReadySubscription;
     private boolean isBootstrapped;
+    private boolean initialDataReceived;
     private final KeepAliveManager keepAliveManager;
     private final Socks5ProxyProvider socks5ProxyProvider;
 
     @Getter
     private static NodeAddress myNodeAddress;
     @Getter
-    private boolean isShutDownStarted = false;
+    private volatile boolean isShutDownStarted = false;
 
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -180,50 +186,90 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
     }
 
     public void shutDown(Runnable shutDownCompleteHandler) {
-        log.info("P2PService shutdown started");
-        shutDownResultHandlers.add(shutDownCompleteHandler);
+        boolean alreadyComplete;
+        synchronized (shutDownLock) {
+            alreadyComplete = shutDownComplete;
+            if (!alreadyComplete) {
+                shutDownResultHandlers.add(shutDownCompleteHandler);
+                if (shutDownRequested) return;
+                shutDownRequested = true;
+            }
+        }
+        if (alreadyComplete) {
+            runShutDownTask("completion handler", shutDownCompleteHandler);
+            return;
+        }
 
-        // We need to make sure queued up messages are flushed out before we continue shut down other network
-        // services
-        if (broadcaster != null) {
-            broadcaster.shutDown(this::doShutDown);
-        } else {
+        log.info("P2PService shutdown started");
+        try {
+            // We need to make sure queued up messages are flushed out before we continue shut down other network
+            // services
+            if (broadcaster != null) {
+                broadcaster.shutDown(this::doShutDown);
+            } else {
+                doShutDown();
+            }
+        } catch (Throwable t) {
+            log.error("Failed to shut down broadcaster", t);
             doShutDown();
         }
     }
 
     private void doShutDown() {
+        synchronized (shutDownLock) {
+            if (isShutDownStarted) return;
+            isShutDownStarted = true;
+        }
         log.info("P2PService doShutDown started");
-        isShutDownStarted = true;
 
-        if (p2PDataStorage != null) {
-            p2PDataStorage.shutDown();
+        // A cleanup failure must not prevent the remaining services and network from shutting down.
+        runShutDownTask("P2PDataStorage", () -> {
+            if (p2PDataStorage != null) p2PDataStorage.shutDown();
+        });
+        runShutDownTask("PeerManager", () -> {
+            if (peerManager != null) peerManager.shutDown();
+        });
+        runShutDownTask("RequestDataManager", () -> {
+            if (requestDataManager != null) requestDataManager.shutDown();
+        });
+        runShutDownTask("PeerExchangeManager", () -> {
+            if (peerExchangeManager != null) peerExchangeManager.shutDown();
+        });
+        runShutDownTask("KeepAliveManager", () -> {
+            if (keepAliveManager != null) keepAliveManager.shutDown();
+        });
+        runShutDownTask("network ready subscription", () -> {
+            if (networkReadySubscription != null) networkReadySubscription.unsubscribe();
+        });
+
+        try {
+            if (networkNode != null) {
+                networkNode.shutDown(this::onShutDownComplete);
+            } else {
+                onShutDownComplete();
+            }
+        } catch (Throwable t) {
+            log.error("Failed to shut down network node", t);
+            onShutDownComplete();
         }
+    }
 
-        if (peerManager != null) {
-            peerManager.shutDown();
+    private void onShutDownComplete() {
+        List<Runnable> handlers;
+        synchronized (shutDownLock) {
+            if (shutDownComplete) return;
+            shutDownComplete = true;
+            handlers = new ArrayList<>(shutDownResultHandlers);
+            shutDownResultHandlers.clear();
         }
+        handlers.forEach(handler -> runShutDownTask("completion handler", handler));
+    }
 
-        if (requestDataManager != null) {
-            requestDataManager.shutDown();
-        }
-
-        if (peerExchangeManager != null) {
-            peerExchangeManager.shutDown();
-        }
-
-        if (keepAliveManager != null) {
-            keepAliveManager.shutDown();
-        }
-
-        if (networkReadySubscription != null) {
-            networkReadySubscription.unsubscribe();
-        }
-
-        if (networkNode != null) {
-            networkNode.shutDown(() -> shutDownResultHandlers.forEach(Runnable::run));
-        } else {
-            shutDownResultHandlers.forEach(Runnable::run);
+    private void runShutDownTask(String service, Runnable task) {
+        try {
+            task.run();
+        } catch (Throwable t) {
+            log.error("Failed to shut down {}", service, t);
         }
     }
 
@@ -331,8 +377,17 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
 
     @Override
     public void onDataReceived() {
-        applyIsBootstrapped(P2PServiceListener::onDataReceived);
+        if (initialDataReceived) return;
+        initialDataReceived = true;
 
+        // A seed failure can complete bootstrap before data arrives.
+        if (isBootstrapped) {
+            synchronized (p2pServiceListeners) {
+                p2pServiceListeners.forEach(P2PServiceListener::onDataReceived);
+            }
+        } else {
+            applyIsBootstrapped(P2PServiceListener::onDataReceived);
+        }
     }
 
     private void applyIsBootstrapped(Consumer<P2PServiceListener> listenerHandler) {
@@ -360,12 +415,12 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
 
     @Override
     public void onConnection(Connection connection) {
-        numConnectedPeers.set(networkNode.getAllConnections().size());
+        UserThread.execute(() -> numConnectedPeers.set(networkNode.getAllConnections().size()));
     }
 
     @Override
     public void onDisconnect(CloseConnectionReason closeConnectionReason, Connection connection) {
-        numConnectedPeers.set(networkNode.getAllConnections().size());
+        UserThread.execute(() -> numConnectedPeers.set(networkNode.getAllConnections().size()));
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -465,7 +520,12 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     public boolean addPersistableNetworkPayload(PersistableNetworkPayload payload, boolean reBroadcast) {
-        return p2PDataStorage.addPersistableNetworkPayload(payload, networkNode.getNodeAddress(), reBroadcast);
+        return addPersistableNetworkPayload(payload, true, reBroadcast);
+    }
+
+    // allowBroadcast=false stores locally without broadcasting, e.g. for older payloads which peers reject as out of date tolerance
+    public boolean addPersistableNetworkPayload(PersistableNetworkPayload payload, boolean allowBroadcast, boolean reBroadcast) {
+        return p2PDataStorage.addPersistableNetworkPayload(payload, networkNode.getNodeAddress(), allowBroadcast, reBroadcast);
     }
 
     public boolean addProtectedStorageEntry(ProtectedStoragePayload protectedStoragePayload) {
@@ -552,6 +612,15 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
 
     public boolean isBootstrapped() {
         return isBootstrapped;
+    }
+
+    // Re-requests P2P data from seed nodes so missing append-only data (e.g. signed witnesses) can be filled
+    // in without a restart. Requests carry our known payload hashes, so responses only contain items we lack,
+    // but the requests themselves grow with the data store, so callers should limit their frequency. See #2182.
+    public void requestData() {
+        if (isBootstrapped() && requestDataManager.getNodeAddressOfPreliminaryDataRequest().isPresent()) {
+            requestDataManager.requestUpdateData();
+        }
     }
 
     public NetworkNode getNetworkNode() {

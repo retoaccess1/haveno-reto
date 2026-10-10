@@ -17,6 +17,8 @@
 
 package haveno.core.user;
 
+import com.google.protobuf.UnknownFieldSet;
+import haveno.common.app.Version;
 import haveno.common.config.Config;
 import haveno.common.persistence.PersistenceManager;
 import haveno.core.api.XmrLocalNode;
@@ -31,20 +33,31 @@ import javafx.collections.ObservableList;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Currency;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class PreferencesTest {
 
     private Preferences preferences;
+    private Config config;
     private PersistenceManager persistenceManager;
     private XmrNodes xmrNodes;
 
@@ -56,11 +69,147 @@ public class PreferencesTest {
         Res.setBaseCurrencyCode("XMR");
         Res.setBaseCurrencyName("Monero");
         persistenceManager = mock(PersistenceManager.class);
-        Config config = new Config();
+        config = new Config();
         preferences = new Preferences(
                 persistenceManager, config, null, null);
         xmrNodes = new XmrNodes();
         XmrLocalNode xmrLocalNode = new XmrLocalNode(config, preferences, xmrNodes);
+    }
+
+    @Test
+    public void testLegacyTacAcceptanceDoesNotAcceptCurrentRevision() throws IOException {
+        for (int legacyAcceptance : new int[]{0, 1}) {
+            protobuf.PreferencesPayload legacy = protobuf.PreferencesPayload.newBuilder()
+                    .setTacAccepted(true)
+                    .setTacAcceptedV120(true)
+                    .setUseNativeXmrWallet(true)
+                    .setUnknownFields(UnknownFieldSet.newBuilder().mergeVarintField(79, legacyAcceptance).build()) // tac_accepted_v190
+                    .build();
+            PreferencesPayload payload = PreferencesPayload.fromProto(protobuf.PreferencesPayload.parseFrom(legacy.toByteArray()), null);
+            assertEquals(legacyAcceptance, payload.getTacAcceptedVersion());
+            assertNotEquals(Version.TAC_VERSION, payload.getTacAcceptedVersion());
+
+            payload.setTacAcceptedVersion(Version.TAC_VERSION);
+            protobuf.PersistableEnvelope persisted = (protobuf.PersistableEnvelope) payload.toProtoMessage();
+            PreferencesPayload reloaded = PreferencesPayload.fromProto(
+                    protobuf.PersistableEnvelope.parseFrom(persisted.toByteArray()).getPreferencesPayload(), null);
+            assertEquals(Version.TAC_VERSION, reloaded.getTacAcceptedVersion());
+            assertTrue(reloaded.isUseNativeXmrWallet());
+        }
+    }
+
+    @Test
+    public void testTacAcceptancePersistsDuringStartup() {
+        assertEquals(0, preferences.getTacAcceptedVersion());
+        preferences.setTacAcceptedVersion(Version.TAC_VERSION);
+        assertEquals(Version.TAC_VERSION, preferences.getTacAcceptedVersion());
+        verify(persistenceManager).forcePersistNow();
+    }
+
+    @Test
+    public void testMaxPriceDistanceAcceptsZeroThroughOneHundredPercent() {
+        for (double deviation : new double[]{0, 0.0001, 0.3, 1}) {
+            preferences.setMaxPriceDistanceInPercent(deviation);
+            assertEquals(deviation, preferences.getMaxPriceDistanceInPercent());
+        }
+    }
+
+    @Test
+    public void testInvalidMaxPriceDistancePreservesPreviousValue() {
+        preferences.setMaxPriceDistanceInPercent(0.3);
+        for (double deviation : new double[]{-0.01, -Double.MIN_VALUE, 1.0001,
+                Double.NaN, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> preferences.setMaxPriceDistanceInPercent(deviation));
+            assertEquals(0.3, preferences.getMaxPriceDistanceInPercent());
+        }
+    }
+
+    @Test
+    public void testPersistedMaxPriceDistance() {
+        for (double[] deviations : new double[][]{{0, 0}, {0.3, 0.3}, {1, 1}, {-0.01, 0}, {1.0001, 0},
+                {Double.NaN, 0}, {Double.NEGATIVE_INFINITY, 0}, {Double.POSITIVE_INFINITY, 0}}) {
+            PreferencesPayload payload = new PreferencesPayload();
+            payload.setUserLanguage("en");
+            payload.setUserCountry(CountryUtil.getDefaultCountry());
+            payload.setPreferredTradeCurrency(new TraditionalCurrency("USD"));
+            payload.setMaxPriceDistanceInPercent(deviations[0]);
+            PersistenceManager<PreferencesPayload> manager = mock(PersistenceManager.class);
+            Preferences reloaded = new Preferences(manager, config, null, xmrNodes);
+            doAnswer(invocation -> {
+                Consumer<PreferencesPayload> resultHandler = invocation.getArgument(1);
+                resultHandler.accept(payload);
+                return null;
+            }).when(manager).readPersisted(eq("PreferencesPayload"), any(), any());
+
+            Runnable completeHandler = mock(Runnable.class);
+            reloaded.readPersisted(completeHandler);
+
+            assertEquals(deviations[1], reloaded.getMaxPriceDistanceInPercent());
+            assertEquals(deviations[1], payload.getMaxPriceDistanceInPercent());
+            verify(completeHandler).run();
+            verify(manager).requestPersistence();
+        }
+    }
+
+    @Test
+    public void testSoftwareRenderingPersistsForNextStartup() {
+        String currentRenderer = System.getProperty("prism.order");
+        assertFalse(preferences.isUseSoftwareRendering());
+        assertFalse(StartupSettings.read(config.appDataDir)
+                .getAsOptionalBoolean(CookieKey.USE_SOFTWARE_RENDERING).orElse(false));
+
+        preferences.setCssTheme(true);
+        assertTrue(preferences.setUseSoftwareRendering(true));
+        Preferences reloaded = new Preferences(persistenceManager, config, null, null);
+        assertTrue(reloaded.isUseSoftwareRendering());
+        assertTrue(StartupSettings.read(config.appDataDir)
+                .getAsOptionalBoolean(CookieKey.USE_SOFTWARE_RENDERING).orElse(false));
+        assertEquals(currentRenderer, System.getProperty("prism.order"));
+
+        preferences.setUserLanguage("de");
+        assertTrue(reloaded.isUseSoftwareRendering());
+        assertTrue(reloaded.setUseSoftwareRendering(false));
+        assertFalse(new Preferences(persistenceManager, config, null, null).isUseSoftwareRendering());
+        Cookie settings = StartupSettings.read(config.appDataDir);
+        assertTrue(settings.getAsOptionalBoolean(CookieKey.CSS_THEME).orElse(false));
+        assertEquals("de", settings.get(CookieKey.USER_LANGUAGE));
+        assertEquals(currentRenderer, System.getProperty("prism.order"));
+    }
+
+    @Test
+    public void testPreferencesIgnoresJvmPrismOrderOverride() {
+        String originalRenderer = System.getProperty("prism.order");
+        try {
+            for (String renderer : new String[]{"es2", "sw"}) {
+                System.setProperty("prism.order", renderer);
+
+                assertFalse(preferences.isUseSoftwareRendering());
+                assertTrue(preferences.setUseSoftwareRendering(true));
+                assertTrue(preferences.isUseSoftwareRendering());
+                assertTrue(new Preferences(persistenceManager, config, null, null).isUseSoftwareRendering());
+                assertEquals(renderer, System.getProperty("prism.order"));
+
+                assertTrue(preferences.setUseSoftwareRendering(false));
+                assertFalse(preferences.isUseSoftwareRendering());
+                assertFalse(new Preferences(persistenceManager, config, null, null).isUseSoftwareRendering());
+                assertEquals(renderer, System.getProperty("prism.order"));
+            }
+        } finally {
+            if (originalRenderer != null) {
+                System.setProperty("prism.order", originalRenderer);
+            } else {
+                System.clearProperty("prism.order");
+            }
+        }
+    }
+
+    @Test
+    public void testSoftwareRenderingReportsPersistenceFailure() throws IOException {
+        Files.createDirectory(config.appDataDir.toPath().resolve("startup_settings"));
+
+        assertFalse(preferences.setUseSoftwareRendering(true));
+        assertFalse(preferences.isUseSoftwareRendering());
     }
 
     @Test

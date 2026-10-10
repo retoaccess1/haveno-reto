@@ -30,13 +30,8 @@ import haveno.core.locale.Res;
 import haveno.core.payment.payload.PaymentAccountPayload;
 import haveno.core.proto.CoreProtoResolver;
 import haveno.core.support.SupportType;
-import haveno.core.support.dispute.mediation.FileTransferReceiver;
-import haveno.core.support.dispute.mediation.FileTransferSender;
-import haveno.core.support.dispute.mediation.FileTransferSession;
 import haveno.core.support.messages.ChatMessage;
 import haveno.core.trade.Contract;
-import haveno.network.p2p.NodeAddress;
-import haveno.network.p2p.network.NetworkNode;
 import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.IntegerProperty;
 import javafx.beans.property.ObjectProperty;
@@ -55,7 +50,6 @@ import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.Nullable;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
@@ -66,7 +60,8 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Slf4j
-@EqualsAndHashCode
+// equality by id (tradeId_traderId); mutable fields (result, chat, state) must not affect identity
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Getter
 public final class Dispute implements NetworkPayload, PersistablePayload {
 
@@ -91,6 +86,7 @@ public final class Dispute implements NetworkPayload, PersistablePayload {
     }
 
     private final String tradeId;
+    @EqualsAndHashCode.Include
     private final String id;
     private final int traderId;
     private final boolean disputeOpenerIsBuyer;
@@ -161,25 +157,6 @@ public final class Dispute implements NetworkPayload, PersistablePayload {
 
     private transient final BooleanProperty isClosedProperty = new SimpleBooleanProperty();
     private transient final IntegerProperty badgeCountProperty = new SimpleIntegerProperty();
-
-    private transient FileTransferReceiver fileTransferSession = null;
-
-    public FileTransferReceiver createOrGetFileTransferReceiver(NetworkNode networkNode,
-                                                                NodeAddress peerNodeAddress,
-                                                                FileTransferSession.FtpCallback callback) throws IOException {
-        // the receiver stores its state temporarily here in the dispute
-        // this method gets called to retrieve the session each time a part of the log files is received
-        if (fileTransferSession == null) {
-            fileTransferSession = new FileTransferReceiver(networkNode, peerNodeAddress, this.tradeId, this.traderId, this.getRoleStringForLogFile(), callback);
-        }
-        return fileTransferSession;
-    }
-
-    public FileTransferSender createFileTransferSender(NetworkNode networkNode,
-                                                       NodeAddress peerNodeAddress,
-                                                       FileTransferSession.FtpCallback callback) {
-        return new FileTransferSender(networkNode, peerNodeAddress, this.tradeId, this.traderId, this.getRoleStringForLogFile(), false, callback);
-    }
 
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -477,16 +454,22 @@ public final class Dispute implements NetworkPayload, PersistablePayload {
     public void refreshAlertLevel(boolean senderFlag) {
         // if the dispute is "new" that is 1 alert that has to be propagated upstream
         // or if there are unread messages that is 1 alert that has to be propagated upstream
-        if (isNew() || unreadMessageCount(senderFlag) > 0) {
-            badgeCountProperty.setValue(1);
-        } else {
-            badgeCountProperty.setValue(0);
+        int count;
+        synchronized (chatMessages) {
+            count = isNew() || unreadMessageCount(senderFlag) > 0 ? 1 : 0;
         }
+        // notify after releasing the chat lock, since badge listeners can acquire the dispute-list lock
+        badgeCountProperty.setValue(count);
     }
 
     public long unreadMessageCount(boolean senderFlag) {
+        return unreadMessageCount(senderFlag, true);
+    }
+
+    public long unreadMessageCount(boolean senderFlag, boolean includeSystemMessages) {
         return chatMessages.stream()
                 .filter(m -> m.isSenderIsTrader() == senderFlag || m.isSystemMessage())
+                .filter(m -> includeSystemMessages || !m.isSystemMessage())
                 .filter(m -> !m.isWasDisplayed())
                 .count();
     }

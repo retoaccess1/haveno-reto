@@ -41,6 +41,7 @@ import haveno.core.util.VolumeUtil;
 import haveno.network.p2p.NodeAddress;
 import haveno.network.p2p.storage.payload.CapabilityRequiringPayload;
 import haveno.network.p2p.storage.payload.DateSortedTruncatablePayload;
+import haveno.network.p2p.storage.payload.InvalidPersistableNetworkPayloadException;
 import haveno.network.p2p.storage.payload.PersistableNetworkPayload;
 import haveno.network.p2p.storage.payload.ProcessOncePersistableNetworkPayload;
 import lombok.Getter;
@@ -68,6 +69,9 @@ import static com.google.common.base.Preconditions.checkNotNull;
 @Slf4j
 public final class TradeStatistics3 implements ProcessOncePersistableNetworkPayload, PersistableNetworkPayload,
         CapabilityRequiringPayload, DateSortedTruncatablePayload {
+
+    private static final int MAX_EXTRA_DATA_VALUE_LENGTH = 1024;
+    private static final long MAX_FUTURE_DATE_MS = TimeUnit.DAYS.toMillis(1);
 
     private static final String VERSION_KEY = "v"; // single character key for versioning
 
@@ -118,7 +122,7 @@ public final class TradeStatistics3 implements ProcessOncePersistableNetworkPayl
         return new TradeStatistics3(offer.getCounterCurrencyCode(),
                 fuzzTradePriceReproducibly(trade, fuzzPricePct),
                 fuzzTradeAmountReproducibly(trade, fuzzAmountPct),
-                offer.getPaymentMethod().getId(),
+                offer.getOfferPayload().getPaymentMethodId(), // keeps retired payment method ids
                 fuzzTradeDateReproducibly(trade, fuzzDateHours),
                 truncatedArbitratorNodeAddress,
                 extraDataMap);
@@ -215,7 +219,26 @@ public final class TradeStatistics3 implements ProcessOncePersistableNetworkPayl
         TRANSFERWISE_USD,
         ACH_TRANSFER,
         DOMESTIC_WIRE_TRANSFER,
-        PAYPAL
+        PAYPAL,
+        BLIK,
+        VIPPS_MOBILEPAY,
+        TWINT,
+        NIP,
+        PAGO_MOVIL,
+        QRIS,
+        PAPARA,
+        RAAST,
+        PAYNOW,
+        WERO,
+        FPS,
+        DUITNOW,
+        MB_WAY,
+        PAYPAY,
+        SBP,
+        MIR,
+        YOOMONEY,
+        UKRAINE_CARD,
+        KASPI
     }
 
     @Getter
@@ -349,15 +372,34 @@ public final class TradeStatistics3 implements ProcessOncePersistableNetworkPayl
     }
 
     public static TradeStatistics3 fromProto(protobuf.TradeStatistics3 proto) {
-        return new TradeStatistics3(
+        // Bound field sizes before hashing or logging them since oversized fields are never valid.
+        if (proto.getCurrency().length() > 100 || proto.getPaymentMethod().length() > 100 || proto.getArbitrator().length() > 100 || proto.getHash().size() > 100 ||
+                proto.getExtraDataCount() > ExtraDataMapValidator.MAX_SIZE ||
+                proto.getExtraDataMap().entrySet().stream().anyMatch(e -> e.getKey().length() > ExtraDataMapValidator.MAX_KEY_LENGTH || e.getValue().length() > MAX_EXTRA_DATA_VALUE_LENGTH))
+            throw new InvalidPersistableNetworkPayloadException("TradeStatistics3 field size exceeds maximum");
+
+        // Reconstruct the extra data as a HashMap so the recomputed hash matches the creating node (see createHash).
+        Map<String, String> extraDataMap = CollectionUtils.isEmpty(proto.getExtraDataMap()) ? null : new HashMap<>(proto.getExtraDataMap());
+        TradeStatistics3 tradeStatistics = new TradeStatistics3(
                 proto.getCurrency(),
                 proto.getPrice(),
                 proto.getAmount(),
                 proto.getPaymentMethod(),
                 proto.getDate(),
                 ProtoUtil.stringOrNullFromProto(proto.getArbitrator()),
-                CollectionUtils.isEmpty(proto.getExtraDataMap()) ? null : proto.getExtraDataMap(),
-                proto.getHash().toByteArray());
+                extraDataMap,
+                null);
+
+        // The provided hash must match the recomputed hash, else the storage key could be chosen independently of the data.
+        byte[] hashFromProto = proto.getHash().toByteArray();
+        if (!Arrays.equals(hashFromProto, tradeStatistics.getHash())) {
+            throw new InvalidPersistableNetworkPayloadException("TradeStatistics3 hash field does not match trade statistics data. " +
+                    "hashFromProto=" + Utilities.bytesAsHexString(hashFromProto) +
+                    ", computedHash=" + Utilities.bytesAsHexString(tradeStatistics.getHash()));
+        }
+        if (!tradeStatistics.isValid())
+            throw new InvalidPersistableNetworkPayloadException("Invalid trade statistics values");
+        return tradeStatistics;
     }
 
 
@@ -454,13 +496,14 @@ public final class TradeStatistics3 implements ProcessOncePersistableNetworkPayl
     }
 
     public boolean isValid() {
-        return amount > 0 &&
-                price > 0 &&
-                date > 0 &&
-                paymentMethod != null &&
-                !paymentMethod.isEmpty() &&
-                currency != null &&
-                !currency.isEmpty();
+        if (amount <= 0 || price <= 0 || date <= 0 || date > System.currentTimeMillis() + MAX_FUTURE_DATE_MS ||
+                paymentMethod == null || paymentMethod.isEmpty() || currency == null || currency.isEmpty()) return false;
+        try {
+            // Validate derived values before consumers can encounter an overflow or an invalid inverted price.
+            return getNormalizedPrice() > 0 && getTradeVolume().getValue() >= 0;
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     @Override

@@ -20,6 +20,7 @@ package haveno.desktop.main.overlays.windows;
 import com.google.inject.Inject;
 import com.google.inject.name.Named;
 import haveno.common.UserThread;
+import haveno.common.util.Tuple2;
 import haveno.common.util.Tuple3;
 import haveno.common.util.Utilities;
 import haveno.core.account.witness.AccountAgeWitnessService;
@@ -32,12 +33,13 @@ import haveno.core.trade.HavenoUtils;
 import haveno.core.trade.Trade;
 import haveno.core.trade.TradeManager;
 import haveno.core.util.FormattingUtils;
+import haveno.core.util.JsonUtil;
 import haveno.core.util.VolumeUtil;
 import haveno.core.util.coin.CoinFormatter;
 import haveno.core.xmr.wallet.BtcWalletService;
-import haveno.desktop.components.HavenoTextArea;
 import haveno.desktop.main.MainView;
 import haveno.desktop.main.overlays.Overlay;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.DisplayUtils;
 import haveno.desktop.util.GUIUtil;
 
@@ -50,11 +52,10 @@ import static haveno.desktop.util.FormBuilder.addSeparator;
 import static haveno.desktop.util.FormBuilder.addTitledGroupBg;
 import haveno.desktop.util.Layout;
 import haveno.network.p2p.NodeAddress;
-import javafx.beans.property.IntegerProperty;
-import javafx.beans.property.SimpleIntegerProperty;
-import javafx.beans.value.ChangeListener;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
+import javafx.scene.control.Label;
+import javafx.scene.control.TextField;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.Tooltip;
 import javafx.scene.input.KeyCode;
@@ -78,8 +79,6 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
     private final BtcWalletService btcWalletService;
     private final AccountAgeWitnessService accountAgeWitnessService;
     private Trade trade;
-    private ChangeListener<Number> changeListener;
-    private TextArea textArea;
     private String buyersAccountAge;
     private String sellersAccountAge;
 
@@ -116,12 +115,6 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Protected
     ///////////////////////////////////////////////////////////////////////////////////////////
-
-    @Override
-    protected void cleanup() {
-        if (textArea != null)
-            textArea.scrollTopProperty().addListener(changeListener);
-    }
 
     @Override
     protected void createGridPane() {
@@ -202,9 +195,10 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
         if (trade.getTradePeerNodeAddress() != null)
             rows++;
 
-        addTitledGroupBg(gridPane, ++rowIndex, rows, Res.get("shared.details"), Layout.COMPACT_GROUP_DISTANCE);
-        addConfirmationLabelTextField(gridPane, rowIndex, Res.get("shared.tradeId"),
-                trade.getId(), Layout.TWICE_FIRST_ROW_AND_COMPACT_GROUP_DISTANCE);
+        addTitledGroupBg(gridPane, ++rowIndex, rows, Res.get("shared.details"), Layout.DETAILS_WINDOW_GROUP_DISTANCE);
+        Tuple2<Label, TextField> tradeIdTuple = addConfirmationLabelTextField(gridPane, rowIndex, Res.get("shared.tradeId"),
+                trade.getId(), Layout.TWICE_FIRST_ROW_AND_DETAILS_WINDOW_GROUP_DISTANCE);
+        Accessibility.setHelp(tradeIdTuple.second, Accessibility.spellOut(trade.getId()));
         addSeparator(gridPane, ++rowIndex);
         addConfirmationLabelTextField(gridPane, ++rowIndex, Res.get("tradeDetailsWindow.tradeDate"),
                 DisplayUtils.formatDateTime(trade.getDate()));
@@ -288,20 +282,12 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
 
         if (trade.hasFailed()) {
             addSeparator(gridPane, ++rowIndex);
-            textArea = addConfirmationLabelTextArea(gridPane, ++rowIndex, Res.get("shared.errorMessage"), "", 0).second;
+            TextArea textArea = addConfirmationLabelTextArea(gridPane, ++rowIndex, Res.get("shared.errorMessage"), "", 0).second;
             textArea.setText(trade.getErrorMessage());
+            textArea.setMaxHeight(Layout.DETAILS_WINDOW_EXTRA_INFO_MAX_HEIGHT);
             textArea.setEditable(false);
             //TODO paint red
-
-            IntegerProperty count = new SimpleIntegerProperty(20);
-            int rowHeight = 10;
-            textArea.prefHeightProperty().bindBidirectional(count);
-            changeListener = (ov, old, newVal) -> {
-                if (newVal.intValue() > rowHeight)
-                    count.setValue(count.get() + newVal.intValue() + 10);
-            };
-            textArea.scrollTopProperty().addListener(changeListener);
-            textArea.setScrollTop(30);
+            GUIUtil.adjustHeightAutomatically(textArea, Layout.DETAILS_WINDOW_EXTRA_INFO_MAX_HEIGHT);
 
             addSeparator(gridPane, ++rowIndex);
             addConfirmationLabelTextField(gridPane, ++rowIndex, Res.get("tradeDetailsWindow.tradePhase"), trade.getPhase().name());
@@ -324,14 +310,15 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
         String sellerWitnessHash = trade.getSeller().getAccountAgeWitness() == null ? "null" : Utilities.bytesAsHexString(trade.getSeller().getAccountAgeWitness().getHash());
         String sellerPubKeyRingHash = Utilities.bytesAsHexString(trade.getSeller().getPubKeyRing().getSignaturePubKeyBytes());
 
+        String contractAsJson = contract == null ? trade.getContractAsJson() : JsonUtil.objectToJsonWithHexBytes(contract);
+
         viewContractButton.setOnAction(e -> {
-            TextArea textArea = new HavenoTextArea();
-            textArea.setText(trade.getContractAsJson());
+            TextArea textArea = new TextArea();
             String data = "Trade state: " + trade.getState();
             data += "\nTrade payout state: " + trade.getPayoutState();
             data += "\nTrade dispute state: " + trade.getDisputeState();
             data += "\n\nContract as json:\n";
-            data += trade.getContractAsJson();
+            data += contractAsJson;
             data += "\n\nOther detail data:";
             if (!trade.isDepositsPublished()) {
                 data += "\n\n" + (trade.getMaker() == trade.getBuyer() ? "Buyer" : "Seller") + " as maker reserve tx hex: " + trade.getMaker().getReserveTxHex();
@@ -358,6 +345,7 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
             textArea.setEditable(false);
             textArea.setWrapText(true);
             textArea.setPrefSize(800, 600);
+            textArea.getStyleClass().add("window-text-area");
 
             Scene viewContractScene = new Scene(textArea);
             Stage viewContractStage = new Stage();
@@ -366,6 +354,7 @@ public class TradeDetailsWindow extends Overlay<TradeDetailsWindow> {
             if (owner == null)
                 owner = MainView.getRootContainer();
             Scene rootScene = owner.getScene();
+            viewContractScene.getStylesheets().setAll(rootScene.getStylesheets());
             viewContractStage.initOwner(rootScene.getWindow());
             viewContractStage.initModality(Modality.NONE);
             viewContractStage.initStyle(StageStyle.UTILITY);

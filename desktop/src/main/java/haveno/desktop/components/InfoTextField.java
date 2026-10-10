@@ -18,9 +18,10 @@
 package haveno.desktop.components;
 
 import com.jfoenix.controls.JFXTextField;
-import de.jensd.fx.fontawesome.AwesomeIcon;
+import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
 import haveno.desktop.components.controlsfx.control.PopOver;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.util.Layout;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.beans.property.StringProperty;
@@ -58,7 +59,7 @@ public class InfoTextField extends AnchorPane {
         textField.setFocusTraversable(false);
         textField.setId("info-field");
 
-        infoIcon = getIcon(AwesomeIcon.INFO_SIGN);
+        infoIcon = getIcon(FontAwesomeIcon.INFO_CIRCLE);
         infoIcon.setLayoutY(Layout.FLOATING_ICON_Y - 2);
         infoIcon.getStyleClass().addAll("icon", "info");
 
@@ -83,6 +84,7 @@ public class InfoTextField extends AnchorPane {
 
         hideIcons();
         setActionHandlers(node);
+        Accessibility.setHelpFromContent(textField, node);
     }
 
     public void setContent(MaterialDesignIcon icon, String info, String style, double opacity) {
@@ -92,6 +94,7 @@ public class InfoTextField extends AnchorPane {
         Text textIcon = getRegularIconForLabel(icon, currentIcon);
 
         setActionHandlers(new Label(info));
+        Accessibility.setHelp(textField, info);
 
         currentIcon.setLayoutY(5);
         textIcon.getStyleClass().addAll("icon", style);

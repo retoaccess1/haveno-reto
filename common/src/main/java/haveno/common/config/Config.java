@@ -18,6 +18,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -57,6 +59,7 @@ public class Config {
     public static final String APP_DATA_DIR = "appDataDir";
     public static final String CONFIG_FILE = "configFile";
     public static final String MAX_MEMORY = "maxMemory";
+    public static final String DUMP_HEAP_ON_OUT_OF_MEMORY_ERROR = "dumpHeapOnOutOfMemoryError";
     public static final String LOG_LEVEL = "logLevel";
     public static final String BANNED_XMR_NODES = "bannedXmrNodes";
     public static final String BANNED_PRICE_RELAY_NODES = "bannedPriceRelayNodes";
@@ -109,12 +112,17 @@ public class Config {
     public static final String XMR_NODE_PASSWORD = "xmrNodePassword";
     public static final String XMR_NODES = "xmrNodes";
     public static final String USE_NATIVE_XMR_WALLET = "useNativeXmrWallet";
+    public static final String XMR_STREAM_ISOLATION = "xmrStreamIsolation";
     public static final String SOCKS5_DISCOVER_MODE = "socks5DiscoverMode";
     public static final String USE_ALL_PROVIDED_NODES = "useAllProvidedNodes";
     public static final String USER_AGENT = "userAgent";
     public static final String NUM_CONNECTIONS_FOR_BTC = "numConnectionsForBtc";
     public static final String API_PASSWORD = "apiPassword";
     public static final String API_PORT = "apiPort";
+    public static final String API_BIND_ADDRESS = "apiBindAddress";
+    public static final String API_HIDDEN_SERVICE = "apiHiddenService";
+    public static final String API_HIDDEN_SERVICE_BEFORE_LOGIN = "apiHiddenServiceBeforeLogin";
+    public static final String API_HIDDEN_SERVICE_PORT = "apiHiddenServicePort";
     public static final String PREVENT_PERIODIC_SHUTDOWN_AT_SEED_NODE = "preventPeriodicShutdownAtSeedNode";
     public static final String REPUBLISH_MAILBOX_ENTRIES = "republishMailboxEntries";
     public static final String LEGACY_FEE_DATAMAP = "dataMap";
@@ -164,6 +172,7 @@ public class Config {
     public final int nodePort;
     public final String  hiddenServiceAddress;
     public final int maxMemory;
+    public final boolean dumpHeapOnOutOfMemoryError;
     public final String logLevel;
     public final List<String> bannedXmrNodes;
     public final List<String> bannedPriceRelayNodes;
@@ -209,6 +218,8 @@ public class Config {
     public final String xmrNodePassword;
     public final String xmrNodes;
     public final boolean useNativeXmrWallet;
+    public final boolean useNativeXmrWalletOptionSetExplicitly;
+    public final boolean xmrStreamIsolation;
     public final UseTorForXmr useTorForXmr;
     public final boolean useTorForXmrOptionSetExplicitly;
     public final String socks5DiscoverMode;
@@ -217,6 +228,10 @@ public class Config {
     public final int numConnectionsForBtc;
     public final String apiPassword;
     public final int apiPort;
+    public final String apiBindAddress;
+    public final boolean apiHiddenService;
+    public final boolean apiHiddenServiceBeforeLogin;
+    public final int apiHiddenServicePort;
     public final boolean preventPeriodicShutdownAtSeedNode;
     public final boolean republishMailboxEntries;
     public final boolean bypassMempoolValidation;
@@ -332,6 +347,14 @@ public class Config {
                         .ofType(String.class)
                         .describedAs("OFF|ALL|ERROR|WARN|INFO|DEBUG|TRACE")
                         .defaultsTo(Level.INFO.levelStr);
+
+        ArgumentAcceptingOptionSpec<Boolean> dumpHeapOnOutOfMemoryErrorOpt =
+                parser.accepts(DUMP_HEAP_ON_OUT_OF_MEMORY_ERROR,
+                        "Dump the Java heap to the application data directory on out-of-memory errors " +
+                                "(may contain sensitive data and require substantial disk space)")
+                        .withRequiredArg()
+                        .ofType(Boolean.class)
+                        .defaultsTo(false);
 
         ArgumentAcceptingOptionSpec<String> bannedXmrNodesOpt =
                 parser.accepts(BANNED_XMR_NODES, "List Bitcoin nodes to ban")
@@ -603,7 +626,13 @@ public class Config {
                         .defaultsTo("");
 
         ArgumentAcceptingOptionSpec<Boolean> useNativeXmrWalletOpt =
-                parser.accepts(USE_NATIVE_XMR_WALLET, "Use native wallet libraries instead of monero-wallet-rpc server")
+                parser.accepts(USE_NATIVE_XMR_WALLET, "Use the native Monero wallet library instead of monero-wallet-rpc (overrides the setting in the UI)")
+                        .withRequiredArg()
+                        .ofType(boolean.class)
+                        .defaultsTo(false);
+
+        ArgumentAcceptingOptionSpec<Boolean> xmrStreamIsolationOpt =
+                parser.accepts(XMR_STREAM_ISOLATION, "Sync each Monero wallet over its own Tor circuit using SOCKS stream isolation.")
                         .withRequiredArg()
                         .ofType(boolean.class)
                         .defaultsTo(false);
@@ -652,6 +681,33 @@ public class Config {
                         .withRequiredArg()
                         .ofType(Integer.class)
                         .defaultsTo(9998);
+
+        ArgumentAcceptingOptionSpec<String> apiBindAddressOpt =
+                parser.accepts(API_BIND_ADDRESS, "gRPC API bind address; anything but loopback exposes full wallet access to that network")
+                        .withRequiredArg()
+                        .defaultsTo("127.0.0.1");
+
+        ArgumentAcceptingOptionSpec<Boolean> apiHiddenServiceOpt =
+                parser.accepts(API_HIDDEN_SERVICE,
+                        "Publish the gRPC API as a Tor hidden service; bundled Tor waits for account login by default")
+                        .withRequiredArg()
+                        .ofType(boolean.class)
+                        .defaultsTo(false);
+
+        ArgumentAcceptingOptionSpec<Boolean> apiHiddenServiceBeforeLoginOpt =
+                parser.accepts(API_HIDDEN_SERVICE_BEFORE_LOGIN,
+                        "Allow the API hidden service before login using startup Tor configuration or defaults; " +
+                        "encrypted bridge preferences cannot be applied to that shared Tor session")
+                        .withRequiredArg()
+                        .ofType(boolean.class)
+                        .defaultsTo(false);
+
+        ArgumentAcceptingOptionSpec<Integer> apiHiddenServicePortOpt =
+                parser.accepts(API_HIDDEN_SERVICE_PORT,
+                        "Port of the API hidden service, forwarded to the same local port (defaults to --" + API_PORT + ")")
+                        .withRequiredArg()
+                        .ofType(Integer.class)
+                        .describedAs("port");
 
         ArgumentAcceptingOptionSpec<Boolean> preventPeriodicShutdownAtSeedNodeOpt =
                 parser.accepts(PREVENT_PERIODIC_SHUTDOWN_AT_SEED_NODE,
@@ -762,6 +818,7 @@ public class Config {
             this.hiddenServiceAddress = options.valueOf(hiddenServiceAddressOpt);
             this.walletRpcBindPort = options.valueOf(walletRpcBindPortOpt);
             this.maxMemory = options.valueOf(maxMemoryOpt);
+            this.dumpHeapOnOutOfMemoryError = options.valueOf(dumpHeapOnOutOfMemoryErrorOpt);
             this.logLevel = options.valueOf(logLevelOpt);
             this.bannedXmrNodes = options.valuesOf(bannedXmrNodesOpt);
             this.bannedPriceRelayNodes = options.valuesOf(bannedPriceRelayNodesOpt);
@@ -808,6 +865,8 @@ public class Config {
             this.xmrNodePassword = options.valueOf(xmrNodePasswordOpt);
             this.xmrNodes = options.valueOf(xmrNodesOpt);
             this.useNativeXmrWallet = options.valueOf(useNativeXmrWalletOpt);
+            this.useNativeXmrWalletOptionSetExplicitly = options.has(useNativeXmrWalletOpt);
+            this.xmrStreamIsolation = options.valueOf(xmrStreamIsolationOpt);
             this.useTorForXmr = (UseTorForXmr) options.valueOf(useTorForXmrOpt);
             this.useTorForXmrOptionSetExplicitly = options.has(useTorForXmrOpt);
             this.socks5DiscoverMode = options.valueOf(socks5DiscoverModeOpt);
@@ -817,6 +876,10 @@ public class Config {
 
             this.apiPassword = options.valueOf(apiPasswordOpt);
             this.apiPort = options.valueOf(apiPortOpt);
+            this.apiBindAddress = options.valueOf(apiBindAddressOpt);
+            this.apiHiddenService = options.valueOf(apiHiddenServiceOpt);
+            this.apiHiddenServiceBeforeLogin = options.valueOf(apiHiddenServiceBeforeLoginOpt);
+            this.apiHiddenServicePort = options.has(apiHiddenServicePortOpt) ? options.valueOf(apiHiddenServicePortOpt) : apiPort;
             this.preventPeriodicShutdownAtSeedNode = options.valueOf(preventPeriodicShutdownAtSeedNodeOpt);
             this.republishMailboxEntries = options.valueOf(republishMailboxEntriesOpt);
             this.bypassMempoolValidation = options.valueOf(bypassMempoolValidationOpt);
@@ -830,6 +893,20 @@ public class Config {
                     ex.getCause() != null ?
                             ex.getCause().getMessage() :
                             ex.getMessage());
+        }
+
+        if (apiHiddenServiceBeforeLogin && !apiHiddenService)
+            throw new ConfigException("The '%s' option requires '%s'", API_HIDDEN_SERVICE_BEFORE_LOGIN, API_HIDDEN_SERVICE);
+
+        if (apiHiddenService) {
+            if (useLocalhostForP2P || !hiddenServiceAddress.isEmpty())
+                throw new ConfigException("The '%s' option requires Haveno to use its own or a running Tor", API_HIDDEN_SERVICE);
+            if (apiPassword.length() < 8)
+                throw new ConfigException("The '%s' option requires an '%s' of at least 8 characters", API_HIDDEN_SERVICE, API_PASSWORD);
+            if (apiHiddenServicePort < 1 || apiHiddenServicePort > 65535)
+                throw new ConfigException("The '%s' option must be a port between 1 and 65535", API_HIDDEN_SERVICE_PORT);
+            if (!acceptsHiddenServiceForwarding(apiBindAddress))
+                throw new ConfigException("The '%s' option forwards to 127.0.0.1, so '%s' must be 127.0.0.1 or a wildcard address", API_HIDDEN_SERVICE, API_BIND_ADDRESS);
         }
 
         // Create all appDataDir subdirectories and assign to their respective properties
@@ -915,6 +992,16 @@ public class Config {
             }
         }
         return dir;
+    }
+
+    // whether a bind address accepts the 127.0.0.1 connections the API hidden service forwards
+    private static boolean acceptsHiddenServiceForwarding(String address) {
+        try {
+            InetAddress inetAddress = InetAddress.getByName(address);
+            return inetAddress.isAnyLocalAddress() || inetAddress.equals(InetAddress.getByName("127.0.0.1"));
+        } catch (UnknownHostException e) {
+            return false;
+        }
     }
 
     /**

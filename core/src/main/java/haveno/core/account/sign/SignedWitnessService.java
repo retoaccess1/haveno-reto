@@ -20,11 +20,13 @@ package haveno.core.account.sign;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Charsets;
 import com.google.inject.Inject;
+import haveno.common.Timer;
 import haveno.common.UserThread;
 import haveno.common.crypto.CryptoException;
 import haveno.common.crypto.Hash;
 import haveno.common.crypto.KeyRing;
 import haveno.common.crypto.Sig;
+import haveno.common.util.DateUtil;
 import haveno.common.util.Utilities;
 import haveno.core.account.witness.AccountAgeWitness;
 import haveno.core.filter.FilterManager;
@@ -38,6 +40,7 @@ import haveno.network.p2p.storage.persistence.AppendOnlyDataStoreService;
 import java.math.BigInteger;
 import java.security.PublicKey;
 import java.security.SignatureException;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -51,7 +54,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.Stack;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import org.bitcoinj.core.ECKey;
 import org.bitcoinj.core.Utils;
@@ -61,6 +66,21 @@ public class SignedWitnessService {
     public static final long SIGNER_AGE_DAYS = 30;
     private static final long SIGNER_AGE = SIGNER_AGE_DAYS * ChronoUnit.DAYS.getDuration().toMillis();
     public static final BigInteger MINIMUM_TRADE_AMOUNT_FOR_SIGNING = Restrictions.getMinTradeAmount();
+    // Tolerance for clock differences between peers when checking the date of a received SignedWitness.
+    private static final long SIGN_DATE_TOLERANCE = ChronoUnit.DAYS.getDuration().toMillis();
+
+    // Max SignedWitnesses accepted as a received signer chain. A valid chain holds one witness per level
+    // and can only grow one level per SIGNER_AGE, so this is headroom against abuse, not a real limit.
+    public static final int MAX_SIGNER_CHAIN_SIZE = 100;
+
+    // How often we check for witnesses with a missing signer chain, and the max intervals between
+    // re-requests while the same gaps persist, as the data may be permanently unavailable (#2182).
+    private static final long GAP_HEALING_INTERVAL_MINUTES = 60;
+    private static final int GAP_HEALING_MAX_BACKOFF_INTERVALS = 24;
+    private Timer gapHealingTimer;
+    private Set<P2PDataStorage.ByteArray> gapHealingLastGapKeys;
+    private int gapHealingBackoffIntervals = 1;
+    private int gapHealingIntervalsWaited = 0;
 
     private final KeyRing keyRing;
     private final P2PService p2PService;
@@ -68,6 +88,7 @@ public class SignedWitnessService {
     private final SignedWitnessStorageService signedWitnessStorageService;
     private final User user;
     private final FilterManager filterManager;
+    private final Clock clock;
 
     private final Map<P2PDataStorage.ByteArray, SignedWitness> signedWitnessMap = new HashMap<>();
 
@@ -98,13 +119,15 @@ public class SignedWitnessService {
                                 SignedWitnessStorageService signedWitnessStorageService,
                                 AppendOnlyDataStoreService appendOnlyDataStoreService,
                                 User user,
-                                FilterManager filterManager) {
+                                FilterManager filterManager,
+                                Clock clock) {
         this.keyRing = keyRing;
         this.p2PService = p2PService;
         this.arbitratorManager = arbitratorManager;
         this.signedWitnessStorageService = signedWitnessStorageService;
         this.user = user;
         this.filterManager = filterManager;
+        this.clock = clock;
 
         // We need to add that early (before onAllServicesInitialized) as it will be used at startup.
         appendOnlyDataStoreService.addService(signedWitnessStorageService);
@@ -145,6 +168,68 @@ public class SignedWitnessService {
         if (user.getRegisteredArbitrator() != null) {
             UserThread.runAfter(this::doRepublishAllSignedWitnesses, 60);
         }
+        startGapHealing();
+    }
+
+    // Periodically re-requests P2P data while our own account's signer chain is missing ancestors locally, so such
+    // gaps heal without a restart and our account is not wrongly treated as unsigned (#2182). Scoped to our own
+    // account, as peers deliver their signer chain in-band with the trade, so every client need not poll the seeds.
+    private void startGapHealing() {
+        if (gapHealingTimer != null) return;
+        gapHealingTimer = UserThread.runPeriodically(() -> {
+            Set<SignedWitness> gaps = getOwnSignerChainGaps();
+            if (gaps.isEmpty()) return;
+            Set<P2PDataStorage.ByteArray> gapKeys = gaps.stream()
+                    .map(SignedWitness::getHashAsByteArray)
+                    .collect(Collectors.toSet());
+            if (gapKeys.equals(gapHealingLastGapKeys)) {
+                // back off while the same gaps persist, as the data may be permanently unavailable
+                if (++gapHealingIntervalsWaited < gapHealingBackoffIntervals) return;
+                gapHealingBackoffIntervals = Math.min(gapHealingBackoffIntervals * 2, GAP_HEALING_MAX_BACKOFF_INTERVALS);
+            } else {
+                gapHealingBackoffIntervals = 1;
+            }
+            gapHealingIntervalsWaited = 0;
+            gapHealingLastGapKeys = gapKeys;
+            log.info("Our account's signer chain is missing ancestors, requesting P2P data to heal gaps");
+            p2PService.requestData();
+        }, GAP_HEALING_INTERVAL_MINUTES, TimeUnit.MINUTES);
+    }
+
+    // Collects the broken links in our own account's signer chain: witnesses we hold whose signer's witness is
+    // missing locally, the gaps a re-request could heal. Empty if our chain reaches an arbitrator or is unsigned.
+    private Set<SignedWitness> getOwnSignerChainGaps() {
+        byte[] ownPubKey = keyRing.getPubKeyRing().getSignaturePubKeyBytes();
+        Set<SignedWitness> ownWitnesses = getSignedWitnessSetByOwnerPubKey(ownPubKey, new Stack<>());
+        if (ownWitnesses.isEmpty()) return new HashSet<>(); // nobody signed us: nothing to heal
+
+        // if any of our witnesses already chains to an arbitrator our account is signed, so nothing to heal
+        long time = new Date().getTime() + SIGNER_AGE;
+        if (ownWitnesses.stream().anyMatch(w -> isValidSignerWitnessInternal(w, time, new Stack<>(), null))) {
+            return new HashSet<>();
+        }
+
+        Set<SignedWitness> gaps = new HashSet<>();
+        collectSignerChainGaps(ownPubKey, new Stack<>(), gaps);
+        return gaps;
+    }
+
+    private void collectSignerChainGaps(byte[] ownerPubKey,
+                                        Stack<P2PDataStorage.ByteArray> excludedPubKeys,
+                                        Set<SignedWitness> gaps) {
+        if (excludedPubKeys.size() >= 2000) return; // bound recursion as in isValidSignerWitnessInternal
+        for (SignedWitness signedWitness : getSignedWitnessSetByOwnerPubKey(ownerPubKey, excludedPubKeys)) {
+            if (signedWitness.isSignedByArbitrator()) continue; // arbitrator signatures need no ancestor
+            excludedPubKeys.push(new P2PDataStorage.ByteArray(signedWitness.getSignerPubKey()));
+            excludedPubKeys.push(new P2PDataStorage.ByteArray(signedWitness.getWitnessOwnerPubKey()));
+            if (getSignedWitnessSetByOwnerPubKey(signedWitness.getSignerPubKey(), new Stack<>()).isEmpty()) {
+                gaps.add(signedWitness); // we hold this witness but not its signer's
+            } else {
+                collectSignerChainGaps(signedWitness.getSignerPubKey(), excludedPubKeys, gaps);
+            }
+            excludedPubKeys.pop();
+            excludedPubKeys.pop();
+        }
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -184,10 +269,10 @@ public class SignedWitnessService {
     }
 
     public boolean isSignedByArbitrator(AccountAgeWitness accountAgeWitness) {
+        // require a verified arbitrator signature, not just the self-declared verificationMethod flag
         return getSignedWitnessSet(accountAgeWitness).stream()
-                .map(SignedWitness::isSignedByArbitrator)
-                .findAny()
-                .orElse(false);
+                .filter(SignedWitness::isSignedByArbitrator)
+                .anyMatch(this::verifySignature);
     }
 
     public boolean isFilteredWitness(AccountAgeWitness accountAgeWitness) {
@@ -217,15 +302,127 @@ public class SignedWitnessService {
                 .collect(Collectors.toSet());
     }
 
-    public boolean publishOwnSignedWitness(SignedWitness signedWitness) {
-        if (!Arrays.equals(signedWitness.getWitnessOwnerPubKey(), keyRing.getPubKeyRing().getSignaturePubKeyBytes()) ||
-                !verifySigner(signedWitness)) {
+    // Collects the witnesses along the first valid signer path from ownerPubKey up to an arbitrator root, to
+    // deliver in-band to a peer we signed so it can validate even if its store lacks our ancestors (#2182).
+    // The path holds one witness per level, so its size is bounded by the chain depth.
+    public Set<SignedWitness> getSignerChain(byte[] ownerPubKey, long childSignedWitnessDateMillis) {
+        List<SignedWitness> path = new ArrayList<>();
+        for (SignedWitness signedWitness : getSignedWitnessSetByOwnerPubKey(ownerPubKey, new Stack<>())) {
+            if (isValidSignerWitnessInternal(signedWitness, childSignedWitnessDateMillis, new Stack<>(), path)) {
+                return path.size() <= MAX_SIGNER_CHAIN_SIZE ? new HashSet<>(path) : new HashSet<>();
+            }
+        }
+        return new HashSet<>();
+    }
+
+    // Stores a signer chain received in-band from a peer, keeping only witnesses on a valid signer path from the
+    // signer's pub key up to an arbitrator root; each witness is self-verifiable, so this adds no trust, only heals gaps.
+    public void addValidSignerChain(Collection<SignedWitness> signerChain, byte[] signerPubKey) {
+        if (signerChain == null) return;
+        if (signerChain.size() > MAX_SIGNER_CHAIN_SIZE) {
+            log.warn("Ignoring oversized signer chain with {} witnesses", signerChain.size());
+            return;
+        }
+
+        // index the received witnesses by owner pub key
+        Map<P2PDataStorage.ByteArray, Set<SignedWitness>> byOwnerPubKey = new HashMap<>();
+        for (SignedWitness signedWitness : signerChain) {
+            byOwnerPubKey.computeIfAbsent(new P2PDataStorage.ByteArray(signedWitness.getWitnessOwnerPubKey()), k -> new HashSet<>()).add(signedWitness);
+        }
+
+        // collect the witnesses on a valid signer path from the signer's pub key up to an arbitrator root; a chain
+        // which does not terminate at an arbitrator root proves nothing, so it is dropped rather than stored
+        Set<SignedWitness> accepted = new HashSet<>();
+        collectValidSignerPath(signerPubKey, byOwnerPubKey, new HashSet<>(), accepted);
+        int numIgnored = new HashSet<>(signerChain).size() - accepted.size();
+        if (numIgnored > 0) log.warn("Ignored {} received signer chain witnesses which are invalid or do not chain from the signer's pub key to an arbitrator root", numIgnored);
+
+        // store the accepted witnesses; only broadcast in-tolerance witnesses, as peers reject older ones
+        for (SignedWitness signedWitness : accepted) {
+            if (signedWitnessMap.containsKey(signedWitness.getHashAsByteArray())) continue; // already have it
+            // the date is not covered by the signature, so reject future dates a peer could have forged
+            if (signedWitness.getDate() > clock.millis() + SIGN_DATE_TOLERANCE) {
+                log.warn("Ignoring received signer chain witness with future date {}", signedWitness.getHashAsByteArray());
+                continue;
+            }
+            log.info("Adding valid signer chain witness received in-band from trade peer {}", signedWitness.getHashAsByteArray());
+            p2PService.addPersistableNetworkPayload(signedWitness, signedWitness.isDateInTolerance(clock), false);
+            addToMap(signedWitness);
+        }
+    }
+
+    // Collects received witnesses along the first valid signer path from ownerPubKey up to an arbitrator root,
+    // visiting each owner once to bound work and prevent loops; returns true and fills accepted if a path exists.
+    private boolean collectValidSignerPath(byte[] ownerPubKey,
+                                           Map<P2PDataStorage.ByteArray, Set<SignedWitness>> byOwnerPubKey,
+                                           Set<P2PDataStorage.ByteArray> visitedOwners,
+                                           Set<SignedWitness> accepted) {
+        P2PDataStorage.ByteArray ownerKey = new P2PDataStorage.ByteArray(ownerPubKey);
+        if (visitedOwners.size() >= MAX_SIGNER_CHAIN_SIZE || !visitedOwners.add(ownerKey)) return false;
+        for (SignedWitness signedWitness : byOwnerPubKey.getOrDefault(ownerKey, new HashSet<>())) {
+            if (!verifySignature(signedWitness)) {
+                log.warn("Ignoring received signer chain witness with invalid signature {}", signedWitness.getHashAsByteArray());
+                continue;
+            }
+            if (signedWitness.isSignedByArbitrator() ||
+                    collectValidSignerPath(signedWitness.getSignerPubKey(), byOwnerPubKey, visitedOwners, accepted)) {
+                accepted.add(signedWitness);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // All fields of the peer-created signedWitness are peer controlled and bypass the P2P date tolerance check,
+    // so accept it only if it matches the witness expected from validated trade data, verifies, and is dated within the trade duration.
+    public boolean publishOwnSignedWitness(SignedWitness signedWitness,
+                                           BigInteger tradeAmount,
+                                           AccountAgeWitness myAccountAgeWitness,
+                                           byte[] signerPubKey,
+                                           byte[] witnessOwnerPubKey,
+                                           long tradeStartDate) {
+        SignedWitness expected = new SignedWitness(SignedWitness.VerificationMethod.TRADE,
+                myAccountAgeWitness.getHash(),
+                signedWitness.getSignature(),
+                signerPubKey,
+                witnessOwnerPubKey,
+                signedWitness.getDate(),
+                tradeAmount.longValueExact());
+        if (!expected.equals(signedWitness)) {
+            log.warn("Received signedWitness is not the one the peer was supposed to create for that trade. " +
+                    "signedWitness={}", signedWitness);
+            return false;
+        }
+        if (!isSufficientTradeAmountForSigning(tradeAmount)) {
+            log.warn("Received signedWitness is from a trade with a too low trade amount. signedWitness={}",
+                    signedWitness);
+            return false;
+        }
+        if (!isSignDateInTradeRange(signedWitness.getDate(), tradeStartDate)) {
+            log.warn("Received signedWitness has a date which is not inside the duration of the trade. " +
+                    "signedWitness={}", signedWitness);
+            return false;
+        }
+        if (!verifySignature(signedWitness)) {
+            log.warn("Received signedWitness has an invalid signature. signedWitness={}", signedWitness);
+            return false;
+        }
+
+        // Does the witness signer hold a witness that makes them a valid signer at the date of this signature?
+        if (!verifySigner(signedWitness.getSignerPubKey(), signedWitness.getDate())) {
+            log.warn("The signer of the received signedWitness is not a valid signer. signedWitness={}",
+                    signedWitness);
             return false;
         }
 
         log.info("Publish own signedWitness {}", signedWitness);
         publishSignedWitness(signedWitness);
         return true;
+    }
+
+    // Compare bounds directly; a difference with a peer controlled extreme date could overflow.
+    private boolean isSignDateInTradeRange(long date, long tradeStartDate) {
+        return DateUtil.isWithinBounds(date, tradeStartDate - SIGN_DATE_TOLERANCE, clock.millis() + SIGN_DATE_TOLERANCE);
     }
 
     // Arbitrators sign with EC key
@@ -360,9 +557,10 @@ public class SignedWitnessService {
         }
         try {
             PublicKey signaturePubKey = Sig.getPublicKeyFromBytes(signedWitness.getSignerPubKey());
-            Sig.verify(signaturePubKey, signedWitness.getAccountAgeWitnessHash(), signedWitness.getSignature());
-            verifySignatureWithDSAKeyResultCache.put(hash, true);
-            return true;
+            boolean isValid = Sig.verify(signaturePubKey, signedWitness.getAccountAgeWitnessHash(), signedWitness.getSignature());
+            if (!isValid) log.warn("verifySignature signedWitness failed. signedWitness={}", signedWitness);
+            verifySignatureWithDSAKeyResultCache.put(hash, isValid);
+            return isValid;
         } catch (CryptoException e) {
             log.warn("verifySignature signedWitness failed. signedWitness={}", signedWitness);
             log.warn("Caused by ", e);
@@ -435,9 +633,11 @@ public class SignedWitnessService {
         return tradeAmount.compareTo(MINIMUM_TRADE_AMOUNT_FOR_SIGNING) >= 0;
     }
 
-    private boolean verifySigner(SignedWitness signedWitness) {
-        return getSignedWitnessSetByOwnerPubKey(signedWitness.getWitnessOwnerPubKey(), new Stack<>()).stream()
-                .anyMatch(w -> isValidSignerWitnessInternal(w, signedWitness.getDate(), new Stack<>()));
+    // Check the signer was a valid signer at signing time by walking the witnesses owned by the signer;
+    // looking up by witness owner would exclude the case that our first account gets signed.
+    private boolean verifySigner(byte[] signerPubKey, long signedWitnessDate) {
+        return getSignedWitnessSetByOwnerPubKey(signerPubKey, new Stack<>()).stream()
+                .anyMatch(w -> isValidSignerWitnessInternal(w, signedWitnessDate, new Stack<>(), null));
     }
 
     /**
@@ -452,7 +652,7 @@ public class SignedWitnessService {
         Stack<P2PDataStorage.ByteArray> excludedPubKeys = new Stack<>();
         Set<SignedWitness> signedWitnessSet = getSignedWitnessSet(accountAgeWitness);
         for (SignedWitness signedWitness : signedWitnessSet) {
-            if (isValidSignerWitnessInternal(signedWitness, time, excludedPubKeys)) {
+            if (isValidSignerWitnessInternal(signedWitness, time, excludedPubKeys, null)) {
                 return true;
             }
         }
@@ -466,11 +666,13 @@ public class SignedWitnessService {
      * @param signedWitness                the signedWitness to validate
      * @param childSignedWitnessDateMillis the date the child SignedWitness was signed or current time if it is a leaf.
      * @param excludedPubKeys              stack to prevent recursive loops
+     * @param path                         if non-null, collects the witnesses along the first valid signer path
      * @return true if signedWitness is valid, false otherwise.
      */
     private boolean isValidSignerWitnessInternal(SignedWitness signedWitness,
                                                  long childSignedWitnessDateMillis,
-                                                 Stack<P2PDataStorage.ByteArray> excludedPubKeys) {
+                                                 Stack<P2PDataStorage.ByteArray> excludedPubKeys,
+                                                 @Nullable List<SignedWitness> path) {
         if (filterManager.isWitnessSignerPubKeyBanned(Utils.HEX.encode(signedWitness.getWitnessOwnerPubKey()))) {
             return false;
         }
@@ -479,6 +681,7 @@ public class SignedWitnessService {
         }
         if (signedWitness.isSignedByArbitrator()) {
             // If signed by an arbitrator we don't have to check anything else.
+            if (path != null) path.add(signedWitness);
             return true;
         } else {
             if (!verifyDate(signedWitness, childSignedWitnessDateMillis)) {
@@ -493,7 +696,8 @@ public class SignedWitnessService {
             // Iterate over signedWitness signers
             Set<SignedWitness> signerSignedWitnessSet = getSignedWitnessSetByOwnerPubKey(signedWitness.getSignerPubKey(), excludedPubKeys);
             for (SignedWitness signerSignedWitness : signerSignedWitnessSet) {
-                if (isValidSignerWitnessInternal(signerSignedWitness, signedWitness.getDate(), excludedPubKeys)) {
+                if (isValidSignerWitnessInternal(signerSignedWitness, signedWitness.getDate(), excludedPubKeys, path)) {
+                    if (path != null) path.add(signedWitness);
                     return true;
                 }
             }
@@ -538,7 +742,10 @@ public class SignedWitnessService {
     }
 
     private void doRepublishAllSignedWitnesses() {
-        getSignedWitnessMapValues()
+        // only re-broadcast in-tolerance witnesses, as peers reject older ones (they sync via data request)
+        Clock clock = Clock.systemDefaultZone();
+        getSignedWitnessMapValues().stream()
+                .filter(signedWitness -> signedWitness.isDateInTolerance(clock))
                 .forEach(signedWitness -> p2PService.addPersistableNetworkPayload(signedWitness, true));
     }
 

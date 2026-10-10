@@ -3,6 +3,7 @@ package haveno.desktop.util;
 import haveno.common.crypto.PubKeyRing;
 import haveno.core.account.witness.AccountAgeWitness;
 import haveno.core.account.witness.AccountAgeWitnessService;
+import haveno.core.locale.CurrencyUtil;
 import haveno.core.locale.GlobalSettings;
 import haveno.core.locale.Res;
 import haveno.core.monetary.Price;
@@ -12,6 +13,7 @@ import haveno.core.offer.OfferDirection;
 import haveno.core.payment.PaymentAccount;
 import haveno.core.payment.payload.PaymentAccountPayload;
 import haveno.core.payment.payload.PaymentMethod;
+import haveno.core.provider.price.MarketPrice;
 import haveno.core.trade.HavenoUtils;
 import haveno.core.util.FormattingUtils;
 import haveno.core.util.ParsingUtils;
@@ -26,13 +28,58 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.text.DateFormat;
+import java.text.NumberFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Locale;
 import java.util.Optional;
 
 @Slf4j
 public class DisplayUtils {
     private static final int SCALE = 3;
+    private static final int MAX_BADGE_COUNT = 99;
+
+    public static String formatBadgeCount(long count) {
+        return count > MAX_BADGE_COUNT ? MAX_BADGE_COUNT + "+" : Long.toString(count);
+    }
+
+    public static boolean isValidEstimatePrice(MarketPrice price) {
+        return price != null && price.isRecentExternalPriceAvailable() && Double.isFinite(price.getPrice());
+    }
+
+    // use atomic units and the unrounded quote; only round the final display value
+    public static String formatBalanceEstimate(BigInteger atomicAmount, MarketPrice price) {
+        if (atomicAmount == null || atomicAmount.signum() < 0 || !isValidEstimatePrice(price)) return null;
+        NumberFormat format = NumberFormat.getNumberInstance(GlobalSettings.getLocale());
+        format.setRoundingMode(RoundingMode.HALF_UP);
+        format.setMinimumFractionDigits(2);
+        format.setMaximumFractionDigits(CurrencyUtil.isPricePrecise(price.getCurrencyCode()) ? 8 : 2);
+        return "≈ " + format.format(toFiatValue(atomicAmount, price)) + " " + price.getCurrencyCode();
+    }
+
+    // the unrounded value of atomic units at the given price
+    public static BigDecimal toFiatValue(BigInteger atomicAmount, MarketPrice price) {
+        return new BigDecimal(atomicAmount, 12).multiply(BigDecimal.valueOf(price.getPrice()));
+    }
+
+    // convert fiat input to atomic XMR, rounded to 8 decimals; requires a valid price
+    public static BigInteger parseFiatToXmr(String fiatInput, MarketPrice price) {
+        if (!isValidEstimatePrice(price)) throw new IllegalArgumentException(Res.get("funds.withdrawal.priceUnavailable"));
+        if (fiatInput == null || fiatInput.trim().isEmpty()) return BigInteger.ZERO;
+        double fiatAmount = Double.parseDouble(fiatInput.trim());
+        return HavenoUtils.parseXmr(String.format(Locale.US, "%.8f", fiatAmount / price.getPrice()));
+    }
+
+    // plain fiat value, kept parseable by parseFiatToXmr (no grouping or currency code)
+    public static String formatXmrToFiat(BigInteger atomicXmr, MarketPrice price, int maxDecimals) {
+        if (!isValidEstimatePrice(price) || atomicXmr == null) return "";
+        NumberFormat format = NumberFormat.getNumberInstance(Locale.US);
+        format.setRoundingMode(RoundingMode.HALF_UP);
+        format.setGroupingUsed(false);
+        format.setMinimumFractionDigits(2);
+        format.setMaximumFractionDigits(maxDecimals);
+        return format.format(toFiatValue(atomicXmr, price));
+    }
 
     public static String formatDateTime(Date date) {
         return FormattingUtils.formatDateTime(date, true);
@@ -158,6 +205,17 @@ public class DisplayUtils {
     // Amount
     ///////////////////////////////////////////////////////////////////////////////////////////
 
+    // shortens a formatted XMR balance for the navigation header without hiding small balances
+    public static String formatCompactXmr(String formattedXmr) {
+        if (formattedXmr == null || formattedXmr.isEmpty()) return "";
+        BigDecimal amount = new BigDecimal(formattedXmr.replace(" XMR", ""));
+        BigDecimal rounded = amount.setScale(8, RoundingMode.DOWN).stripTrailingZeros();
+        if (amount.signum() != 0 && rounded.signum() == 0) {
+            return amount.signum() > 0 ? "< 0.00000001 XMR" : "> -0.00000001 XMR";
+        }
+        return rounded.setScale(Math.max(2, rounded.scale())).toPlainString() + " XMR";
+    }
+
     public static String formatAmount(Offer offer, CoinFormatter coinFormatter) {
         return offer.isRange()
                 ? HavenoUtils.formatXmr(offer.getMinAmount()) + FormattingUtils.RANGE_SEPARATOR + HavenoUtils.formatXmr(offer.getAmount())
@@ -182,6 +240,12 @@ public class DisplayUtils {
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Other
     ///////////////////////////////////////////////////////////////////////////////////////////
+
+    public static String formatTradePrice(Price price) {
+        return price != null && CurrencyUtil.isFiatCurrency(price.getCurrencyCode())
+                ? FormattingUtils.formatMarketPrice(price.getDoubleValue(), 2)
+                : FormattingUtils.formatPrice(price);
+    }
 
     public static String formatPrice(Price price, Boolean decimalAligned, int maxPlaces) {
         String formattedPrice = FormattingUtils.formatPrice(price);

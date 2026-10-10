@@ -23,13 +23,16 @@ import haveno.core.locale.Res;
 import haveno.core.offer.OfferPayload;
 import haveno.core.offer.OpenOffer;
 import haveno.core.trade.Trade;
+import haveno.core.trade.TradeManager;
 import haveno.core.trade.failed.FailedTradesManager;
 import haveno.desktop.Navigation;
+import haveno.desktop.util.Accessibility;
 import haveno.desktop.common.view.ActivatableView;
 import haveno.desktop.common.view.CachingViewLoader;
 import haveno.desktop.common.view.FxmlView;
 import haveno.desktop.common.view.View;
 import haveno.desktop.main.MainView;
+import haveno.desktop.main.overlays.notifications.NotificationCenter;
 import haveno.desktop.main.overlays.popups.Popup;
 import haveno.desktop.main.portfolio.cloneoffer.CloneOfferView;
 import haveno.desktop.main.portfolio.closedtrades.ClosedTradesView;
@@ -38,17 +41,45 @@ import haveno.desktop.main.portfolio.editoffer.EditOfferView;
 import haveno.desktop.main.portfolio.failedtrades.FailedTradesView;
 import haveno.desktop.main.portfolio.openoffer.OpenOffersView;
 import haveno.desktop.main.portfolio.pendingtrades.PendingTradesView;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import javafx.beans.binding.Bindings;
+import javafx.beans.property.LongProperty;
+import javafx.beans.property.ReadOnlyBooleanProperty;
+import javafx.beans.property.SimpleLongProperty;
 import javafx.beans.value.ChangeListener;
+import javafx.beans.value.ObservableNumberValue;
 import javafx.collections.ListChangeListener;
+import javafx.event.EventHandler;
 import javafx.fxml.FXML;
+import javafx.geometry.Insets;
+import javafx.scene.Node;
+import javafx.scene.control.Label;
+import javafx.scene.control.Separator;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
+import javafx.scene.control.Tooltip;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
+import javafx.scene.layout.VBox;
+import javafx.scene.shape.Circle;
+import javafx.scene.shape.Rectangle;
 import javax.annotation.Nullable;
 
 @FxmlView
-public class PortfolioView extends ActivatableView<TabPane, Void> {
+public class PortfolioView extends ActivatableView<VBox, Void> {
 
+    @FXML
+    TabPane tabPane;
+    @FXML
+    StackPane headerControls, content;
+    @FXML
+    Region navigationSpacer;
+    @FXML
+    Separator headerSeparator;
     @FXML
     Tab openOffersTab, pendingTradesTab, closedTradesTab;
     private Tab editOpenOfferTab, duplicateOfferTab, cloneOpenOfferTab;
@@ -61,7 +92,16 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
     private final CachingViewLoader viewLoader;
     private final Navigation navigation;
     private final FailedTradesManager failedTradesManager;
+    private final TradeManager tradeManager;
+    private final LongProperty numOpenTrades = new SimpleLongProperty();
+    private final Set<Trade> observedTrades = new HashSet<>();
+    private final ListChangeListener<Trade> tradesListChangeListener = change -> UserThread.execute(this::updateOpenTradeCount);
+    private final ChangeListener<Trade.State> tradeStateChangeListener = (observable, oldValue, newValue) ->
+            UserThread.execute(this::updateOpenTradeCount);
+    private boolean active;
+    private final NotificationCenter notificationCenter;
     private EditOfferView editOfferView;
+    private ReadOnlyBooleanProperty editOfferCanceling;
     private DuplicateOfferView duplicateOfferView;
     private CloneOfferView cloneOfferView;
     private boolean editOpenOfferViewOpen, cloneOpenOfferViewOpen;
@@ -70,20 +110,45 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
     private boolean tabListChangeListenerAdded = false;
 
     @Inject
-    public PortfolioView(CachingViewLoader viewLoader, Navigation navigation, FailedTradesManager failedTradesManager) {
+    public PortfolioView(CachingViewLoader viewLoader, Navigation navigation, FailedTradesManager failedTradesManager,
+                         NotificationCenter notificationCenter, TradeManager tradeManager) {
         this.viewLoader = viewLoader;
         this.navigation = navigation;
         this.failedTradesManager = failedTradesManager;
+        this.notificationCenter = notificationCenter;
+        this.tradeManager = tradeManager;
     }
 
     @Override
     public void initialize() {
-        root.setTabClosingPolicy(TabPane.TabClosingPolicy.ALL_TABS);
+        Accessibility.fixTabs(tabPane);
+        tabPane.setTabClosingPolicy(TabPane.TabClosingPolicy.ALL_TABS);
         failedTradesTab.setClosable(false);
 
         openOffersTab.setText(Res.get("portfolio.tab.openOffers"));
         pendingTradesTab.setText(Res.get("portfolio.tab.pendingTrades"));
         closedTradesTab.setText(Res.get("portfolio.tab.history"));
+        setupOpenTradeIndicator();
+        // preserve the tab content's clipping when a view exceeds the available space
+        Rectangle contentClip = new Rectangle();
+        contentClip.widthProperty().bind(content.widthProperty());
+        contentClip.heightProperty().bind(content.heightProperty());
+        content.setClip(contentClip);
+        // retain tab shortcuts from controls hosted outside the tab pane
+        EventHandler<KeyEvent> tabNavigationHandler = event -> {
+            if (event.isControlDown() && !event.isAltDown() && !event.isMetaDown() &&
+                    (event.getCode() == KeyCode.TAB || (!event.isShiftDown() &&
+                            (event.getCode() == KeyCode.PAGE_UP || event.getCode() == KeyCode.PAGE_DOWN)))) {
+                tabPane.fireEvent(event.copyFor(tabPane, tabPane));
+                event.consume();
+            }
+        };
+        content.addEventHandler(KeyEvent.KEY_PRESSED, tabNavigationHandler);
+        headerControls.addEventHandler(KeyEvent.KEY_PRESSED, tabNavigationHandler);
+        headerControls.setVisible(false);
+        headerControls.managedProperty().bind(headerControls.visibleProperty());
+        headerSeparator.visibleProperty().bind(headerControls.visibleProperty());
+        headerSeparator.managedProperty().bind(headerControls.visibleProperty());
 
         navigationListener = (viewPath, data) -> {
             if (viewPath.size() == 3 && viewPath.indexOf(PortfolioView.class) == 1)
@@ -91,6 +156,18 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
         };
 
         tabChangeListener = (ov, oldValue, newValue) -> {
+            if (oldValue != null && oldValue == editOpenOfferTab && editOfferView != null)
+                editOfferView.onTabSelected(false);
+            if (oldValue != null && oldValue == duplicateOfferTab)
+                duplicateOfferView.onTabSelected(false);
+            if (oldValue != null && oldValue == cloneOpenOfferTab)
+                cloneOfferView.onTabSelected(false);
+
+            // let the removal listener return directly to open offers without loading the neighboring tab
+            if (oldValue != null && oldValue == editOpenOfferTab && !tabPane.getTabs().contains(oldValue)) return;
+            // navigation has already loaded the tab before selecting it
+            if (newValue == currentTab) return;
+
             if (newValue == openOffersTab)
                 navigation.navigateTo(MainView.class, PortfolioView.class, OpenOffersView.class);
             else if (newValue == pendingTradesTab)
@@ -107,13 +184,6 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
                 navigation.navigateTo(MainView.class, PortfolioView.class, CloneOfferView.class);
             }
 
-            if (oldValue != null && oldValue == editOpenOfferTab)
-                editOfferView.onTabSelected(false);
-            if (oldValue != null && oldValue == duplicateOfferTab)
-                duplicateOfferView.onTabSelected(false);
-            if (oldValue != null && oldValue == cloneOpenOfferTab)
-                cloneOfferView.onTabSelected(false);
-
         };
 
         tabListChangeListener = change -> {
@@ -128,9 +198,90 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
         };
     }
 
+    public void reserveNavigationWidth(ObservableNumberValue width) {
+        navigationSpacer.prefWidthProperty().bind(width);
+    }
+
+    private void setupOpenTradeIndicator() {
+        Label count = new Label();
+        count.getStyleClass().add("pending-trades-count");
+        count.textProperty().bind(numOpenTrades.asString());
+        StackPane countContainer = new StackPane(count);
+        countContainer.setPadding(new Insets(0, 0, 0, 8));
+        countContainer.setMouseTransparent(true);
+
+        Circle countDot = new Circle(4);
+        countDot.getStyleClass().add("tab-unread-dot");
+        countDot.setManaged(false);
+        countDot.visibleProperty().bind(notificationCenter.unreadPortfolioProperty());
+        countDot.centerXProperty().bind(count.layoutXProperty().add(count.widthProperty()));
+        countDot.centerYProperty().bind(count.layoutYProperty());
+        countContainer.getChildren().add(countDot);
+
+        Circle dot = new Circle(4);
+        dot.getStyleClass().add("tab-unread-dot");
+        dot.setManaged(false);
+        dot.visibleProperty().bind(notificationCenter.unreadPortfolioProperty());
+
+        // use the existing right padding without changing the tab's width
+        StackPane indicator = new StackPane(dot) {
+            @Override
+            protected void layoutChildren() {
+                super.layoutChildren();
+                Node label = getParent() == null ? null : getParent().lookup(".text");
+                if (label != null) {
+                    dot.centerXProperty().bind(Bindings.createDoubleBinding(
+                            () -> parentToLocal(label.localToParent(label.getLayoutBounds())).getMaxX() + 8,
+                            label.layoutBoundsProperty(), label.localToParentTransformProperty(), localToParentTransformProperty()));
+                    dot.centerYProperty().bind(Bindings.createDoubleBinding(
+                            () -> parentToLocal(label.localToParent(label.getLayoutBounds())).getMinY(),
+                            label.layoutBoundsProperty(), label.localToParentTransformProperty(), localToParentTransformProperty()));
+                }
+            }
+        };
+        indicator.setMinSize(0, 0);
+        indicator.setPrefSize(0, 0);
+        indicator.setMaxSize(0, 0);
+        indicator.setMouseTransparent(true);
+        pendingTradesTab.graphicProperty().bind(Bindings.when(numOpenTrades.greaterThan(0))
+                .then(countContainer).otherwise(indicator));
+        pendingTradesTab.getStyleClass().add("unread-trade-chat-tab");
+
+        Tooltip tooltip = new Tooltip(Res.get("notification.trade.unreadUpdates"));
+        Runnable updateHelp = () -> {
+            boolean unread = notificationCenter.unreadPortfolioProperty().get();
+            pendingTradesTab.setTooltip(unread ? tooltip : null);
+            Node header = tabPane.lookup(".unread-trade-chat-tab");
+            String help = numOpenTrades.get() > 0 ? pendingTradesTab.getText() + ": " + numOpenTrades.get() : null;
+            if (unread) help = help == null ? tooltip.getText() : help + ". " + tooltip.getText();
+            if (header != null) header.setAccessibleHelp(help);
+        };
+        tabPane.skinProperty().addListener((observable, oldValue, newValue) -> UserThread.execute(updateHelp));
+        notificationCenter.unreadPortfolioProperty().addListener((observable, oldValue, newValue) -> updateHelp.run());
+        numOpenTrades.addListener((observable, oldValue, newValue) -> updateHelp.run());
+        updateHelp.run();
+    }
+
+    private void updateOpenTradeCount() {
+        if (!active) return;
+        synchronized (tradeManager.getObservableList()) {
+            observedTrades.removeIf(trade -> {
+                if (tradeManager.getObservableList().contains(trade)) return false;
+                trade.stateProperty().removeListener(tradeStateChangeListener);
+                return true;
+            });
+            for (Trade trade : tradeManager.getObservableList()) {
+                if (observedTrades.add(trade)) trade.stateProperty().addListener(tradeStateChangeListener);
+            }
+            // match the unfiltered table even while another portfolio tab is selected
+            numOpenTrades.set(tradeManager.getObservableList().stream().filter(Trade::isDepositsPublished).count());
+        }
+    }
+
     private void onEditOpenOfferRemoved() {
         editOpenOfferViewOpen = false;
         if (editOfferView != null) {
+            editOfferCanceling = editOfferView.cancelingProperty();
             editOfferView.onClose();
             editOfferView = null;
         }
@@ -159,37 +310,40 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
 
     @Override
     protected void activate() {
+        active = true;
+        tradeManager.getObservableList().addListener(tradesListChangeListener);
+        updateOpenTradeCount();
         failedTradesManager.getObservableList().addListener((ListChangeListener<Trade>) c -> {
             UserThread.execute(() -> {
-                if (failedTradesManager.getObservableList().size() > 0 && root.getTabs().size() == 3)
-                    root.getTabs().add(failedTradesTab);
+                if (failedTradesManager.getObservableList().size() > 0 && tabPane.getTabs().size() == 3)
+                    tabPane.getTabs().add(failedTradesTab);
             });
         });
-        if (failedTradesManager.getObservableList().size() > 0 && root.getTabs().size() == 3)
-            root.getTabs().add(failedTradesTab);
+        if (failedTradesManager.getObservableList().size() > 0 && tabPane.getTabs().size() == 3)
+            tabPane.getTabs().add(failedTradesTab);
 
-        root.getSelectionModel().selectedItemProperty().addListener(tabChangeListener);
+        tabPane.getSelectionModel().selectedItemProperty().addListener(tabChangeListener);
         if (!tabListChangeListenerAdded) {
-            root.getTabs().addListener(tabListChangeListener);
+            tabPane.getTabs().addListener(tabListChangeListener);
             tabListChangeListenerAdded = true; // add listener only once
         }
         navigation.addListener(navigationListener);
 
-        if (root.getSelectionModel().getSelectedItem() == openOffersTab)
+        if (tabPane.getSelectionModel().getSelectedItem() == openOffersTab)
             navigation.navigateTo(MainView.class, PortfolioView.class, OpenOffersView.class);
-        else if (root.getSelectionModel().getSelectedItem() == pendingTradesTab)
+        else if (tabPane.getSelectionModel().getSelectedItem() == pendingTradesTab)
             navigation.navigateTo(MainView.class, PortfolioView.class, PendingTradesView.class);
-        else if (root.getSelectionModel().getSelectedItem() == closedTradesTab)
+        else if (tabPane.getSelectionModel().getSelectedItem() == closedTradesTab)
             navigation.navigateTo(MainView.class, PortfolioView.class, ClosedTradesView.class);
-        else if (root.getSelectionModel().getSelectedItem() == failedTradesTab)
+        else if (tabPane.getSelectionModel().getSelectedItem() == failedTradesTab)
             navigation.navigateTo(MainView.class, PortfolioView.class, FailedTradesView.class);
-        else if (root.getSelectionModel().getSelectedItem() == editOpenOfferTab) {
+        else if (tabPane.getSelectionModel().getSelectedItem() == editOpenOfferTab) {
             navigation.navigateTo(MainView.class, PortfolioView.class, EditOfferView.class);
             if (editOfferView != null) editOfferView.onTabSelected(true);
-        } else if (root.getSelectionModel().getSelectedItem() == duplicateOfferTab) {
+        } else if (tabPane.getSelectionModel().getSelectedItem() == duplicateOfferTab) {
             navigation.navigateTo(MainView.class, PortfolioView.class, DuplicateOfferView.class);
             if (duplicateOfferView != null) duplicateOfferView.onTabSelected(true);
-        } else if (root.getSelectionModel().getSelectedItem() == cloneOpenOfferTab) {
+        } else if (tabPane.getSelectionModel().getSelectedItem() == cloneOpenOfferTab) {
             navigation.navigateTo(MainView.class, PortfolioView.class, CloneOfferView.class);
             if (cloneOfferView != null) cloneOfferView.onTabSelected(true);
         }
@@ -197,15 +351,24 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
 
     @Override
     protected void deactivate() {
-        root.getSelectionModel().selectedItemProperty().removeListener(tabChangeListener);
+        active = false;
+        tradeManager.getObservableList().removeListener(tradesListChangeListener);
+        observedTrades.forEach(trade -> trade.stateProperty().removeListener(tradeStateChangeListener));
+        observedTrades.clear();
+        tabPane.getSelectionModel().selectedItemProperty().removeListener(tabChangeListener);
         navigation.removeListener(navigationListener);
         currentTab = null;
     }
 
     private void loadView(Class<? extends View> viewClass, @Nullable Object data) {
+        if (viewClass == EditOfferView.class && editOfferCanceling != null && editOfferCanceling.get()) {
+            navigation.navigateTo(MainView.class, PortfolioView.class, OpenOffersView.class);
+            return;
+        }
 
-        // nullify current tab to trigger activate/deactivate
-        if (currentTab != null) currentTab.setContent(null);
+        // keep pending trade details attached when a notification targets the active tab
+        if (currentTab != null && (viewClass != PendingTradesView.class || currentTab != pendingTradesTab))
+            content.getChildren().clear();
 
         View view = viewLoader.load(viewClass);
 
@@ -225,11 +388,11 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
                 if (editOfferView == null) {
                     editOfferView = (EditOfferView) view;
                     editOfferView.applyOpenOffer(openOffer);
-                    editOpenOfferTab = new Tab(Res.get("portfolio.tab.editOpenOffer").toUpperCase());
+                    editOpenOfferTab = new Tab(Res.get("portfolio.tab.editOpenOffer"));
                     editOfferView.setCloseHandler(() -> {
-                        UserThread.execute(() -> root.getTabs().remove(editOpenOfferTab));
+                        UserThread.execute(() -> tabPane.getTabs().remove(editOpenOfferTab));
                     });
-                    root.getTabs().add(editOpenOfferTab);
+                    tabPane.getTabs().add(editOpenOfferTab);
                 }
                 if (currentTab != editOpenOfferTab)
                     editOfferView.onTabSelected(true);
@@ -245,11 +408,11 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
                 view = viewLoader.load(viewClass);      // and load a fresh one
                 duplicateOfferView = (DuplicateOfferView) view;
                 duplicateOfferView.initWithData((OfferPayload) data);
-                duplicateOfferTab = new Tab(Res.get("portfolio.tab.duplicateOffer").toUpperCase());
+                duplicateOfferTab = new Tab(Res.get("portfolio.tab.duplicateOffer"));
                 duplicateOfferView.setCloseHandler(() -> {
-                    UserThread.execute(() -> root.getTabs().remove(duplicateOfferTab));
+                    UserThread.execute(() -> tabPane.getTabs().remove(duplicateOfferTab));
                 });
-                root.getTabs().add(duplicateOfferTab);
+                tabPane.getTabs().add(duplicateOfferTab);
             }
             if (duplicateOfferView != null) {
                 if (currentTab != duplicateOfferTab)
@@ -267,11 +430,11 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
                 if (cloneOfferView == null) {
                     cloneOfferView = (CloneOfferView) view;
                     cloneOfferView.applyOpenOffer(openOffer);
-                    cloneOpenOfferTab = new Tab(Res.get("portfolio.tab.cloneOpenOffer").toUpperCase());
+                    cloneOpenOfferTab = new Tab(Res.get("portfolio.tab.cloneOpenOffer"));
                     cloneOfferView.setCloseHandler(() -> {
-                        root.getTabs().remove(cloneOpenOfferTab);
+                        tabPane.getTabs().remove(cloneOpenOfferTab);
                     });
-                    root.getTabs().add(cloneOpenOfferTab);
+                    tabPane.getTabs().add(cloneOpenOfferTab);
                 }
                 if (currentTab != cloneOpenOfferTab)
                     cloneOfferView.onTabSelected(true);
@@ -283,15 +446,33 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
             }
         }
 
-        currentTab.setContent(view.getRoot());
-        root.getSelectionModel().select(currentTab);
+        Region controls = null;
+        if (view instanceof OpenOffersView openOffers) controls = openOffers.getHeaderControls();
+        else if (view instanceof PendingTradesView pendingTrades) controls = pendingTrades.getHeaderControls();
+        else if (view instanceof ClosedTradesView closedTrades) controls = closedTrades.getHeaderControls();
+        else if (view instanceof FailedTradesView failedTrades) controls = failedTrades.getHeaderControls();
+        if (controls == null) headerControls.getChildren().clear();
+        else if (!headerControls.getChildren().contains(controls)) headerControls.getChildren().setAll(controls);
+        headerControls.setVisible(controls != null);
+
+        Node viewRoot = view.getRoot();
+        // retain the scene attachment when a notification targets the currently visible trade
+        if (!content.getChildren().contains(viewRoot)) content.getChildren().setAll(viewRoot);
+        tabPane.getSelectionModel().select(currentTab);
+        if (view instanceof PendingTradesView pendingTradesView) {
+            if (data instanceof PendingTradesView.OpenChatRequest request) pendingTradesView.selectTrade(request.trade(), true);
+            else if (data instanceof Trade trade) pendingTradesView.selectTrade(trade);
+        }
     }
 
     private void selectOpenOffersView(OpenOffersView view) {
         openOffersView = view;
         currentTab = openOffersTab;
+        // keep the cancellation guard on the cached offer view
+        if (editOfferCanceling != null) view.getRoot().disableProperty().bind(editOfferCanceling);
 
         EditOpenOfferHandler editOpenOfferHandler = openOffer -> {
+            if (editOfferCanceling != null && editOfferCanceling.get()) return;
             if (!editOpenOfferViewOpen) {
                 editOpenOfferViewOpen = true;
                 PortfolioView.this.openOffer = openOffer;
@@ -322,4 +503,3 @@ public class PortfolioView extends ActivatableView<TabPane, Void> {
         void onCloneOpenOffer(OpenOffer openOffer);
     }
 }
-

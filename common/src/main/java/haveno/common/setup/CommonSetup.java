@@ -18,6 +18,7 @@
 package haveno.common.setup;
 
 import ch.qos.logback.classic.Level;
+import com.sun.management.HotSpotDiagnosticMXBean;
 import haveno.common.UserThread;
 import haveno.common.app.AsciiLogo;
 import haveno.common.app.DevEnv;
@@ -31,15 +32,42 @@ import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.bitcoinj.store.BlockStoreException;
 import sun.misc.Signal;
 
+import java.lang.management.ManagementFactory;
 import java.net.URISyntaxException;
 import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 public class CommonSetup {
+    private static final int SHUTDOWN_WATCHDOG_MINUTES = 4;
+    private static final AtomicBoolean exitScheduled = new AtomicBoolean();
+    private static final AtomicBoolean shutdownWatchdogStarted = new AtomicBoolean();
+    private static final AtomicBoolean shutdownHookRunning = new AtomicBoolean();
+    private static final AtomicBoolean pipelineDisposedNpeLogged = new AtomicBoolean();
+    private static volatile Thread shutdownHook;
+
+    // throttle repeated exceptions per throw site so a hot loop cannot fill the logs:
+    // full handling for the first occurrences, then one sampled occurrence per interval
+    private static final int DETAILED_LOGS_PER_THROW_SITE = 3;
+    private static final long THROTTLED_SAMPLE_INTERVAL_NS = TimeUnit.SECONDS.toNanos(10);
+    private static final int MAX_TRACKED_THROW_SITES = 1000;
+    private static final int MAX_CAUSE_DEPTH = 10;
+    private static final int MAX_SIGNATURE_FRAMES = 8;
+    private static final ConcurrentHashMap<String, RepeatedThrow> repeatedThrows = new ConcurrentHashMap<>();
+
+    private static class RepeatedThrow {
+        final AtomicLong count = new AtomicLong();
+        final AtomicLong lastSampleNs = new AtomicLong(System.nanoTime() - THROTTLED_SAMPLE_INTERVAL_NS); // first sample due immediately
+    }
 
     public static void setup(Config config, GracefulShutDownHandler gracefulShutDownHandler) {
         setupLog(config);
+        setupHeapDump(config);
         AsciiLogo.showAsciiLogo();
         Version.setBaseCryptoNetworkId(config.baseCurrencyNetwork.ordinal());
         Version.printVersion();
@@ -47,13 +75,17 @@ public class CommonSetup {
         Profiler.printSystemLoad();
 
         setSystemProperties();
-        setupSigIntHandlers(gracefulShutDownHandler);
+        setupShutdownHandler(gracefulShutDownHandler);
 
         DevEnv.setup(config);
     }
 
     public static void printSystemLoadPeriodically(int delayMin) {
         UserThread.runPeriodically(Profiler::printSystemLoad, delayMin, TimeUnit.MINUTES);
+    }
+
+    public static void warnOnHighMemoryUsagePeriodically(int delaySec) {
+        Profiler.warnOnHighMemoryUsagePeriodically(delaySec, TimeUnit.SECONDS);
     }
 
     public static void setupUncaughtExceptionHandler(UncaughtExceptionHandler uncaughtExceptionHandler) {
@@ -68,8 +100,24 @@ public class CommonSetup {
             } else if (throwable instanceof UnsupportedOperationException &&
                     "The system tray is not supported on the current platform.".equals(throwable.getMessage())) {
                 log.warn(throwable.getMessage());
+            } else if (throwable instanceof IndexOutOfBoundsException && Arrays.stream(throwable.getStackTrace())
+                    .anyMatch(element -> element.getClassName().startsWith("com.sun.glass.ui.mac.MacAccessible"))) {
+                log.warn("Ignoring JavaFX macOS accessibility bug (JDK-8235989): {}", throwable.getMessage());
+            } else if (throwable instanceof NullPointerException && isShutdownInProgress() && throwable.getMessage() != null &&
+                    throwable.getMessage().contains("\"com.sun.prism.GraphicsPipeline.getPipeline()\" is null") &&
+                    Arrays.stream(throwable.getStackTrace())
+                            .anyMatch(element -> element.getClassName().equals("com.sun.javafx.tk.quantum.QuantumToolkit") && element.getMethodName().equals("isSupported"))) {
+                if (pipelineDisposedNpeLogged.compareAndSet(false, true))
+                    log.warn("Ignoring JavaFX input events delivered after graphics pipeline disposal on shutdown: {}", throwable.getMessage());
             } else {
-                log.error("Uncaught Exception from thread {}, throwableClass={}, throwableMessage={}", Thread.currentThread().getName(), throwable.getClass(), throwable.getMessage());
+                RepeatedThrow repeat = trackThrowSite(throwable);
+                long count = repeat.count.incrementAndGet();
+                if (count > DETAILED_LOGS_PER_THROW_SITE && !sampleDue(repeat)) return;
+                if (count <= DETAILED_LOGS_PER_THROW_SITE) {
+                    log.error("Uncaught Exception from thread {}, throwableClass={}, throwableMessage={}", Thread.currentThread().getName(), throwable.getClass(), throwable.getMessage());
+                } else {
+                    log.error("Uncaught Exception from thread {} repeated {} times, throwableClass={}, throwableMessage={}", Thread.currentThread().getName(), count, throwable.getClass(), throwable.getMessage());
+                }
                 log.error("Stack trace:\n" + ExceptionUtils.getStackTrace(throwable));
                 throwable.printStackTrace();
                 UserThread.execute(() -> uncaughtExceptionHandler.handleUncaughtException(throwable, false));
@@ -79,6 +127,45 @@ public class CommonSetup {
         Thread.currentThread().setUncaughtExceptionHandler(handler);
     }
 
+    // true once application exit is requested or the JVM shutdown hook has started
+    private static boolean isShutdownInProgress() {
+        return exitScheduled.get() || shutdownWatchdogStarted.get() || shutdownHookRunning.get();
+    }
+
+    private static RepeatedThrow trackThrowSite(Throwable throwable) {
+        String site = throwSite(throwable);
+        RepeatedThrow repeat = repeatedThrows.get(site);
+        if (repeat != null) return repeat;
+        if (repeatedThrows.size() >= MAX_TRACKED_THROW_SITES) site = "overflow"; // hard cap on memory
+        return repeatedThrows.computeIfAbsent(site, key -> new RepeatedThrow());
+    }
+
+    private static boolean sampleDue(RepeatedThrow repeat) {
+        long now = System.nanoTime(); // monotonic, immune to wall clock changes
+        long last = repeat.lastSampleNs.get();
+        return now - last >= THROTTLED_SAMPLE_INTERVAL_NS && repeat.lastSampleNs.compareAndSet(last, now);
+    }
+
+    // identifies a throw site by exception class, top frame and a bounded stack signature
+    // through the cause chain, excluding messages so variable text cannot defeat the throttle
+    static String throwSite(Throwable throwable) {
+        StringBuilder site = new StringBuilder();
+        for (int depth = 0; throwable != null && depth < MAX_CAUSE_DEPTH; throwable = throwable.getCause(), depth++) {
+            if (depth > 0) site.append(" < ");
+            site.append(throwable.getClass().getName());
+            StackTraceElement[] trace = throwable.getStackTrace();
+            if (trace.length > 0) site.append(" at ").append(trace[0]).append('#').append(stackSignature(trace));
+        }
+        return site.toString();
+    }
+
+    // hash of the first frames so different callers of a shared throw helper get distinct buckets
+    private static String stackSignature(StackTraceElement[] trace) {
+        int hash = 1;
+        for (int i = 0; i < trace.length && i < MAX_SIGNATURE_FRAMES; i++) hash = 31 * hash + trace[i].hashCode();
+        return Integer.toHexString(hash);
+    }
+
     private static void setupLog(Config config) {
         String logPath = Paths.get(config.appDataDir.getPath(), "haveno").toString();
         Log.setup(logPath);
@@ -86,23 +173,112 @@ public class CommonSetup {
         Log.setLevel(Level.toLevel(config.logLevel));
     }
 
+    static void setupHeapDump(Config config) {
+        if (!config.dumpHeapOnOutOfMemoryError) return;
+
+        try {
+            String dumpPath = config.appDataDir.toPath().resolve("haveno-" + ProcessHandle.current().pid() +
+                    "-" + System.currentTimeMillis() + ".hprof").toAbsolutePath().toString();
+            HotSpotDiagnosticMXBean diagnostics = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+            // configure the JVM before loading application data; ExitOnOutOfMemoryError bypasses shutdown hooks
+            diagnostics.setVMOption("HeapDumpPath", dumpPath);
+            diagnostics.setVMOption("HeapDumpOnOutOfMemoryError", "true");
+            log.warn("Heap dump on out-of-memory enabled: {}. Dumps may contain wallet keys, passwords and other " +
+                    "private data, and require substantial disk space. Do not share them publicly.", dumpPath);
+        } catch (RuntimeException e) {
+            log.warn("Could not enable heap dump on out-of-memory", e);
+        }
+    }
+
     protected static void setSystemProperties() {
         if (Utilities.isLinux())
             System.setProperty("prism.lcdtext", "false");
     }
 
-    protected static void setupSigIntHandlers(GracefulShutDownHandler gracefulShutDownHandler) {
-        Signal.handle(new Signal("INT"), signal -> {
-            log.info("Received {}", signal);
-            UserThread.execute(() -> gracefulShutDownHandler.gracefulShutDown(() -> {
-            }));
-        });
+    protected static void setupShutdownHandler(GracefulShutDownHandler gracefulShutDownHandler) {
+        // handle INT and TERM before the JVM shutdown sequence starts, as concurrent shutdown hooks
+        // tear down JavaFX and the UserThread then silently drops the graceful shutdown task
+        for (String signalName : new String[]{"INT", "TERM"}) {
+            Signal.handle(new Signal(signalName), signal -> {
+                log.info("Received {}", signal);
+                startShutdownWatchdog();
+                UserThread.execute(() -> gracefulShutDownHandler.gracefulShutDown(() -> {
+                }));
+            });
+        }
 
-        Signal.handle(new Signal("TERM"), signal -> {
-            log.info("Received {}", signal);
-            UserThread.execute(() -> gracefulShutDownHandler.gracefulShutDown(() -> {
-            }));
-        });
+        // fallback for termination paths which bypass the signal handlers, e.g. System.exit
+        // setup re-runs on in-process restart, so replace any hook of the previous executable
+        removeShutdownHook();
+        Thread hook = new Thread(() -> {
+            try {
+                shutdownHookRunning.set(true);
+                var countDownLatch = new CountDownLatch(1);
+                UserThread.execute(() ->
+                        gracefulShutDownHandler.gracefulShutDown(countDownLatch::countDown));
+                //noinspection ResultOfMethodCallIgnored
+                countDownLatch.await(2, TimeUnit.MINUTES);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }, "HavenoShutdownHook");
+        Runtime.getRuntime().addShutdownHook(hook);
+        shutdownHook = hook;
+    }
+
+    // Halts the process if graceful shutdown for application exit does not complete in time.
+    // Applies to UI requests and signals which do not trigger the JVM shutdown sequence.
+    public static void startShutdownWatchdog() {
+        if (!shutdownWatchdogStarted.compareAndSet(false, true)) {
+            return;
+        }
+
+        Thread watchdog = new Thread(() -> {
+            try {
+                TimeUnit.MINUTES.sleep(SHUTDOWN_WATCHDOG_MINUTES);
+            } catch (InterruptedException e) {
+                return;
+            }
+            log.warn("Graceful shutdown did not complete within {} minutes, halting", SHUTDOWN_WATCHDOG_MINUTES);
+            Runtime.getRuntime().halt(1);
+        }, "HavenoShutdownWatchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
+    // Terminates the process after an application-initiated graceful shutdown. Removes the shutdown hook first,
+    // as re-running it waits on the UserThread while System.exit waits on the hook, which can deadlock.
+    public static void exitAfter(int status, long delay, TimeUnit timeUnit) {
+        if (!exitScheduled.compareAndSet(false, true)) {
+            return;
+        }
+
+        removeShutdownHook();
+        Thread exitThread = new Thread(() -> {
+            try {
+                timeUnit.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            System.exit(status);
+        }, "HavenoExit");
+        exitThread.setDaemon(false);
+        exitThread.start();
+    }
+
+    static boolean removeShutdownHook() {
+        Thread hook = shutdownHook;
+        shutdownHook = null;
+        if (hook == null) {
+            return false;
+        }
+
+        try {
+            return Runtime.getRuntime().removeShutdownHook(hook);
+        } catch (IllegalStateException | SecurityException ignored) {
+            // The JVM is already shutting down, or its security policy does not permit removal.
+            return false;
+        }
     }
 
     protected static void maybePrintPathOfCodeSource() {

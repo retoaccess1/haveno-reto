@@ -73,7 +73,10 @@ public class Offer implements NetworkPayload, PersistablePayload {
     private final static double PRICE_TOLERANCE = 0.005;
 
     public static final String TRADE_PRICE_OUT_OF_TOLERANCE_MSG = "Trade price is too far away from our calculated offer price based on the market price.";
+    // Keep this wording stable because peers match it to preserve offers.
     public static final String MARKET_PRICE_NOT_AVAILABLE_MSG = "Market price required for calculating trade price is not available.";
+    public static final String PRICE_NOT_AVAILABLE_MSG = "The offer price is currently unavailable.";
+    public static final String OFFER_UNAVAILABLE_MSG = "is already taken or unavailable";
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Enums
@@ -204,6 +207,7 @@ public class Offer implements NetworkPayload, PersistablePayload {
                         CryptoMoney.SMALLEST_UNIT_EXPONENT;
                 double scaled = MathUtils.scaleUpByPowerOf10(targetPriceAsDouble, precision);
                 final long roundedToLong = MathUtils.roundDoubleToLong(scaled);
+                if (roundedToLong <= 0) return null;
                 return Price.valueOf(counterCurrencyCode, roundedToLong);
             } catch (Exception e) {
                 log.error("Exception at getPrice / parseToFiat: " + e + "\n" +
@@ -223,6 +227,15 @@ public class Offer implements NetworkPayload, PersistablePayload {
 
     public void verifyTradePrice(long price) throws TradePriceOutOfToleranceException,
             MarketPriceNotAvailableException, IllegalArgumentException {
+        verifyTradePrice(price, false);
+    }
+
+    public void verifyTradePrice(long price, boolean refreshPriceOnFailure) throws TradePriceOutOfToleranceException,
+            MarketPriceNotAvailableException, IllegalArgumentException {
+        checkArgument(price > 0, "tradePrice must be positive");
+        Price tradePrice = Price.valueOf(getCounterCurrencyCode(), price);
+        Volume minVolume = VolumeUtil.getAdjustedVolume(tradePrice.getVolumeByAmount(getMinAmount()), getPaymentMethodId());
+        checkArgument(minVolume.getValue() > 0, "Trade payment amount must not round to zero");
         if (!isUseMarketBasedPrice()) {
             checkArgument(price == getFixedPrice(),
                     "Takers price does not match offer price. " +
@@ -230,12 +243,9 @@ public class Offer implements NetworkPayload, PersistablePayload {
             return;
         }
 
-        Price tradePrice = Price.valueOf(getCounterCurrencyCode(), price);
         Price offerPrice = getPrice();
         if (offerPrice == null)
             throw new MarketPriceNotAvailableException(MARKET_PRICE_NOT_AVAILABLE_MSG);
-
-        checkArgument(price > 0, "tradePrice must be positive");
 
         double relation = (double) price / (double) offerPrice.getValue();
         double deviation = Math.abs(1 - relation);
@@ -243,6 +253,19 @@ public class Offer implements NetworkPayload, PersistablePayload {
                 getShortId(), getCounterCurrencyCode(), price, offerPrice.getValue(),
                 deviation * 100 + "%");
         if (deviation > PRICE_TOLERANCE) {
+
+            // refresh market prices and re-verify once, since cached price can lag the peer's
+            if (refreshPriceOnFailure) {
+                log.warn("Trade price is out of tolerance, refreshing market prices and re-verifying. offerId={}", getShortId());
+                try {
+                    priceFeedService.requestAllPrices();
+                } catch (Exception e) {
+                    log.warn("Error refreshing market prices to re-verify trade price for offer {}: {}", getShortId(), e.getMessage());
+                }
+                verifyTradePrice(price, false);
+                return;
+            }
+
             String msg = TRADE_PRICE_OUT_OF_TOLERANCE_MSG + "\n" +
                     "tradePrice=" + tradePrice.getValue() + "\n" +
                     "offerPrice=" + offerPrice.getValue();
@@ -451,6 +474,8 @@ public class Offer implements NetworkPayload, PersistablePayload {
             return getExtraDataMap().get(OfferPayload.CASHAPP_EXTRA_INFO);
         else if (getExtraDataMap() != null && getExtraDataMap().containsKey(OfferPayload.CASH_AT_ATM_EXTRA_INFO))
             return getExtraDataMap().get(OfferPayload.CASH_AT_ATM_EXTRA_INFO);
+        else if (getExtraDataMap() != null && getExtraDataMap().containsKey(OfferPayload.BLIK_EXTRA_INFO))
+            return getExtraDataMap().get(OfferPayload.BLIK_EXTRA_INFO);
         else
             return "";
     }
@@ -458,8 +483,11 @@ public class Offer implements NetworkPayload, PersistablePayload {
     public String getPaymentMethodNameWithCountryCode() {
         String method = this.getPaymentMethod().getShortName();
         String methodCountryCode = this.getCountryCode();
-        if (methodCountryCode != null)
-            method = method + " (" + methodCountryCode + ")";
+        if (methodCountryCode != null) {
+            String countrySuffix = " (" + methodCountryCode + ")";
+            if (!method.endsWith(countrySuffix))
+                method += countrySuffix;
+        }
         return method;
     }
 

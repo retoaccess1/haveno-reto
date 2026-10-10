@@ -108,16 +108,15 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     protected final OfferUtil offerUtil;
 
     private String amountDescription;
-    private String addressAsString;
     private final String paymentLabel;
     private boolean createOfferInProgress;
     public boolean createOfferCanceled;
 
     public final StringProperty amount = new SimpleStringProperty();
     public final StringProperty minAmount = new SimpleStringProperty();
-    protected final StringProperty securityDeposit = new SimpleStringProperty();
-    final StringProperty securityDepositInXMR = new SimpleStringProperty();
-    final StringProperty securityDepositLabel = new SimpleStringProperty();
+    public final StringProperty securityDeposit = new SimpleStringProperty();
+    public final StringProperty minSecurityDepositMessage = new SimpleStringProperty();
+    public final StringProperty securityDepositLabel = new SimpleStringProperty();
 
     // Price in the viewModel is always dependent on fiat/crypto: Fiat Fiat/BTC, for cryptos we use inverted price.
     // The domain (dataModel) uses always the same price model (otherCurrencyBTC)
@@ -154,11 +153,12 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     final BooleanProperty showPayFundsScreenDisplayed = new SimpleBooleanProperty();
     private final BooleanProperty showTransactionPublishedScreen = new SimpleBooleanProperty();
     final BooleanProperty isWaitingForFunds = new SimpleBooleanProperty();
-    final BooleanProperty isMinSecurityDeposit = new SimpleBooleanProperty();
+    public final BooleanProperty isMinSecurityDeposit = new SimpleBooleanProperty();
 
     final ObjectProperty<InputValidator.ValidationResult> amountValidationResult = new SimpleObjectProperty<>();
     final ObjectProperty<InputValidator.ValidationResult> minAmountValidationResult = new SimpleObjectProperty<>();
     final ObjectProperty<InputValidator.ValidationResult> priceValidationResult = new SimpleObjectProperty<>();
+    final ObjectProperty<InputValidator.ValidationResult> marketPriceMarginValidationResult = new SimpleObjectProperty<>(new InputValidator.ValidationResult(true));
     final ObjectProperty<InputValidator.ValidationResult> triggerPriceValidationResult = new SimpleObjectProperty<>(new InputValidator.ValidationResult(true));
     final ObjectProperty<InputValidator.ValidationResult> volumeValidationResult = new SimpleObjectProperty<>();
     final ObjectProperty<InputValidator.ValidationResult> securityDepositValidationResult = new SimpleObjectProperty<>();
@@ -183,7 +183,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     protected Offer offer;
     private boolean inputIsMarketBasedPrice;
     private ChangeListener<Boolean> useMarketBasedPriceListener;
-    private boolean ignorePriceStringListener, ignoreVolumeStringListener, ignoreAmountStringListener, ignoreSecurityDepositStringListener;
+    private boolean ignorePriceStringListener, ignoreVolumeStringListener, ignoreAmountStringListener, ignoreSecurityDepositStringListener, ignoreMarketPriceMarginStringListener;
     private MarketPrice marketPrice;
     final IntegerProperty marketPriceAvailableProperty = new SimpleIntegerProperty(-1);
     private ChangeListener<Number> currenciesUpdateListener;
@@ -247,6 +247,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         addBindings();
         addListeners();
 
+        updateSecurityDeposit();
         updateButtonDisableState();
 
         updateMarketPriceAvailable();
@@ -300,6 +301,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         amountStringListener = (ov, oldValue, newValue) -> {
             if (!ignoreAmountStringListener) {
                 if (isXmrInputValid(newValue).isValid) {
+                    applyMarketPriceIfMarginUntouched();
                     setAmountToModel();
                     dataModel.calculateVolume();
                     dataModel.calculateTotalToPay();
@@ -346,15 +348,15 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
             updateButtonDisableState();
         };
         marketPriceMarginStringListener = (ov, oldValue, newValue) -> {
-            if (inputIsMarketBasedPrice) {
+            if (!ignoreMarketPriceMarginStringListener && inputIsMarketBasedPrice) {
                 try {
                     if (!newValue.isEmpty() && !newValue.equals("-")) {
                         double percentage = ParsingUtils.parsePercentStringToDouble(newValue);
-                        if (percentage >= 1 || percentage <= -1) {
-                            new Popup().warning(Res.get("popup.warning.tooLargePercentageValue") + "\n" +
-                                            Res.get("popup.warning.examplePercentageValue"))
-                                    .show();
+                        if (!OfferRestrictions.isValidMarketPriceMargin(dataModel.getDirection(), percentage)) {
+                            marketPriceMarginValidationResult.set(new InputValidator.ValidationResult(false,
+                                    Res.get("popup.warning.tooLargePercentageValue")));
                         } else {
+                            marketPriceMarginValidationResult.set(new InputValidator.ValidationResult(true));
                             final String currencyCode = dataModel.getTradeCurrencyCode().get();
                             MarketPrice marketPrice = priceFeedService.getMarketPrice(currencyCode);
                             if (marketPrice != null && marketPrice.isRecentExternalPriceAvailable()) {
@@ -387,11 +389,11 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
                                 }
                             }
                         }
+                    } else {
+                        marketPriceMarginValidationResult.set(new InputValidator.ValidationResult(true));
                     }
                 } catch (NumberFormatException t) {
-                    log.error(t.toString());
-                    t.printStackTrace();
-                    new Popup().warning(Res.get("validation.NaN")).show();
+                    marketPriceMarginValidationResult.set(new InputValidator.ValidationResult(false, Res.get("validation.NaN")));
                 } catch (Throwable t) {
                     log.error(t.toString());
                     t.printStackTrace();
@@ -402,11 +404,14 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         useMarketBasedPriceListener = (observable, oldValue, newValue) -> {
             if (newValue)
                 priceValidationResult.set(new InputValidator.ValidationResult(true));
+            else
+                marketPriceMarginValidationResult.set(new InputValidator.ValidationResult(true));
         };
 
         volumeStringListener = (ov, oldValue, newValue) -> {
             if (!ignoreVolumeStringListener) {
                 if (isVolumeInputValid(newValue).isValid) {
+                    applyMarketPriceIfMarginUntouched();
                     setVolumeToModel();
                     setPriceToModel();
                     dataModel.calculateAmount();
@@ -418,7 +423,10 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
         securityDepositStringListener = (ov, oldValue, newValue) -> {
             if (!ignoreSecurityDepositStringListener) {
-                if (securityDepositValidator.validate(newValue).isValid) {
+                InputValidator.ValidationResult result = securityDepositValidator.validate(newValue);
+                if (!isMinSecurityDeposit.get())
+                    securityDepositValidationResult.set(result);
+                if (result.isValid) {
                     setSecurityDepositToModel();
                     dataModel.calculateTotalToPay();
                 }
@@ -429,10 +437,8 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         amountListener = (ov, oldValue, newValue) -> {
             if (newValue != null) {
                 amount.set(HavenoUtils.formatXmr(newValue));
-                securityDepositInXMR.set(HavenoUtils.formatXmr(dataModel.getSecurityDeposit(), true));
             } else {
                 amount.set("");
-                securityDepositInXMR.set("");
             }
 
             applyMakerFee();
@@ -470,13 +476,10 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         securityDepositAsDoubleListener = (ov, oldValue, newValue) -> {
             if (newValue != null) {
                 securityDeposit.set(FormattingUtils.formatToPercent((double) newValue));
-                if (dataModel.getAmount().get() != null) {
-                    securityDepositInXMR.set(HavenoUtils.formatXmr(dataModel.getSecurityDeposit(), true));
-                }
                 updateSecurityDeposit();
             } else {
                 securityDeposit.set("");
-                securityDepositInXMR.set("");
+                minSecurityDepositMessage.set("");
             }
         };
 
@@ -517,6 +520,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
         BigInteger makerFee = dataModel.getMaxMakerFee();
         if (makerFee == null) {
+            isTradeFeeVisible.setValue(false);
             return;
         }
 
@@ -596,9 +600,6 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
     boolean initWithData(OfferDirection direction, TradeCurrency tradeCurrency, boolean initAddressEntry) {
         boolean result = dataModel.initWithData(direction, tradeCurrency, initAddressEntry);
-        if (dataModel.getAddressEntry() != null) {
-            addressAsString = dataModel.getAddressEntry().getAddressString();
-        }
         if (dataModel.paymentAccount != null)
             xmrValidator.setMaxValue(dataModel.paymentAccount.getPaymentMethod().getMaxTradeLimit(dataModel.getTradeCurrencyCode().get()));
         xmrValidator.setMaxTradeLimit(dataModel.getMaxTradeLimit());
@@ -624,31 +625,29 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     void onPlaceOffer(Offer offer, Runnable resultHandler) {
+        errorMessage.set(null);
+        createOfferInProgress = true;
+        createOfferCanceled = false;
+        updateButtonDisableState();
+        updateSpinnerInfo();
+
         ThreadUtils.execute(() -> {
-            errorMessage.set(null);
-            createOfferInProgress = true;
-            createOfferCanceled = false;
-
             dataModel.onPlaceOffer(offer, transaction -> {
-                createOfferInProgress = false;
-                resultHandler.run();
-                if (!createOfferCanceled) placeOfferCompleted.set(true);
-                errorMessage.set(null);
-            }, errMessage -> {
-                createOfferInProgress = false;
-                if (offer.getState() == Offer.State.OFFER_FEE_RESERVED) errorMessage.set(errMessage + Res.get("createOffer.errorInfo"));
-                else errorMessage.set(errMessage);
-
                 UserThread.execute(() -> {
+                    createOfferInProgress = false;
+                    resultHandler.run();
+                    if (!createOfferCanceled) placeOfferCompleted.set(true);
+                    errorMessage.set(null);
+                });
+            }, errMessage -> {
+                UserThread.execute(() -> {
+                    createOfferInProgress = false;
+                    if (offer.getState() == Offer.State.OFFER_FEE_RESERVED) errorMessage.set(errMessage + Res.get("createOffer.errorInfo"));
+                    else errorMessage.set(errMessage);
                     updateButtonDisableState();
                     updateSpinnerInfo();
                     resultHandler.run();
                 });
-            });
-
-            UserThread.execute(() -> {
-                updateButtonDisableState();
-                updateSpinnerInfo();
             });
         }, getClass().getSimpleName());
     }
@@ -725,6 +724,8 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     // On focus out we do validation and apply the data to the model
     void onFocusOutAmountTextField(boolean oldValue, boolean newValue) {
         if (oldValue && !newValue) {
+            // flag an empty field only after an amount was set, so an untouched field stays neutral
+            if ((amount.get() == null || amount.get().isEmpty()) && dataModel.getAmount().get() == null) return;
             InputValidator.ValidationResult result = isXmrInputValid(amount.get());
             amountValidationResult.set(result);
             if (result.isValid) {
@@ -782,18 +783,16 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
             // trigger recalculation of the volume
             UserThread.execute(() -> {
-                onFocusOutVolumeTextField(true, false);
+                triggerFocusOutOnVolumeTextField();
                 onFocusOutMinAmountTextField(true, false);
             });
-
-            if (marketPriceMargin.get() == null && amount.get() != null && volume.get() != null) {
-                updateMarketPriceToManual();
-            }
         }
     }
 
     public void onFocusOutMinAmountTextField(boolean oldValue, boolean newValue) {
         if (oldValue && !newValue) {
+            // flag an empty field only after a minimum amount was set, so an untouched field stays neutral
+            if ((minAmount.get() == null || minAmount.get().isEmpty()) && dataModel.getMinAmount().get() == null) return;
             InputValidator.ValidationResult result = isXmrInputValid(minAmount.get());
             minAmountValidationResult.set(result);
             if (result.isValid) {
@@ -895,6 +894,8 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
     void onFocusOutPriceTextField(boolean oldValue, boolean newValue) {
         if (oldValue && !newValue) {
+            // flag an empty field only after a price was set, so an untouched field stays neutral
+            if ((price.get() == null || price.get().isEmpty()) && dataModel.getPrice().get() == null) return;
             InputValidator.ValidationResult result = isPriceInputValid(price.get());
             priceValidationResult.set(result);
             if (result.isValid) {
@@ -910,7 +911,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
             // We want to trigger a recalculation of the volume and minAmount
             UserThread.execute(() -> {
-                onFocusOutVolumeTextField(true, false);
+                triggerFocusOutOnVolumeTextField();
                 triggerFocusOutOnAmountFields();
             });
         }
@@ -921,25 +922,34 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         onFocusOutMinAmountTextField(true, false);
     }
 
+    // revalidate volume only if input was entered, so an untouched field is not flagged prematurely
+    private void triggerFocusOutOnVolumeTextField() {
+        if (volume.get() == null || volume.get().isEmpty()) return;
+        onFocusOutVolumeTextField(true, false);
+    }
+
     public void onFocusOutPriceAsPercentageTextField(boolean oldValue, boolean newValue) {
         inputIsMarketBasedPrice = !oldValue && newValue;
         if (oldValue && !newValue) {
-            if (marketPriceMargin.get() == null) {
-                // field wasn't set manually
+            if (marketPriceMargin.get() == null || marketPriceMargin.get().isEmpty()) {
+                // field wasn't set manually; null initially, empty after the view clears it
                 inputIsMarketBasedPrice = true;
             }
             marketPriceMargin.set(FormattingUtils.formatRoundedDoubleWithPrecision(dataModel.getMarketPriceMarginPct() * 100, 2));
+            marketPriceMarginValidationResult.set(new InputValidator.ValidationResult(true)); // field text is reset to the model value
         }
 
         // We want to trigger a recalculation of the volume, as well as update trigger price validation
         UserThread.execute(() -> {
-            onFocusOutVolumeTextField(true, false);
+            triggerFocusOutOnVolumeTextField();
             onTriggerPriceTextFieldChanged();
         });
     }
 
     void onFocusOutVolumeTextField(boolean oldValue, boolean newValue) {
         if (oldValue && !newValue) {
+            // flag an empty field only after a volume was set, so an untouched field stays neutral
+            if ((volume.get() == null || volume.get().isEmpty()) && dataModel.getVolume().get() == null) return;
             InputValidator.ValidationResult result = isVolumeInputValid(volume.get());
             volumeValidationResult.set(result);
             if (result.isValid) {
@@ -967,10 +977,6 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
                     if (amountValidationResult.getValue() != null && amountValidationResult.getValue().isValid && minAmount.get() != null)
                         minAmountValidationResult.set(isXmrInputValid(minAmount.get()));
                 }
-            }
-
-            if (marketPriceMargin.get() == null && amount.get() != null && volume.get() != null) {
-                updateMarketPriceToManual();
             }
 
             // trigger recalculation of security deposit
@@ -1026,6 +1032,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     ///////////////////////////////////////////////////////////////////////////////////////////
 
     public boolean isPriceInRange() {
+        if (!marketPriceMarginValidationResult.get().isValid) return false;
         if (marketPriceMargin.get() != null && !marketPriceMargin.get().isEmpty()) {
             if (Math.abs(ParsingUtils.parsePercentStringToDouble(marketPriceMargin.get())) > preferences.getMaxPriceDistanceInPercent()) {
                 displayPriceOutOfRangePopup();
@@ -1073,15 +1080,9 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
 
     public String getSecurityDepositLabel() {
         return dataModel.buyerAsTakerWithoutDeposit.get() && dataModel.isSellOffer() ? Res.get("createOffer.myDeposit") :
-                dataModel.isMinSecurityDeposit() ? Res.get("createOffer.minSecurityDepositUsed") :
+                isMinSecurityDeposit.get() ? Res.get("createOffer.minSecurityDepositUsed") :
                 Preferences.USE_SYMMETRIC_SECURITY_DEPOSIT ? Res.get("createOffer.setDepositForBothTraders") :
                 dataModel.isBuyOffer() ? Res.get("createOffer.setDepositAsBuyer") : Res.get("createOffer.setDeposit");
-    }
-
-    public String getSecurityDepositPopOverLabel(String depositInXMR) {
-        return dataModel.buyerAsTakerWithoutDeposit.get() && dataModel.isSellOffer() ? Res.get("createOffer.myDepositInfo", depositInXMR) :
-                dataModel.isBuyOffer() ? Res.get("createOffer.securityDepositInfoAsBuyer", depositInXMR) :
-                Res.get("createOffer.securityDepositInfo", depositInXMR);
     }
 
     public String getSecurityDepositInfo() {
@@ -1131,7 +1132,7 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     }
 
     public String getAddressAsString() {
-        return addressAsString;
+        return dataModel.getAddressEntry() == null ? null : dataModel.getAddressEntry().getAddressString();
     }
 
     public String getPaymentLabel() {
@@ -1294,18 +1295,32 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         isWaitingForFunds.set(!waitingForFundsText.get().isEmpty());
     }
 
-    private void updateSecurityDeposit() {
-        isMinSecurityDeposit.set(dataModel.isMinSecurityDeposit());
+    protected void updateSecurityDeposit() {
+        String amountText = amount.get();
+        BigInteger amountValue = amountText != null && amountText.isEmpty() ? null : dataModel.getAmount().get();
+        double floorAsPercent = amountValue != null && amountValue.signum() > 0
+                ? CoinUtil.getAsPercentPerXmr(Restrictions.getMinSecurityDeposit(), amountValue)
+                : Double.MAX_VALUE;
+        boolean percentIrrelevant = floorAsPercent >= Restrictions.getMaxSecurityDepositPct();
+        isMinSecurityDeposit.set(percentIrrelevant);
         securityDepositLabel.set(getSecurityDepositLabel());
-        if (dataModel.isMinSecurityDeposit()) {
+        if (percentIrrelevant) {
             securityDeposit.set(HavenoUtils.formatXmr(Restrictions.getMinSecurityDeposit()));
             securityDepositValidationResult.set(new ValidationResult(true));
         } else {
+            // percents below the floor stay valid; the data model floors the actual deposit at the min XMR amount
             boolean hasBuyerAsTakerWithoutDeposit = dataModel.buyerAsTakerWithoutDeposit.get() && dataModel.isSellOffer();
             securityDeposit.set(FormattingUtils.formatToPercent(hasBuyerAsTakerWithoutDeposit ?
                     Restrictions.getDefaultSecurityDepositPct() : // use default percent if no deposit from buyer
                     dataModel.getSecurityDepositPct().get()));
+            securityDepositValidationResult.set(securityDepositValidator.validate(securityDeposit.get()));
         }
+
+        // note when the min deposit will override the entered percent
+        boolean floorBinds = !percentIrrelevant && amountValue != null && amountValue.signum() > 0 &&
+                dataModel.getSecurityDeposit().compareTo(Restrictions.getMinSecurityDeposit()) <= 0;
+        minSecurityDepositMessage.set(floorBinds ? Res.get("createOffer.minSecurityDepositApplied",
+                HavenoUtils.formatXmr(Restrictions.getMinSecurityDeposit(), true)) : "");
     }
 
     void updateButtonDisableState() {
@@ -1325,8 +1340,8 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
             inputDataValid = inputDataValid && triggerPriceValidationResult.get().isValid;
         }
 
-        // validating the percentage deposit value only makes sense if it is actually used
-        if (!dataModel.isMinSecurityDeposit()) {
+        // validating the percentage deposit value only makes sense while the field holds a percentage
+        if (!isMinSecurityDeposit.get()) {
             inputDataValid = inputDataValid && securityDepositValidator.validate(securityDeposit.get()).isValid;
         }
 
@@ -1344,30 +1359,23 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
         }
     }
 
-    private void updateMarketPriceToManual() {
-        final String currencyCode = dataModel.getTradeCurrencyCode().get();
+    // treat an untouched market price margin as 0% so amount and volume calculate from the market price
+    private void applyMarketPriceIfMarginUntouched() {
+        if (!dataModel.getUseMarketBasedPrice().get()) return;
+        if (marketPriceMargin.get() != null && !marketPriceMargin.get().isEmpty()) return;
+        if (price.get() != null && !price.get().isEmpty()) return;
+        String currencyCode = dataModel.getTradeCurrencyCode().get();
         MarketPrice marketPrice = priceFeedService.getMarketPrice(currencyCode);
-        if (marketPrice != null && marketPrice.isRecentExternalPriceAvailable()) {
-            double marketPriceAsDouble = marketPrice.getPrice();
-            double amountAsDouble = ParsingUtils.parseNumberStringToDouble(amount.get());
-            double volumeAsDouble = ParsingUtils.parseNumberStringToDouble(volume.get());
-            double manualPriceAsDouble = dataModel.calculateMarketPriceManual(marketPriceAsDouble, volumeAsDouble, amountAsDouble);
-
-            int precision = CurrencyUtil.isTraditionalCurrency(currencyCode) ?
-                    TraditionalMoney.SMALLEST_UNIT_EXPONENT : CryptoMoney.SMALLEST_UNIT_EXPONENT;
-            price.set(FormattingUtils.formatRoundedDoubleWithPrecision(manualPriceAsDouble, precision));
-            setPriceToModel();
-            dataModel.calculateTotalToPay();
-            updateButtonDisableState();
-            applyMakerFee();
-        } else {
-            marketPriceMargin.set("");
-            String id = "showNoPriceFeedAvailablePopup";
-            if (preferences.showAgain(id)) {
-                new Popup().warning(Res.get("popup.warning.noPriceFeedAvailable"))
-                        .dontShowAgainId(id)
-                        .show();
-            }
-        }
+        if (marketPrice == null || !marketPrice.isRecentExternalPriceAvailable()) return;
+        int precision = CurrencyUtil.isTraditionalCurrency(currencyCode) ?
+                TraditionalMoney.SMALLEST_UNIT_EXPONENT : CryptoMoney.SMALLEST_UNIT_EXPONENT;
+        ignorePriceStringListener = true;
+        price.set(FormattingUtils.formatRoundedDoubleWithPrecision(marketPrice.getPrice(), precision));
+        ignorePriceStringListener = false;
+        setPriceToModel();
+        dataModel.setMarketPriceMarginPct(0);
+        ignoreMarketPriceMarginStringListener = true;
+        marketPriceMargin.set(FormattingUtils.formatRoundedDoubleWithPrecision(0, 2));
+        ignoreMarketPriceMarginStringListener = false;
     }
 }

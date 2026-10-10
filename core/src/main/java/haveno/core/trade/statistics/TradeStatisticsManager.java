@@ -37,10 +37,18 @@ import haveno.network.p2p.storage.persistence.AppendOnlyDataStoreService;
 import java.io.File;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
@@ -57,7 +65,29 @@ public class TradeStatisticsManager {
     private final boolean dumpStatistics;
     private final ObservableList<TradeStatistics3> observableTradeStatisticsList = FXCollections.observableArrayList();
     private JsonFileManager jsonFileManager;
+    private final AtomicBoolean dumpStatisticsScheduled = new AtomicBoolean();
+    private final List<TradeStatistics3> pendingTradeStatistics = new ArrayList<>();
+    // Early trades are accumulated raw and deduplicated deterministically; recent trades dedup by value so re-delivered payloads are dropped.
+    private final Set<TradeStatistics3> earlyTradeStatistics = new HashSet<>();
+    // Early trades kept after deduplication, by payment method and currency then date, since duplicates share all three.
+    private final Map<String, Map<Long, TradeStatistics3>> earlyTradeStatisticsDeduplicated = new HashMap<>();
+    // Kept early trades subject to fuzzy deduplication, additionally by price then date, since fuzzy duplicates share the price within a day.
+    private final Map<String, TreeMap<Long, TradeStatistics3>> earlyFuzzyTradeStatistics = new HashMap<>();
+    private final Set<TradeStatistics3> recentTradeStatistics = new LinkedHashSet<>();
+    private boolean earlyTradeStatisticsCapped;
+    private final AtomicBoolean flushPendingScheduled = new AtomicBoolean();
+    private volatile boolean shutDownRequested;
     public static final int PUBLISH_STATS_RANDOM_DELAY_HOURS = 24;
+    private static final int DUMP_STATISTICS_DELAY_SEC = 60;
+    private static final int ADD_STATISTICS_DELAY_SEC = 1;
+    // Legacy publishing bugs duplicated early trades; stats before these dates are deduplicated.
+    private static final Instant EARLY_DUPLICATE_DATE = Instant.parse("2024-09-30T00:00:00Z");
+    private static final Instant EARLY_FUZZY_DUPLICATE_DATE = Instant.parse("2024-08-07T00:00:00Z");
+    private static final int MAX_EARLY_TRADE_STATISTICS = 50000; // early trades are a fixed history, so more indicates a flood
+    // Canonical order so the greedy dedup keeps the same representatives regardless of arrival order within a batch,
+    // which covers the persisted early trades loaded at startup.
+    private static final Comparator<TradeStatistics3> EARLY_TRADE_ORDER =
+            Comparator.comparingLong(TradeStatistics3::getDateAsLong).thenComparing(TradeStatistics3::getHash, Arrays::compare);
 
     @Inject
     public TradeStatisticsManager(P2PService p2PService,
@@ -77,6 +107,12 @@ public class TradeStatisticsManager {
     }
 
     public void shutDown() {
+        shutDownRequested = true;
+        // flush pending statistics and a pending batched dump so the json includes the final statistics
+        flushPendingTradeStatistics();
+        if (dumpStatisticsScheduled.getAndSet(false)) {
+            dumpStatistics();
+        }
         if (jsonFileManager != null) {
             jsonFileManager.shutDown();
         }
@@ -89,11 +125,10 @@ public class TradeStatisticsManager {
                 if (!tradeStatistics.isValid()) {
                     return;
                 }
-                synchronized (observableTradeStatisticsList) {
-                    observableTradeStatisticsList.add(tradeStatistics);
-                    priceFeedService.applyLatestHavenoMarketPrice(observableTradeStatisticsList);
+                synchronized (pendingTradeStatistics) {
+                    pendingTradeStatistics.add(tradeStatistics); // add to batch which is flushed on intervals
                 }
-                maybeDumpStatistics();
+                maybeFlushPendingTradeStatistics();
             }
         });
 
@@ -102,77 +137,94 @@ public class TradeStatisticsManager {
                 .map(e -> (TradeStatistics3) e)
                 .filter(TradeStatistics3::isValid)
                 .collect(Collectors.toSet());
-        
 
-        // remove duplicates in early trade stats due to bugs
-        removeDuplicateStats(set);
-
-        synchronized (observableTradeStatisticsList) {
-            observableTradeStatisticsList.addAll(set);
-            priceFeedService.applyLatestHavenoMarketPrice(observableTradeStatisticsList);
-        }
+        // add deduplicated, dropping early trade stats duplicated by legacy publishing bugs
+        addTradeStatistics(set);
         maybeDumpStatistics();
     }
 
-    private void removeDuplicateStats(Set<TradeStatistics3> tradeStats) {
-        removeEarlyDuplicateStats(tradeStats);
-        removeEarlyDuplicateStatsFuzzy(tradeStats);
-    }
-
-    private void removeEarlyDuplicateStats(Set<TradeStatistics3> tradeStats) {
-       
-        // collect trades before September 30, 2024
-        Set<TradeStatistics3> earlyTrades = tradeStats.stream()
-                .filter(e -> e.getDate().toInstant().isBefore(Instant.parse("2024-09-30T00:00:00Z")))
-                .collect(Collectors.toSet());
-
-        // collect stats with duplicated timestamp, currency, and payment method
-        Set<TradeStatistics3> duplicates = new HashSet<>();
-        Set<TradeStatistics3> deduplicates = new HashSet<>();
-        for (TradeStatistics3 tradeStatistic : earlyTrades) {
-            TradeStatistics3 duplicate = findDuplicate(tradeStatistic, deduplicates);
-            if (duplicate == null) deduplicates.add(tradeStatistic);
-            else duplicates.add(tradeStatistic);
+    // flush statistics in intervals to bound CPU and memory during rapid sync
+    private void maybeFlushPendingTradeStatistics() {
+        if (!flushPendingScheduled.compareAndSet(false, true)) {
+            return;
         }
-
-        // remove duplicated stats
-        tradeStats.removeAll(duplicates);
+        UserThread.runAfter(() -> {
+            flushPendingScheduled.set(false);
+            if (shutDownRequested) return;
+            flushPendingTradeStatistics();
+            maybeDumpStatistics();
+        }, ADD_STATISTICS_DELAY_SEC);
     }
 
-    private TradeStatistics3 findDuplicate(TradeStatistics3 tradeStatistics, Set<TradeStatistics3> set) {
-        return set.stream().filter(e -> isDuplicate(tradeStatistics, e)).findFirst().orElse(null);
-    }
-
-    private boolean isDuplicate(TradeStatistics3 tradeStatistics1, TradeStatistics3 tradeStatistics2) {
-        if (!tradeStatistics1.getPaymentMethodId().equals(tradeStatistics2.getPaymentMethodId())) return false;
-        if (!tradeStatistics1.getCurrency().equals(tradeStatistics2.getCurrency())) return false;
-        return tradeStatistics1.getDateAsLong() == tradeStatistics2.getDateAsLong();
-    }
-
-    private void removeEarlyDuplicateStatsFuzzy(Set<TradeStatistics3> tradeStats) {
-
-        // collect trades before August 7, 2024
-        Set<TradeStatistics3> earlyTrades = tradeStats.stream()
-                .filter(e -> e.getDate().toInstant().isBefore(Instant.parse("2024-08-07T00:00:00Z")))
-                .collect(Collectors.toSet());
-
-        // collect duplicated trades
-        Set<TradeStatistics3> duplicates = new HashSet<TradeStatistics3>();
-        Set<TradeStatistics3> deduplicates = new HashSet<TradeStatistics3>();
-        for (TradeStatistics3 tradeStatistic : earlyTrades) {
-            TradeStatistics3 fuzzyDuplicate = findFuzzyDuplicate(tradeStatistic, deduplicates);
-            if (fuzzyDuplicate == null) deduplicates.add(tradeStatistic);
-            else duplicates.add(tradeStatistic);
+    private void flushPendingTradeStatistics() {
+        List<TradeStatistics3> pending;
+        synchronized (pendingTradeStatistics) {
+            if (pendingTradeStatistics.isEmpty()) return;
+            pending = new ArrayList<>(pendingTradeStatistics);
+            pendingTradeStatistics.clear();
         }
-
-        // remove duplicated stats
-        tradeStats.removeAll(duplicates);
+        addTradeStatistics(pending);
     }
 
-    private TradeStatistics3 findFuzzyDuplicate(TradeStatistics3 tradeStatistics, Set<TradeStatistics3> set) {
-        return set.stream().filter(e -> isFuzzyDuplicate(tradeStatistics, e)).findFirst().orElse(null);
+    private void addTradeStatistics(Collection<TradeStatistics3> tradeStatistics) {
+        List<TradeStatistics3> applied = new ArrayList<>();
+        synchronized (observableTradeStatisticsList) {
+            List<TradeStatistics3> addedEarly = new ArrayList<>();
+            List<TradeStatistics3> addedRecent = new ArrayList<>();
+            for (TradeStatistics3 tradeStatistic : tradeStatistics) {
+                if (isEarlyTrade(tradeStatistic)) {
+                    if (earlyTradeStatistics.size() >= MAX_EARLY_TRADE_STATISTICS) {
+                        if (!earlyTradeStatisticsCapped) log.warn("Ignoring early trade statistics beyond {}", MAX_EARLY_TRADE_STATISTICS);
+                        earlyTradeStatisticsCapped = true;
+                    } else if (earlyTradeStatistics.add(tradeStatistic)) {
+                        addedEarly.add(tradeStatistic);
+                    }
+                } else if (recentTradeStatistics.add(tradeStatistic)) {
+                    addedRecent.add(tradeStatistic);
+                }
+            }
+            if (!addedEarly.isEmpty()) {
+                deduplicateEarlyTradeStatistics(addedEarly);
+                earlyTradeStatisticsDeduplicated.values().forEach(kept -> applied.addAll(kept.values()));
+                applied.sort(EARLY_TRADE_ORDER);
+                applied.addAll(recentTradeStatistics);
+                observableTradeStatisticsList.setAll(applied);
+            } else {
+                observableTradeStatisticsList.addAll(addedRecent);
+                applied.addAll(addedRecent);
+            }
+        }
+        priceFeedService.applyLatestHavenoMarketPrice(applied);
     }
 
+    // Deduplicates the added early trades against those already kept, looking up exact duplicates by date and fuzzy
+    // duplicates within the fuzzed date window of the same price, so the work is bounded by the trades which can match.
+    private void deduplicateEarlyTradeStatistics(List<TradeStatistics3> added) {
+        added.sort(EARLY_TRADE_ORDER);
+        long fuzzDateMs = TimeUnit.HOURS.toMillis(FUZZ_DATE_HOURS);
+        for (TradeStatistics3 candidate : added) {
+            String key = candidate.getPaymentMethodId() + "/" + candidate.getCurrency();
+            long date = candidate.getDateAsLong();
+            Map<Long, TradeStatistics3> kept = earlyTradeStatisticsDeduplicated.computeIfAbsent(key, k -> new HashMap<>());
+            if (kept.containsKey(date)) continue;
+            if (isEarlyFuzzyTrade(candidate)) {
+                TreeMap<Long, TradeStatistics3> keptFuzzy = earlyFuzzyTradeStatistics.computeIfAbsent(key + "/" + candidate.getNormalizedPrice(), k -> new TreeMap<>());
+                if (keptFuzzy.subMap(date - fuzzDateMs, true, date + fuzzDateMs, true).values().stream().anyMatch(keptStatistic -> isFuzzyDuplicate(candidate, keptStatistic))) continue;
+                keptFuzzy.put(date, candidate);
+            }
+            kept.put(date, candidate);
+        }
+    }
+
+    private boolean isEarlyTrade(TradeStatistics3 tradeStatistics) {
+        return tradeStatistics.getDate().toInstant().isBefore(EARLY_DUPLICATE_DATE);
+    }
+
+    private boolean isEarlyFuzzyTrade(TradeStatistics3 tradeStatistics) {
+        return tradeStatistics.getDate().toInstant().isBefore(EARLY_FUZZY_DUPLICATE_DATE);
+    }
+
+    // duplicated payment method, currency, price, and a fuzzily matching date/amount
     private boolean isFuzzyDuplicate(TradeStatistics3 tradeStatistics1, TradeStatistics3 tradeStatistics2) {
         if (!tradeStatistics1.getPaymentMethodId().equals(tradeStatistics2.getPaymentMethodId())) return false;
         if (!tradeStatistics1.getCurrency().equals(tradeStatistics2.getCurrency())) return false;
@@ -210,6 +262,20 @@ public class TradeStatisticsManager {
             return;
         }
 
+        // Dumping serializes the whole statistics list, so we batch frequent updates into one dump per interval.
+        if (!dumpStatisticsScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        UserThread.runAfter(() -> {
+            dumpStatisticsScheduled.set(false);
+            if (shutDownRequested) {
+                return;
+            }
+            dumpStatistics();
+        }, DUMP_STATISTICS_DELAY_SEC);
+    }
+
+    private void dumpStatistics() {
         if (jsonFileManager == null) {
             jsonFileManager = new JsonFileManager(storageDir);
 

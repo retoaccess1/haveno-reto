@@ -23,7 +23,6 @@ import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import haveno.common.app.Capabilities;
 import haveno.common.app.Version;
-import haveno.common.util.MathUtils;
 import static haveno.common.util.MathUtils.roundDoubleToLong;
 import static haveno.common.util.MathUtils.scaleUpByPowerOf10;
 import haveno.common.util.Utilities;
@@ -46,8 +45,10 @@ import static haveno.core.offer.OfferPayload.PAYPAL_EXTRA_INFO;
 import static haveno.core.offer.OfferPayload.REFERRAL_ID;
 import static haveno.core.offer.OfferPayload.XMR_AUTO_CONF;
 import static haveno.core.offer.OfferPayload.XMR_AUTO_CONF_ENABLED_VALUE;
+import static haveno.core.offer.OfferPayload.BLIK_EXTRA_INFO;
 
 import haveno.core.payment.AustraliaPayidAccount;
+import haveno.core.payment.BlikAccount;
 import haveno.core.payment.CashAppAccount;
 import haveno.core.payment.CashAtAtmAccount;
 import haveno.core.payment.F2FAccount;
@@ -158,14 +159,6 @@ public class OfferUtil {
         }
     }
 
-    public double calculateManualPrice(double volumeAsDouble, double amountAsDouble) {
-        return volumeAsDouble / amountAsDouble;
-    }
-
-    public double calculateMarketPriceMarginPct(double manualPrice, double marketPrice) {
-        return MathUtils.roundDouble(manualPrice / marketPrice, 4);
-    }
-
     public boolean isBlockChainPaymentMethod(Offer offer) {
         return offer != null && offer.getPaymentMethod().isBlockchain();
     }
@@ -222,6 +215,10 @@ public class OfferUtil {
 
         if (paymentAccount instanceof CashAtAtmAccount) {
             extraDataMap.put(CASH_AT_ATM_EXTRA_INFO, ((CashAtAtmAccount) paymentAccount).getExtraInfo());
+        }
+
+        if (paymentAccount instanceof BlikAccount) {
+            extraDataMap.put(BLIK_EXTRA_INFO, ((BlikAccount) paymentAccount).getExtraInfo());
         }
 
         extraDataMap.put(CAPABILITIES, Capabilities.app.toStringList());

@@ -1,5 +1,6 @@
 .root {
     -bs-color-primary: rgb(28, 96, 220);
+    -bs-control-accent: #0b65da;
 
     /* javafx main color palette */
     -fx-base: #29292a;
@@ -21,6 +22,9 @@
 
     /* haveno main colors */
     -bs-color-primary-dark: #0c59bd;
+    /* hero window accents, lightened for contrast on dark */
+    -bs-hero-primary: rgb(92, 148, 240);
+    -bs-hero-purple: rgb(155, 124, 216);
     -bs-text-color: white;
     -bs-background-color: black;
     -bs-background-gray: transparent;
@@ -38,6 +42,7 @@
     -bs-color-gray-2: #504f52;
     -bs-color-gray-1: #29292a;
     -bs-color-gray-0: #2B2B2B;
+    -bs-color-hairline: -bs-color-gray-1;
     -bs-color-gray-dim: #aaaaaa;
     -bs-color-gray-ddd: #444444;
     -bs-color-gray-ccc: #7a7a7a;
@@ -48,13 +53,22 @@
     -bs-color-background-popup: rgb(38, 38, 38);
     -bs-color-background-popup-blur: rgb(9, 9, 9);
     -bs-color-background-popup-input: rgb(9, 9, 9);
+    -bs-confirm-sheet-background: rgba(255, 255, 255, 0.04);
     -bs-color-background-form-field: rgb(26, 26, 26);
     -bs-color-background-form-field-readonly: rgb(18, 18, 18);
     -bs-color-border-form-field: rgb(65, 65, 65);
+    -bs-offer-card-border: rgba(255, 255, 255, 0.08);
+    -bs-login-field-border: #4c4c50;
+    -bs-login-field-focus-glow: rgba(56, 128, 255, 0.36);
+    -bs-login-prompt-text: #9a9a9e;
     -bs-color-background-pane: rgb(15, 15, 15);
+    -bs-color-table-header-background: -bs-color-background-pane;
+    -bs-trade-sidebar-background: rgba(255, 255, 255, 0.018);
     -bs-color-background-row-even: rgb(19, 19, 19);
     -bs-color-background-row-odd: rgb(9, 9, 9);
+    -bs-color-background-row-hover: rgb(33, 33, 33);
     -bs-color-table-cell-dim: -bs-color-gray-ccc;
+    -bs-color-table-cell-disabled: #7a7a7a;
     -bs-text-color-dim1: rgb(87, 87, 87);
     -bs-text-color-dim2: rgb(130, 130, 130);
 
@@ -82,11 +96,13 @@
     /* other element styling */
     -bs-rd-nav-border: #535353;
     -bs-rd-nav-primary-border: rgba(0, 0, 0, 0);
+    -bs-rd-nav-bar-edge: rgba(255, 255, 255, 0.14);
     -bs-rd-nav-border-color: rgba(255, 255, 255, 0.1);
     -bs-rd-nav-background: rgb(15, 15, 15);
     -bs-rd-nav-primary-background: rgb(15, 15, 15);
     -bs-rd-nav-selected: black;
     -bs-rd-nav-deselected: rgba(255, 255, 255, 1);
+    -bs-rd-nav-unread-dot-stroke: -bs-rd-nav-primary-background;
     -bs-rd-nav-secondary-selected: -fx-accent;
     -bs-rd-nav-secondary-deselected: -bs-rd-font-light;
     -bs-rd-nav-button-hover: derive(-bs-rd-nav-background, 10%);
@@ -98,7 +114,12 @@
     -bs-tab-content-label-hover: rgba(0, 0, 0, 0.03);
     -bs-combobox-hover: rgba(255, 255, 255, 0.1);
     -bs-combobox-selected: rgba(21, 188, 29, 0.1);
+    -bs-combo-popup-selected: rgba(56, 128, 255, 0.15);
+    -bs-combo-popup-hover: rgba(255, 255, 255, 0.06);
     -bs-content-pane-bg-bottom: #29292a;
+    -bs-wizard-backdrop: black;
+    -bs-wizard-card-bg: #1c1c1e;
+    -bs-wizard-card-shadow: rgba(0, 0, 0, 0.55);
     -bs-scroll-pane-background: transparent;
     -bs-tab-content-area: transparent;
     -bs-viewport-background: transparent;
@@ -117,7 +138,9 @@
     -bs-rd-font-balance-label: #999999;
 
     -bs-text-color-dropshadow: rgba(45, 45, 49, .75);
-    -bs-text-color-dropshadow-light-mode: transparent;
+    -bs-popup-shadow: rgba(45, 45, 49, 0.45);
+    -bs-popup-shadow-light-mode: transparent;
+    -bs-popup-nested-border: rgba(255, 255, 255, 0.14);
     -bs-text-color-transparent: rgba(29, 29, 33, 0.2);
     -bs-color-gray-line: #504f52;
 
@@ -125,7 +148,11 @@
     -bs-rd-separator-dark: rgb(255, 255, 255, 0.1);
     -bs-rd-error-red: #d83431;
     -bs-rd-error-field: #521C1C;
-    -bs-rd-message-bubble: #0086c6;
+    -bs-rd-message-bubble: -bs-color-primary;
+    -bs-rd-message-bubble-other: #2c2c2e;
+    -bs-rd-chat-background: #121212;
+    -bs-rd-message-bubble-system: #1c1c1e;
+    -bs-rd-message-bubble-system-border: rgba(255, 255, 255, 0.08);
     -bs-rd-tooltip-truncated: #afaeb0;
 
     /*-bs-toggle-selected: rgb(12, 89, 189);*/
@@ -170,8 +197,6 @@
 
     /* Monero orange color code */
     -xmr-orange: #f26822;
-
-    -bs-support-chat-background: rgb(125, 125, 125);
 }
 
 /* table view */
@@ -188,6 +213,9 @@
 .table-view {
     -fx-background-color: derive(-bs-background-color,-30%);
     -fx-border-width: 0;
+    /* muted selection stays visible while interacting with the selected row's details */
+    -fx-selection-bar: #26374a;
+    -fx-selection-bar-non-focused: -fx-selection-bar;
 }
 
 /** These must be set to override default styles */
@@ -199,8 +227,23 @@
     -fx-background-color: -bs-color-background-row-odd;
     -fx-border-color: -bs-color-background-row-odd;
 }
-.table-view .table-row-cell:selected .table-cell {
-    -fx-background: -fx-accent;
+.table-view .table-row-cell:filled:hover,
+.table-view.offer-table .table-row-cell:filled:hover {
+    -fx-background-color: -bs-color-background-row-hover;
+}
+.table-view .table-row-cell:filled:hover .table-cell,
+.table-view.offer-table .table-row-cell:filled:hover .table-cell {
+    -fx-background: -bs-color-background-row-hover;
+    -fx-background-color: -bs-color-background-row-hover;
+    -fx-border-color: transparent;
+}
+.table-view .table-row-cell:filled:selected,
+.table-view.offer-table .table-row-cell:filled:selected {
+    -fx-background-color: -fx-selection-bar;
+}
+.table-view .table-row-cell:filled:selected .table-cell,
+.table-view.offer-table .table-row-cell:filled:selected .table-cell {
+    -fx-background: -fx-selection-bar;
     -fx-background-color: -fx-selection-bar;
     -fx-border-color: -fx-selection-bar;
 }
@@ -248,7 +291,10 @@
     -jfx-rippler-fill: none;
 }
 
-.jfx-tab-pane .viewport {
+.jfx-tab-pane .viewport,
+.portfolio-content .viewport,
+.funds-content .viewport,
+.support-content .viewport {
     -fx-background-color: -bs-viewport-background;
 }
 
@@ -275,11 +321,6 @@
 .jfx-combo-box > .text,
 .jfx-text-field-top-label, .jfx-text-area-top-label {
     -fx-text-fill: -bs-color-gray-11;
-}
-
-.offer-input {
-    -fx-border-color: -bs-color-gray-2;
-    -fx-border-width: 0 0 10 0;
 }
 
 #address-text-field.jfx-text-field:readonly {
@@ -333,14 +374,6 @@
     -fx-fill: -bs-color-gray-11;
 }
 
-#bubble_arrow_grey_left {
-    -fx-image: url("../../images/bubble_arrow_grey_left_dark.png");
-}
-
-#bubble_arrow_grey_right {
-    -fx-image: url("../../images/bubble_arrow_grey_right_dark.png");
-}
-
 .headline-label {
     -fx-font-weight: normal;
     -fx-font-size: 1.892em;
@@ -369,21 +402,24 @@
 
 .combo-box-popup > .list-view{
     -fx-background-color: -bs-color-background-pane;
+    /* no shadow: its effect bounds render as a faint dark rectangle behind the card */
+    -fx-effect: null;
 }
 
 .jfx-combo-box > .arrow-button > .arrow {
     -fx-border-color: -bs-color-gray-13;
 }
 
-.combo-box-popup > .list-view > .virtual-flow > .clipped-container > .sheet > .list-cell:filled:selected {
-    -fx-background: -bs-combobox-selected;
-    -fx-background-color: -bs-combobox-selected;
+.combo-box-popup > .list-view > .virtual-flow > .clipped-container > .sheet > .list-cell:filled:selected,
+.combo-box-popup > .list-view > .virtual-flow > .clipped-container > .sheet > .list-cell:filled:selected:hover {
+    -fx-background: -bs-combo-popup-selected;
+    -fx-background-color: -bs-combo-popup-selected;
+    -fx-text-fill: -bs-text-color;
 }
 
-.combo-box-popup > .list-view > .virtual-flow > .clipped-container > .sheet > .list-cell:filled:hover,
-.combo-box-popup > .list-view > .virtual-flow > .clipped-container > .sheet > .list-cell:filled:selected:hover {
-    -fx-background:-bs-combobox-hover;
-    -fx-background-color: -bs-combobox-hover;
+.combo-box-popup > .list-view > .virtual-flow > .clipped-container > .sheet > .list-cell:filled:hover {
+    -fx-background: -bs-combo-popup-hover;
+    -fx-background-color: -bs-combo-popup-hover;
     -fx-text-fill: -bs-text-color;
 }
 
@@ -437,20 +473,6 @@
     -fx-translate-x: -0.333333em;
     -fx-background-color: transparent;
     -jfx-disable-animation: true;
-}
-
-.offer-input {
-    -fx-border-width: 0;
-    -fx-border-color: -bs-background-color;
-}
-
-.jfx-toggle-button,
-.jfx-toggle-button:armed,
-.jfx-toggle-button:hover,
-.jfx-toggle-button:focused,
-.jfx-toggle-button:selected,
-.jfx-toggle-button:focused:selected {
-    -jfx-disable-visual-focus: true;
 }
 
 .jfx-text-area > .input-line {
@@ -521,6 +543,10 @@
     -fx-border-color: -bs-rd-separator-dark;
 }
 
+.tac-agreement-footer-separator {
+    -fx-background-color: -bs-rd-separator-dark;
+}
+
 .action-button:disabled, #sell-button:disabled, #buy-button:disabled {
     -fx-background-color: derive(-bs-color-gray-0, -20%);
 }
@@ -551,31 +577,36 @@
     -fx-fill: -bs-text-color;
 }
 
+/* neutral gray toggles with white text and glyphs when selected */
 .toggle-button-no-slider {
+    -bs-hero-primary: white;
     -fx-background-color: -bs-color-background-form-field;
-}
-
-.toggle-button-no-slider:selected {
-    -fx-text-fill: white;
-    -fx-background-color: -bs-color-gray-ccc;
-    -fx-border-color: -bs-color-gray-ccc;
+    -fx-border-color: -bs-color-border-form-field;
     -fx-border-width: 1px;
 }
 
-.toggle-button-no-slider:hover {
-    -fx-cursor: hand;
+.toggle-button-no-slider:selected {
+    -fx-background-color: -bs-color-gray-ccc;
+    -fx-border-color: -bs-color-gray-ccc;
+}
+
+.toggle-button-no-slider:hover, .toggle-button-no-slider:focus-visible {
     -fx-background-color: -bs-color-gray-ddd;
     -fx-border-color: -bs-color-gray-ddd;
 }
 
-.toggle-button-no-slider:selected:hover {
-    -fx-cursor: hand;
+.toggle-button-no-slider:selected:hover, .toggle-button-no-slider:selected:focus-visible {
     -fx-background-color: -bs-color-gray-3;
     -fx-border-color: -bs-color-gray-3;
 }
 
-.toggle-button-no-slider:pressed,  .toggle-button-no-slider:selected:hover:pressed {
+.toggle-button-no-slider:pressed, .toggle-button-no-slider:selected:hover:pressed {
     -fx-background-color: -bs-color-gray-bbb;
+}
+
+/* soften the slide toggle accent so it does not read heavy on dark backgrounds */
+.pill-toggle-button {
+    -bs-color-primary: rgb(85, 133, 242);
 }
 
 #image-logo-splash {
@@ -590,20 +621,24 @@
     -fx-image: url("../../images/logo_landscape_dark_mode.png");
 }
 
+#image-logo-splash-landscape {
+    -fx-image: url("../../images/logo_splash_landscape_dark_mode.png");
+}
+
 .table-view .placeholder {
     -fx-background-color: -bs-color-background-pane;
 }
 
 #charts .default-color0.chart-series-area-fill {
     -fx-fill: linear-gradient(to bottom,
-        rgba(80, 181, 90, 0.45) 0%,
+        rgba(80, 181, 90, 0.55) 0%,
         rgba(80, 181, 90, 0.0) 100%
     );
 }
 
 #charts .default-color1.chart-series-area-fill {
     -fx-fill: linear-gradient(to bottom,
-        rgba(213, 63, 46, 0.45) 0%,
+        rgba(213, 63, 46, 0.55) 0%,
         rgba(213, 63, 46, 0.0) 100%
     );
 }
@@ -649,6 +684,24 @@
     -fx-image: url("../../images/fiat_logo_dark_mode.png");
 }
 
-#message-list-view.list-view {
-    -fx-background-image: url("../../images/chatbg_dark.png");
+/* brighten the withdraw-confirmation badges against the dark popup */
+.confirm-send-icon {
+    -fx-background-color: rgba(28, 96, 220, 0.28);
+}
+
+.confirm-send-icon .glyph-icon {
+    -fx-fill: derive(-bs-color-primary, 45%);
+}
+
+.tx-sent-icon {
+    -fx-background-color: rgba(62, 163, 74, 0.24);
+}
+
+.tx-sent-icon .glyph-icon {
+    -fx-fill: derive(-bs-rd-green-dark, 40%);
+}
+
+/* soften the white QR background against the dark theme */
+.qr-code-pane {
+    -fx-opacity: 0.9;
 }

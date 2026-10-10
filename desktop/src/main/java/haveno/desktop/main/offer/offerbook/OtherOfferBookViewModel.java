@@ -74,8 +74,23 @@ public class OtherOfferBookViewModel extends OfferBookViewModel {
         if (direction == OfferDirection.BUY) {
             preferences.setBuyScreenOtherCurrencyCode(code);
         } else {
-            preferences.setBuyScreenOtherCurrencyCode(code);
+            preferences.setSellScreenOtherCurrencyCode(code);
         }
+    }
+
+    @Override
+    void savePaymentMethodInPreferences(OfferDirection direction, String paymentMethodId) {
+        if (direction == OfferDirection.BUY) {
+            preferences.setBuyScreenOtherPaymentMethodId(paymentMethodId);
+        } else {
+            preferences.setSellScreenOtherPaymentMethodId(paymentMethodId);
+        }
+    }
+
+    @Override
+    String getPaymentMethodIdFromPreferences(OfferDirection direction) {
+        return direction == OfferDirection.BUY ? preferences.getBuyScreenOtherPaymentMethodId() :
+                preferences.getSellScreenOtherPaymentMethodId();
     }
 
     @Override
@@ -108,13 +123,14 @@ public class OtherOfferBookViewModel extends OfferBookViewModel {
 
     @Override
     Predicate<OfferBookListItem> getCurrencyAndMethodPredicate(OfferDirection direction,
-                                                               TradeCurrency selectedTradeCurrency) {
+                                                               TradeCurrency selectedTradeCurrency,
+                                                               boolean applyPaymentMethodFilter) {
         return offerBookListItem -> {
             Offer offer = offerBookListItem.getOffer();
             boolean directionResult = offer.getDirection() != direction;
             boolean currencyResult = CurrencyUtil.isTraditionalCurrency(offer.getCounterCurrencyCode()) && !CurrencyUtil.isFiatCurrency(offer.getCounterCurrencyCode()) &&
                     (showAllTradeCurrenciesProperty.get() || offer.getCounterCurrencyCode().equals(selectedTradeCurrency.getCode()));
-            boolean paymentMethodResult = showAllPaymentMethods ||
+            boolean paymentMethodResult = !applyPaymentMethodFilter || showAllPaymentMethods ||
                     offer.getPaymentMethod().equals(selectedPaymentMethod);
             boolean notMyOfferOrShowMyOffersActivated = !isMyOffer(offerBookListItem.getOffer()) || preferences.isShowOwnOffersInOfferBook();
             return directionResult && currencyResult && paymentMethodResult && notMyOfferOrShowMyOffersActivated;
