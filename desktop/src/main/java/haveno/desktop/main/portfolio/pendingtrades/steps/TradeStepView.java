@@ -43,7 +43,6 @@ import haveno.core.trade.TakerTrade;
 import haveno.core.trade.Trade;
 import haveno.core.user.Preferences;
 import haveno.core.xmr.wallet.XmrWalletService;
-import haveno.desktop.components.AutoTooltipLabel;
 import haveno.desktop.components.BusyAnimation;
 import haveno.desktop.components.PopOverWrapper;
 import haveno.desktop.components.controlsfx.control.PopOver;
@@ -53,6 +52,7 @@ import javafx.geometry.Pos;
 import javafx.scene.control.Button;
 import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.Hyperlink;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextArea;
 import javafx.scene.layout.Region;
@@ -67,6 +67,7 @@ import haveno.desktop.main.portfolio.pendingtrades.PendingTradesViewModel;
 import haveno.desktop.main.portfolio.pendingtrades.TradeStepInfo;
 import haveno.desktop.main.portfolio.pendingtrades.TradeSubView;
 import static haveno.desktop.util.FormBuilder.addButtonBusyAnimationLabel;
+import static haveno.desktop.util.FormBuilder.setButtonBusyContent;
 import static haveno.desktop.util.FormBuilder.addMultilineLabel;
 
 import haveno.network.p2p.BootstrapListener;
@@ -87,7 +88,6 @@ import javafx.scene.layout.ColumnConstraints;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
-import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import org.fxmisc.easybind.EasyBind;
 import org.fxmisc.easybind.Subscription;
@@ -112,6 +112,7 @@ public abstract class TradeStepView extends VBox {
     private VBox deadlinePeriod;
     private HBox maximumPeriodRow;
     private final VBox actionPane;
+    private Button confirmationButton;
     private VBox deadlinePane;
     private VBox sidebar;
     private VBox helpPane;
@@ -687,6 +688,7 @@ public abstract class TradeStepView extends VBox {
         currency.getStyleClass().add("trade-amount-currency");
         Button copyAmount = new Button();
         GUIUtil.configureCopyIcon(copyAmount, () -> number);
+        Accessibility.setName(copyAmount, Res.get("shared.copyToClipboard") + ": " + volume);
         copyAmount.getStyleClass().add("trade-copy-button");
         copyAmount.getGraphic().getStyleClass().add("trade-copy-icon");
         HBox value = new HBox(8, amount, currency, copyAmount);
@@ -694,10 +696,17 @@ public abstract class TradeStepView extends VBox {
         VBox metric = new VBox(6, label, value);
         Label xmrAmount = new Label(model.getTradeVolume());
         xmrAmount.setWrapText(true);
+        Button copyXmrAmount = new Button();
+        GUIUtil.configureCopyIcon(copyXmrAmount, () -> HavenoUtils.formatXmr(trade.getAmount()));
+        Accessibility.setName(copyXmrAmount, Res.get("shared.copyToClipboard") + ": " + xmrAmount.getText());
+        copyXmrAmount.getStyleClass().add("trade-copy-button");
+        copyXmrAmount.getGraphic().getStyleClass().add("trade-copy-icon");
+        HBox xmrValue = new HBox(8, xmrAmount, copyXmrAmount);
+        xmrValue.setAlignment(Pos.CENTER_RIGHT);
         Label rate = new Label(Res.get("portfolio.pending.tradeView.atPrice", model.getTradePrice()));
         rate.getStyleClass().add("trade-secondary");
         rate.setWrapText(true);
-        VBox exchange = new VBox(4, xmrAmount, rate);
+        VBox exchange = new VBox(4, xmrValue, rate);
         exchange.setAlignment(Pos.BOTTOM_RIGHT);
         exchange.setMinWidth(0);
         Region spacer = new Region();
@@ -750,43 +759,25 @@ public abstract class TradeStepView extends VBox {
     protected Tuple4<Button, BusyAnimation, Label, HBox> addConfirmationButton(GridPane pane, int row, String title) {
         Tuple4<Button, BusyAnimation, Label, HBox> action = addButtonBusyAnimationLabel(pane, row, 0, title, 4);
         Button button = action.first;
+        confirmationButton = button;
         BusyAnimation busy = action.second;
         action.fourth.getChildren().remove(busy);
-        button.getStyleClass().add("trade-confirmation-button");
-
-        Label idleText = new AutoTooltipLabel(title);
-        Label busyText = new AutoTooltipLabel(Res.get("portfolio.pending.tradeView.confirmingAction"));
-        idleText.setMinWidth(0);
-        busyText.setMinWidth(0);
-        idleText.fontProperty().bind(button.fontProperty());
-        busyText.fontProperty().bind(button.fontProperty());
-        idleText.textFillProperty().bind(button.textFillProperty());
-        busyText.textFillProperty().bind(button.textFillProperty());
-        busy.setMinSize(14, 14);
-        busy.setPrefSize(14, 14);
-        busy.setMaxSize(14, 14);
-        StackPane spinner = new StackPane(busy);
-        spinner.setMinSize(14, 14);
-        spinner.setPrefSize(14, 14);
-        spinner.setMaxSize(14, 14);
-        HBox progress = new HBox(8, spinner, busyText);
-        progress.setAlignment(Pos.CENTER);
-
-        // measure both states so confirmation never changes the button's size
-        StackPane content = new StackPane(idleText, progress);
-        idleText.visibleProperty().bind(busy.isRunningProperty().not());
-        progress.visibleProperty().bind(busy.isRunningProperty());
-        button.setGraphic(content);
-        button.setContentDisplay(ContentDisplay.GRAPHIC_ONLY);
-        button.textProperty().bind(Bindings.when(busy.isRunningProperty()).then(busyText.getText()).otherwise(title));
+        setButtonBusyContent(button, busy).setText(Res.get("portfolio.pending.tradeView.confirmingAction"));
         busy.isRunningProperty().addListener((observable, oldValue, running) -> {
-            button.pseudoClassStateChanged(PseudoClass.getPseudoClass("busy"), running);
             confirmationInProgress = running;
             updateStatus();
         });
 
         initStatusLabel(action.third);
         return action;
+    }
+
+    // brings the step's confirmation button into view and focuses it; false when the step has none
+    public boolean focusConfirmationButton(ScrollPane scrollPane) {
+        if (confirmationButton == null) return false;
+        GUIUtil.scrollIntoView(scrollPane, actionPane);
+        confirmationButton.requestFocus();
+        return true;
     }
 
     protected void initStatusLabel(Label label) {
@@ -818,6 +809,7 @@ public abstract class TradeStepView extends VBox {
         addInfoBlock();
         confirmationPane = new TradeConfirmationPane();
         gridPane.add(confirmationPane, 0, ++gridRow, 2, 1);
+        gridPane.add(createAmountPanel(Res.get("portfolio.pending.step1.paymentAmount")), 0, ++gridRow, 2, 1);
         updateStepCaption(Res.get("portfolio.pending.tradeView.confirming"));
         updateDepositSummary();
     }

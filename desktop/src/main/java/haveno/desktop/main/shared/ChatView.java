@@ -33,6 +33,7 @@ import haveno.core.support.SupportSession;
 import haveno.core.support.dispute.Attachment;
 import haveno.core.support.dispute.DisputeSession;
 import haveno.core.support.messages.ChatMessage;
+import haveno.core.support.traderchat.TraderChatManager;
 
 import haveno.network.p2p.network.Connection;
 
@@ -553,7 +554,8 @@ public class ChatView extends AnchorPane {
 
                     private List<Observable> msgStateProperties(ChatMessage message) {
                         return List.of(message.arrivedProperty(), message.storedInMailboxProperty(),
-                                message.acknowledgedProperty(), message.ackErrorProperty(), message.sendMessageErrorProperty());
+                                message.acknowledgedProperty(), message.ackErrorProperty(), message.sendMessageErrorProperty(),
+                                message.ackTimedOutProperty());
                     }
 
                     // fit the bubble to its content up to a share of the list width; system messages span it
@@ -586,7 +588,8 @@ public class ChatView extends AnchorPane {
                         } else if (message.ackErrorProperty().get() != null) {
                             visible = true;
                             icon = FontAwesomeIcon.EXCLAMATION_CIRCLE;
-                            text = Res.get("support.error", message.ackErrorProperty().get());
+                            String ackError = message.ackErrorProperty().get();
+                            text = TraderChatManager.TRADE_COMPLETED_ERROR.equals(ackError) ? Res.get("support.errorTradeCompleted") : Res.get("support.error", ackError);
                             statusIcon.getStyleClass().add("error-text");
                             statusInfoLabel.getStyleClass().add("error-text");
                         } else if (message.sendMessageErrorProperty().get() != null) {
@@ -599,6 +602,17 @@ public class ChatView extends AnchorPane {
                             visible = true;
                             icon = FontAwesomeIcon.ENVELOPE;
                             text = Res.get("support.savedInMailbox");
+                        } else if (message.ackTimedOutProperty().get()) {
+                            visible = true;
+                            icon = FontAwesomeIcon.EXCLAMATION_CIRCLE;
+                            text = Res.get("support.error", Res.get("support.errorTimeout"));
+                            statusIcon.getStyleClass().add("error-text");
+                            statusInfoLabel.getStyleClass().add("error-text");
+                        } else if (!message.isSystemMessage() && !sendingMessages.contains(message)) {
+                            // retain an unconfirmed status without an active send, including after restart
+                            visible = true;
+                            icon = FontAwesomeIcon.QUESTION_CIRCLE;
+                            text = Res.get("support.deliveryUnconfirmed");
                         } else if (message.arrivedProperty().get()) {
                             visible = true;
                             icon = FontAwesomeIcon.MAIL_REPLY;
@@ -759,7 +773,7 @@ public class ChatView extends AnchorPane {
         message.startAckTimer();
         sendingMessages.add(message);
         List<Observable> sendStates = List.of(message.acknowledgedProperty(), message.storedInMailboxProperty(),
-                message.ackErrorProperty(), message.sendMessageErrorProperty());
+                message.ackErrorProperty(), message.sendMessageErrorProperty(), message.ackTimedOutProperty());
         InvalidationListener sendDoneListener = new InvalidationListener() {
             @Override
             public void invalidated(Observable observable) {
@@ -776,7 +790,8 @@ public class ChatView extends AnchorPane {
 
     private boolean isSendingDone(ChatMessage message) {
         return message.acknowledgedProperty().get() || message.storedInMailboxProperty().get() ||
-                message.ackErrorProperty().get() != null || message.sendMessageErrorProperty().get() != null;
+                message.ackErrorProperty().get() != null || message.sendMessageErrorProperty().get() != null ||
+                message.ackTimedOutProperty().get();
     }
 
     private ChatMessage sendDisputeDirectMessage(String text, ArrayList<Attachment> attachments) {

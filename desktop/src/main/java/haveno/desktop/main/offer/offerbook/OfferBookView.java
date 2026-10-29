@@ -57,11 +57,10 @@ import haveno.desktop.main.MainView;
 import haveno.desktop.main.account.AccountView;
 import haveno.desktop.main.account.content.cryptoaccounts.CryptoAccountsView;
 import haveno.desktop.main.account.content.traditionalaccounts.TraditionalAccountsView;
-import haveno.desktop.main.funds.FundsView;
-import haveno.desktop.main.funds.withdrawal.WithdrawalView;
 import haveno.desktop.main.offer.OfferView;
 import haveno.desktop.main.offer.OfferViewUtil;
 import haveno.desktop.main.overlays.popups.Popup;
+import haveno.desktop.main.overlays.windows.RemoveOfferWindow;
 import haveno.desktop.main.overlays.windows.OfferDetailsWindow;
 import haveno.desktop.main.portfolio.PortfolioView;
 import haveno.desktop.main.portfolio.editoffer.EditOfferView;
@@ -146,7 +145,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
     private ListChangeListener<OfferBookListItem> offerListListener;
     private ChangeListener<Number> priceFeedUpdateCounterListener;
     private Subscription currencySelectionSubscriber;
-    private Subscription filterTextHidesOffersSubscriber;
+    private Subscription filtersHideOffersSubscriber;
     private static final int SHOW_ALL = 0;
     private Label disabledCreateOfferButtonTooltip;
     protected VBox currencyComboBoxContainer;
@@ -227,8 +226,8 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
             }
         };
         createOfferButton.setGraphicTextGap(10);
-        createOfferButton.setPrefWidth(340); // overhangs the actions + trader columns (300) for emphasis
-        createOfferButton.setStyle("-fx-padding: 7 25 7 25;");
+        createOfferButton.setPrefWidth(340); // overhangs the actions (225) and trader (60) columns for emphasis
+        createOfferButton.setStyle("-fx-padding: 8 25 8 25;"); // matches the filter row inputs (35px)
         disabledCreateOfferButtonTooltip = new Label("");
         disabledCreateOfferButtonTooltip.setMinSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
         disabledCreateOfferButtonTooltip.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
@@ -513,7 +512,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
         model.getOfferList().addListener(offerListListener);
         nrOfOffersLabel.setText(Res.get("offerbook.nrOffers", model.getOfferList().size()));
-        filterTextHidesOffersSubscriber = EasyBind.subscribe(model.filterTextHidesOffers, hides ->
+        filtersHideOffersSubscriber = EasyBind.subscribe(model.filtersHideOffers, hides ->
                 GUIUtil.updateFilterPlaceholder(tableView, hides));
 
         model.priceFeedService.updateCounterProperty().addListener(priceFeedUpdateCounterListener);
@@ -584,7 +583,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         model.priceFeedService.updateCounterProperty().removeListener(priceFeedUpdateCounterListener);
 
         currencySelectionSubscriber.unsubscribe();
-        filterTextHidesOffersSubscriber.unsubscribe();
+        filtersHideOffersSubscriber.unsubscribe();
     }
 
     static class CurrencyStringConverter extends StringConverter<TradeCurrency> {
@@ -689,7 +688,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
     public void setDirection(OfferDirection direction) {
         model.initWithDirection(direction);
-        createOfferButton.setGraphic(GUIUtil.getCurrencyIconWithBorder(Res.getBaseCurrencyCode(), 26, 1));
+        createOfferButton.setGraphic(GUIUtil.getMoneroMark());
         createOfferButton.setContentDisplay(ContentDisplay.RIGHT);
         createOfferButton.setId(direction == OfferDirection.SELL ? "sell-button-big" : "buy-button-big");
         avatarColumn.setTitle(direction == OfferDirection.SELL ? Res.get("shared.buyerUpperCase") : Res.get("shared.sellerUpperCase"));
@@ -831,13 +830,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
         if (model.isBootstrappedOrShowPopup()) {
             String key = "RemoveOfferWarning";
             if (DontShowAgainLookup.showAgain(key)) {
-                String message = Res.get("popup.warning.removeOffer");
-                new Popup().warning(message)
-                        .actionButtonText(Res.get("shared.removeOffer"))
-                        .onAction(() -> doRemoveOffer(offer))
-                        .closeButtonText(Res.get("shared.dontRemoveOffer"))
-                        .dontShowAgainId(key)
-                        .show();
+                RemoveOfferWindow.show(offer, model.hasClonedOffer(offer), () -> doRemoveOffer(offer));
             } else {
                 doRemoveOffer(offer);
             }
@@ -852,17 +845,8 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
     }
 
     private void doRemoveOffer(Offer offer) {
-        String key = "WithdrawFundsAfterRemoveOfferInfo";
         model.onRemoveOpenOffer(offer,
-                () -> {
-                    log.debug(Res.get("offerbook.removeOffer.success"));
-                    if (DontShowAgainLookup.showAgain(key))
-                        new Popup().instruction(Res.get("offerbook.withdrawFundsHint", Res.get("funds.tab.withdrawal")))
-                                .actionButtonTextWithGoTo("funds.tab.withdrawal")
-                                .onAction(() -> navigation.navigateTo(MainView.class, FundsView.class, WithdrawalView.class))
-                                .dontShowAgainId(key)
-                                .show();
-                },
+                () -> log.debug(Res.get("offerbook.removeOffer.success")),
                 (message) -> {
                     log.error(message);
                     new Popup().warning(Res.get("offerbook.removeOffer.failed", message)).show();
@@ -1398,7 +1382,7 @@ abstract public class OfferBookView<R extends GridPane, M extends OfferBookViewM
 
     private void updateCreateOfferButton() {
         createOfferButton.setText(Res.get("offerbook.createNewOffer",
-                model.getDirection() == OfferDirection.BUY ? Res.get("shared.buy").toUpperCase() : Res.get("shared.sell").toUpperCase(),
+                model.getDirection() == OfferDirection.BUY ? Res.get("shared.buy") : Res.get("shared.sell"),
                 getTradeCurrencyCode()));
     }
 

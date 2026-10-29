@@ -24,23 +24,20 @@ import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.common.util.Tuple4;
 import haveno.core.locale.Res;
+import haveno.core.monetary.Volume;
 import haveno.core.payment.PaymentAccount;
 import haveno.core.payment.payload.AssetAccountPayload;
-import haveno.core.payment.payload.BlikAccountPayload;
-import haveno.core.payment.payload.CashDepositAccountPayload;
-import haveno.core.payment.payload.F2FAccountPayload;
-import haveno.core.payment.payload.FasterPaymentsAccountPayload;
-import haveno.core.payment.payload.HalCashAccountPayload;
-import haveno.core.payment.payload.MoneyGramAccountPayload;
-import haveno.core.payment.payload.PayByMailAccountPayload;
 import haveno.core.payment.payload.PaymentAccountPayload;
 import haveno.core.payment.payload.PaymentMethod;
-import haveno.core.payment.payload.SwiftAccountPayload;
-import haveno.core.payment.payload.USPostalMoneyOrderAccountPayload;
-import haveno.core.payment.payload.WesternUnionAccountPayload;
+import haveno.core.payment.payload.SepaAccountPayload;
+import haveno.core.payment.payload.SepaInstantAccountPayload;
 import haveno.core.trade.Trade;
 import haveno.core.user.DontShowAgainLookup;
-import haveno.core.util.VolumeUtil;
+import haveno.desktop.main.MainView;
+import haveno.desktop.main.portfolio.PortfolioView;
+import haveno.desktop.main.portfolio.pendingtrades.PendingTradesView;
+import haveno.desktop.main.overlays.windows.PaymentInstructionsWindow;
+import haveno.desktop.main.overlays.windows.PaymentConfirmationWindow;
 import haveno.desktop.components.BusyAnimation;
 import haveno.desktop.components.paymentmethods.AchTransferForm;
 import haveno.desktop.components.paymentmethods.AdvancedCashForm;
@@ -124,6 +121,7 @@ import haveno.desktop.components.paymentmethods.VippsMobilePayForm;
 import haveno.desktop.components.paymentmethods.WeChatPayForm;
 import haveno.desktop.components.paymentmethods.WesternUnionForm;
 import haveno.desktop.main.overlays.popups.Popup;
+import haveno.desktop.main.overlays.windows.SepaQRCodeWindow;
 import haveno.desktop.main.portfolio.pendingtrades.PendingTradesViewModel;
 import haveno.desktop.main.portfolio.pendingtrades.steps.TradeStepView;
 import haveno.desktop.main.portfolio.pendingtrades.TradeFormPane;
@@ -142,6 +140,8 @@ import javafx.scene.layout.Region;
 
 import org.fxmisc.easybind.EasyBind;
 import org.fxmisc.easybind.Subscription;
+
+import javax.annotation.Nullable;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static haveno.desktop.util.FormBuilder.addButtonBusyAnimationLabel;
@@ -553,7 +553,8 @@ public class BuyerStep2View extends TradeStepView {
 
         paymentFields.finish(model.isBlockChainMethod());
         paymentAccountGridPane = createGridPane();
-        Label title = new Label(Res.get("portfolio.pending.tradeView.sendAmount", model.getFiatVolume(), Res.get(paymentMethodId)));
+        Label title = new Label(model.isBlockChainMethod() ? Res.get("portfolio.pending.tradeView.sendCryptoAmount", model.getFiatVolume()) :
+                Res.get("portfolio.pending.tradeView.sendAmount", model.getFiatVolume(), Res.get(paymentMethodId)));
         title.setWrapText(true);
         title.getStyleClass().add("trade-action-title");
         paymentAccountGridPane.add(title, 0, 0, 2, 1);
@@ -568,6 +569,7 @@ public class BuyerStep2View extends TradeStepView {
         detailsTitle.setWrapText(true);
         detailsTitle.getStyleClass().add("trade-section-heading");
         copyAll = new Hyperlink(Res.get("portfolio.pending.tradeView.copyAll"));
+        copyAll.setMinWidth(Region.USE_PREF_SIZE);
         copyFeedback = new PauseTransition(Duration.seconds(1));
         copyFeedback.setOnFinished(event -> copyAll.setText(Res.get("portfolio.pending.tradeView.copyAll")));
         copyAll.setOnAction(event -> {
@@ -578,9 +580,15 @@ public class BuyerStep2View extends TradeStepView {
         boolean hasInlineDetails = !paymentMethodId.equals(PaymentMethod.SWIFT_ID) && !paymentFields.getPaymentDetails().isEmpty();
         copyAll.setVisible(hasInlineDetails);
         copyAll.setManaged(hasInlineDetails);
+        String epcPayload = getSepaEpcPayload(paymentAccountPayload, trade.getVolume());
+        Hyperlink showQrCode = new Hyperlink(Res.get("portfolio.pending.tradeView.showQrCode"));
+        showQrCode.setMinWidth(Region.USE_PREF_SIZE);
+        showQrCode.setOnAction(event -> new SepaQRCodeWindow(epcPayload).show());
+        showQrCode.setVisible(epcPayload != null);
+        showQrCode.setManaged(epcPayload != null);
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
-        HBox detailsHeading = new HBox(12, detailsTitle, spacer, copyAll);
+        HBox detailsHeading = new HBox(12, detailsTitle, spacer, showQrCode, copyAll);
         detailsHeading.setAlignment(Pos.CENTER_LEFT);
         paymentAccountGridPane.add(detailsHeading, 0, actionRow++, 2, 1);
         paymentAccountGridPane.add(paymentFields, 0, actionRow++, 2, 1);
@@ -597,6 +605,14 @@ public class BuyerStep2View extends TradeStepView {
         confirmButton.setOnAction(e -> onPaymentSent());
         busyAnimation = tuple3.second;
         paymentDetailsLabel = tuple3.third;
+    }
+
+    // offered only with the matching form, so the encoded details are the displayed ones
+    @Nullable
+    private String getSepaEpcPayload(PaymentAccountPayload payload, Volume volume) {
+        if (payload instanceof SepaAccountPayload sepa && PaymentMethod.SEPA_ID.equals(sepa.getPaymentMethodId())) return SepaQRCodeWindow.getEpcPayload(sepa.getHolderName(), sepa.getBic(), sepa.getIban(), volume);
+        if (payload instanceof SepaInstantAccountPayload sepa && PaymentMethod.SEPA_INSTANT_ID.equals(sepa.getPaymentMethodId())) return SepaQRCodeWindow.getEpcPayload(sepa.getHolderName(), sepa.getBic(), sepa.getIban(), volume);
+        return null;
     }
 
     private void createRecommendationGridPane() {
@@ -708,88 +724,18 @@ public class BuyerStep2View extends TradeStepView {
             return;
         }
 
-        PaymentAccountPayload sellersPaymentAccountPayload = model.dataModel.getSellersPaymentAccountPayload();
-        Trade trade = checkNotNull(model.dataModel.getTrade(), "trade must not be null");
-        if (sellersPaymentAccountPayload instanceof CashDepositAccountPayload) {
-            String key = "confirmPaperReceiptSent";
-            if (!DevEnv.isDevMode() && DontShowAgainLookup.showAgain(key)) {
-                Popup popup = new Popup();
-                popup.headLine(Res.get("portfolio.pending.step2_buyer.paperReceipt.headline"))
-                        .feedback(Res.get("portfolio.pending.step2_buyer.paperReceipt.msg"))
-                        .onAction(this::showConfirmPaymentSentPopup)
-                        .closeButtonText(Res.get("shared.no"))
-                        .onClose(popup::hide)
-                        .dontShowAgainId(key)
-                        .show();
-            } else {
-                showConfirmPaymentSentPopup();
-            }
-        } else if (sellersPaymentAccountPayload instanceof WesternUnionAccountPayload) {
-            String key = "westernUnionMTCNSent";
-            if (!DevEnv.isDevMode() && DontShowAgainLookup.showAgain(key)) {
-                String email = ((WesternUnionAccountPayload) sellersPaymentAccountPayload).getEmail();
-                Popup popup = new Popup();
-                popup.headLine(Res.get("portfolio.pending.step2_buyer.westernUnionMTCNInfo.headline"))
-                        .feedback(Res.get("portfolio.pending.step2_buyer.westernUnionMTCNInfo.msg", email))
-                        .onAction(this::showConfirmPaymentSentPopup)
-                        .actionButtonText(Res.get("shared.yes"))
-                        .closeButtonText(Res.get("shared.no"))
-                        .onClose(popup::hide)
-                        .dontShowAgainId(key)
-                        .show();
-            } else {
-                showConfirmPaymentSentPopup();
-            }
-        } else if (sellersPaymentAccountPayload instanceof MoneyGramAccountPayload) {
-            String key = "moneyGramMTCNSent";
-            if (!DevEnv.isDevMode() && DontShowAgainLookup.showAgain(key)) {
-                String email = ((MoneyGramAccountPayload) sellersPaymentAccountPayload).getEmail();
-                Popup popup = new Popup();
-                popup.headLine(Res.get("portfolio.pending.step2_buyer.moneyGramMTCNInfo.headline"))
-                        .feedback(Res.get("portfolio.pending.step2_buyer.moneyGramMTCNInfo.msg", email))
-                        .onAction(this::showConfirmPaymentSentPopup)
-                        .actionButtonText(Res.get("shared.yes"))
-                        .closeButtonText(Res.get("shared.no"))
-                        .onClose(popup::hide)
-                        .dontShowAgainId(key)
-                        .show();
-            } else {
-                showConfirmPaymentSentPopup();
-            }
-        } else if (sellersPaymentAccountPayload instanceof HalCashAccountPayload) {
-            String key = "halCashCodeInfo";
-            if (!DevEnv.isDevMode() && DontShowAgainLookup.showAgain(key)) {
-                String mobileNr = ((HalCashAccountPayload) sellersPaymentAccountPayload).getMobileNr();
-                Popup popup = new Popup();
-                popup.headLine(Res.get("portfolio.pending.step2_buyer.halCashInfo.headline"))
-                        .feedback(Res.get("portfolio.pending.step2_buyer.halCashInfo.msg",
-                                trade.getShortId(), mobileNr))
-                        .onAction(this::showConfirmPaymentSentPopup)
-                        .actionButtonText(Res.get("shared.yes"))
-                        .closeButtonText(Res.get("shared.no"))
-                        .onClose(popup::hide)
-                        .dontShowAgainId(key)
-                        .show();
-            } else {
-                showConfirmPaymentSentPopup();
-            }
-        } else {
-            showConfirmPaymentSentPopup();
-        }
+        showConfirmPaymentSentPopup();
     }
 
     private void showConfirmPaymentSentPopup() {
+        PaymentAccountPayload account = model.dataModel.getSellersPaymentAccountPayload();
         String key = "confirmPaymentSent";
-        if (!DevEnv.isDevMode() && DontShowAgainLookup.showAgain(key)) {
-            Popup popup = new Popup();
-            popup.headLine(Res.get("portfolio.pending.step2_buyer.confirmStart.headline"))
-                    .confirmation(Res.get("portfolio.pending.step2_buyer.confirmStart.msg", getCurrencyName(trade)))
-                    .width(700)
-                    .actionButtonText(Res.get("portfolio.pending.step2_buyer.confirmStart.yes"))
+        String methodKey = PaymentConfirmationWindow.methodConfirmationKey(account);
+        boolean showMethod = methodKey != null && DontShowAgainLookup.showAgain(methodKey);
+        if (!DevEnv.isDevMode() && (DontShowAgainLookup.showAgain(key) || showMethod)) {
+            new PaymentConfirmationWindow(trade, account)
                     .onAction(this::confirmPaymentSent)
-                    .closeButtonText(Res.get("shared.no"))
-                    .onClose(popup::hide)
-                    .dontShowAgainId(key)
+                    .dontShowAgainId(DontShowAgainLookup.showAgain(key) ? key : methodKey)
                     .show();
         } else {
             confirmPaymentSent();
@@ -801,7 +747,7 @@ public class BuyerStep2View extends TradeStepView {
         setPreparingConfirmation();
         disableConfirmationButton(confirmButton);
 
-        model.dataModel.onPaymentSent(() -> {
+        model.dataModel.onPaymentSent(trade, () -> {
         }, errorMessage -> UserThread.execute(() -> {
             busyAnimation.stop();
             new Popup().warning(Res.get("popup.warning.sendMsgFailed") + "\n\n" + errorMessage).show();
@@ -810,75 +756,17 @@ public class BuyerStep2View extends TradeStepView {
         }));
     }
 
-    private boolean shouldShowReferenceWarning(PaymentAccountPayload payload) {
-        return !(payload instanceof AssetAccountPayload || payload instanceof WesternUnionAccountPayload ||
-                payload instanceof MoneyGramAccountPayload || payload instanceof F2FAccountPayload ||
-                payload instanceof PayByMailAccountPayload || payload instanceof HalCashAccountPayload ||
-                payload instanceof BlikAccountPayload);
-    }
-
     @Override
     protected void showPaymentReminder() {
         if (!trade.isDepositsUnlocked() || trade.isPaymentSent()) return;
-        PaymentAccountPayload paymentAccountPayload = model.dataModel.getSellersPaymentAccountPayload();
-        if (paymentAccountPayload != null && !trade.isPayoutPublished()) {
-            String message = Res.get("portfolio.pending.step2.confReached");
-            String refTextWarn = shouldShowReferenceWarning(paymentAccountPayload) ? Res.get("portfolio.pending.step2_buyer.refTextWarn") : "";
-            String fees = Res.get("portfolio.pending.step2_buyer.fees");
-            String id = trade.getShortId();
-            String amount = VolumeUtil.formatVolumeWithCode(trade.getVolume());
-            if (paymentAccountPayload instanceof AssetAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.crypto",
-                        getCurrencyName(trade),
-                        amount);
-            } else if (paymentAccountPayload instanceof CashDepositAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.cash",
-                        amount) +
-                        refTextWarn + "\n\n" +
-                        fees + "\n\n" +
-                        Res.get("portfolio.pending.step2_buyer.cash.extra");
-            } else if (paymentAccountPayload instanceof WesternUnionAccountPayload) {
-                final String email = ((WesternUnionAccountPayload) paymentAccountPayload).getEmail();
-                final String extra = Res.get("portfolio.pending.step2_buyer.westernUnion.extra", email);
-                message += Res.get("portfolio.pending.step2_buyer.westernUnion",
-                        amount) +
-                        extra;
-            } else if (paymentAccountPayload instanceof MoneyGramAccountPayload) {
-                final String email = ((MoneyGramAccountPayload) paymentAccountPayload).getEmail();
-                final String extra = Res.get("portfolio.pending.step2_buyer.moneyGram.extra", email);
-                message += Res.get("portfolio.pending.step2_buyer.moneyGram",
-                        amount) +
-                        extra;
-            } else if (paymentAccountPayload instanceof USPostalMoneyOrderAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.postal", amount) +
-                        refTextWarn;
-            } else if (paymentAccountPayload instanceof F2FAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.f2f", amount);
-            } else if (paymentAccountPayload instanceof FasterPaymentsAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.pay", amount) +
-                        Res.get("portfolio.pending.step2_buyer.fasterPaymentsHolderNameInfo") + "\n\n" +
-                        refTextWarn + "\n\n" +
-                        fees;
-            } else if (paymentAccountPayload instanceof PayByMailAccountPayload ||
-                    paymentAccountPayload instanceof HalCashAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.pay", amount);
-            } else if (paymentAccountPayload instanceof SwiftAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.pay", amount) +
-                        refTextWarn + "\n\n" +
-                        Res.get("portfolio.pending.step2_buyer.fees.swift");
-            } else if (paymentAccountPayload instanceof BlikAccountPayload) {
-                message += Res.get("portfolio.pending.step2_buyer.pay.blik", amount);
-            } else {
-                message += Res.get("portfolio.pending.step2_buyer.pay", amount) +
-                        refTextWarn + "\n\n" +
-                        fees;
-            }
-
+        PaymentAccountPayload account = model.dataModel.getSellersPaymentAccountPayload();
+        if (account != null && !trade.isPayoutPublished()) {
             String key = "startPayment" + trade.getId();
             if (!DevEnv.isDevMode() && DontShowAgainLookup.showAgain(key)) {
                 DontShowAgainLookup.dontShowAgain(key, true);
-                new Popup().headLine(Res.get("popup.attention.forTradeWithId", id))
-                        .attention(message)
+                new PaymentInstructionsWindow(trade, account, true, null, false)
+                        .onAction(() -> model.getNavigation().navigateToWithData(trade,
+                                MainView.class, PortfolioView.class, PendingTradesView.class))
                         .show();
             }
         }

@@ -103,6 +103,7 @@
     -bs-rd-nav-selected: black;
     -bs-rd-nav-deselected: rgba(255, 255, 255, 1);
     -bs-rd-nav-unread-dot-stroke: -bs-rd-nav-primary-background;
+    -bs-rd-nav-badge-neutral: #5a5a5a;
     -bs-rd-nav-secondary-selected: -fx-accent;
     -bs-rd-nav-secondary-deselected: -bs-rd-font-light;
     -bs-rd-nav-button-hover: derive(-bs-rd-nav-background, 10%);
@@ -116,6 +117,8 @@
     -bs-combobox-selected: rgba(21, 188, 29, 0.1);
     -bs-combo-popup-selected: rgba(56, 128, 255, 0.15);
     -bs-combo-popup-hover: rgba(255, 255, 255, 0.06);
+    -bs-context-menu-background: #1e1e1f;
+    -bs-context-menu-hover: rgba(92, 148, 240, 0.08);
     -bs-content-pane-bg-bottom: #29292a;
     -bs-wizard-backdrop: black;
     -bs-wizard-card-bg: #1c1c1e;
@@ -684,6 +687,10 @@
     -fx-image: url("../../images/fiat_logo_dark_mode.png");
 }
 
+#message-list-view.list-view {
+    -fx-background-image: url("../../images/chatbg_dark.png");
+}
+
 /* brighten the withdraw-confirmation badges against the dark popup */
 .confirm-send-icon {
     -fx-background-color: rgba(28, 96, 220, 0.28);
@@ -701,7 +708,45 @@
     -fx-fill: derive(-bs-rd-green-dark, 40%);
 }
 
+/* keep the pending status readable against the dark sheet */
+.tx-status {
+    -fx-text-fill: #e3a23a;
+}
+
+.tx-status .progress-indicator {
+    -fx-progress-color: #e3a23a;
+}
+
+.tx-note-add:hover {
+    -fx-background-color: rgba(91, 141, 239, 0.10);
+}
+
 /* soften the white QR background against the dark theme */
 .qr-code-pane {
     -fx-opacity: 0.9;
+}
+
+.network-settings {
+    -network-purple: #b29ae4;
+    -network-text: #ececef;
+    -network-dim: #afaeb0;
+    -network-faint: #7d7c80;
+    -network-line: #29292a;
+    -network-blue: #5c94f0;
+    -network-active: rgba(92,148,240,0.08);
+    -network-selected: rgba(92,148,240,0.16);
+    -network-hover: rgba(255,255,255,0.035);
+    -network-green: #82c58d;
+    -network-green-background: rgba(130,197,141,0.14);
+    -network-amber: #eac087;
+    -network-red: #ec7a76;
+    -network-warning-background: rgba(234,192,135,0.07);
+}
+
+.review-popup {
+    -review-red: #e0504d;
+    -review-green: #4cb858;
+    -review-amber: rgb(248, 178, 73);
+    -review-gated-background: #2a2a2c;
+    -review-gated-text: #a0a0a0;
 }

@@ -213,25 +213,28 @@ public abstract class SupportManager {
     // TODO: this never updates the node address
     private void onAckMessage(DecryptedMessageWithPubKey decryptedMessageWithPubKey, AckMessage ackMessage) {
         if (ackMessage.getSourceType() == getAckMessageSourceType()) {
+            Trade trade = tradeManager.getTrade(ackMessage.getSourceId());
+            if (trade == null) {
+                log.warn("Ignoring AckMessage for unknown trade {}", ackMessage.getSourceId());
+                return;
+            }
+            TradePeer verifiedPeer = trade.getVerifiedTradePeer(decryptedMessageWithPubKey);
+            if (verifiedPeer == null) {
+                log.warn("Ignoring AckMessage from unknown peer for trade {}", ackMessage.getSourceId());
+                return;
+            }
             if (ackMessage.isSuccess()) {
                 log.info("Received AckMessage for {} with tradeId {} and uid {}", ackMessage.getSourceMsgClassName(), ackMessage.getSourceId(), ackMessage.getSourceUid());
 
                 // ack message on chat message received when dispute is opened and closed
                 if (ackMessage.getSourceMsgClassName().equals(ChatMessage.class.getSimpleName())) {
-                    Trade trade = tradeManager.getTrade(ackMessage.getSourceId());
                     for (Dispute dispute : trade.getDisputes()) {
                             synchronized (dispute.getChatMessages()) {
                                 for (ChatMessage chatMessage : dispute.getChatMessages()) {
                                     if (chatMessage.getUid().equals(ackMessage.getSourceUid())) {
                                         
                                         // set ack state
-                                        TradePeer verifiedPeer = trade.getVerifiedTradePeer(decryptedMessageWithPubKey);
-                                        if (verifiedPeer == null) {
-                                            log.warn("Received AckMessage from unknown peer {} for {} with tradeId={}, uid={}", ackMessage.getSenderNodeAddress(), ackMessage.getSourceMsgClassName(), ackMessage.getSourceId(), ackMessage.getSourceUid());
-                                            return;
-                                        } else {
-                                            verifiedPeer.setDisputeOpenedAckMessage(ackMessage);
-                                        }
+                                        verifiedPeer.setDisputeOpenedAckMessage(ackMessage);
 
                                         // advance trade state
                                         if (trade.getDisputeState() == Trade.DisputeState.DISPUTE_PREPARING || trade.getDisputeState() == Trade.DisputeState.DISPUTE_REQUESTED) { // ack can arrive before saw arrived
@@ -251,7 +254,6 @@ public abstract class SupportManager {
 
                 // nack message on chat message received when dispute closed message is nacked
                 if (ackMessage.getSourceMsgClassName().equals(ChatMessage.class.getSimpleName())) {
-                    Trade trade = tradeManager.getTrade(ackMessage.getSourceId());
                     for (Dispute dispute : trade.getDisputes()) {
                         synchronized (dispute.getChatMessages()) {
                             for (ChatMessage chatMessage : dispute.getChatMessages()) {
@@ -259,18 +261,19 @@ public abstract class SupportManager {
                                     if (!trade.isArbitrator() && (trade.getDisputeState().isRequested() || trade.getDisputeState().isCloseRequested())) {
 
                                         // set ack state
-                                        TradePeer sender = trade.getVerifiedTradePeer(decryptedMessageWithPubKey);
-                                        if (sender == null) {
-                                            log.warn("Received AckMessage from unknown peer {} for {} with tradeId={}, uid={}", ackMessage.getSenderNodeAddress(), ackMessage.getSourceMsgClassName(), ackMessage.getSourceId(), ackMessage.getSourceUid());
-                                            return;
-                                        } else {
-                                            sender.setDisputeOpenedAckMessage(ackMessage);
-                                        }
+                                        verifiedPeer.setDisputeOpenedAckMessage(ackMessage);
 
                                         // advance trade state
                                         log.warn("DisputeOpenedMessage was nacked. We close the dispute now. tradeId={}, nack sender={}", trade.getId(), ackMessage.getSenderNodeAddress());
                                         dispute.setIsClosed();
                                         trade.advanceDisputeState(Trade.DisputeState.DISPUTE_CLOSED);
+                                    } else if (trade.isArbitrator()) {
+                                        TradePeer sender = trade.getVerifiedTradePeer(decryptedMessageWithPubKey);
+                                        if (sender == null) {
+                                            log.warn("Received AckMessage from unknown peer {} for {} with tradeId={}, uid={}", ackMessage.getSenderNodeAddress(), ackMessage.getSourceMsgClassName(), ackMessage.getSourceId(), ackMessage.getSourceUid());
+                                            return;
+                                        }
+                                        onDisputeClosedMessageNack(trade, dispute, sender, ackMessage);
                                     }
                                 }
                             }
@@ -297,6 +300,10 @@ public abstract class SupportManager {
     }
 
     protected abstract AckMessageSourceType getAckMessageSourceType();
+
+    // called on the arbitrator when a trader nacks the chat message of a DisputeClosedMessage
+    protected void onDisputeClosedMessageNack(Trade trade, Dispute dispute, TradePeer sender, AckMessage ackMessage) {
+    }
 
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -354,6 +361,11 @@ public abstract class SupportManager {
 
     protected void sendAckMessage(NodeAddress peersNodeAddress, SupportMessage supportMessage, PubKeyRing peersPubKeyRing,
                                   boolean result, @Nullable String errorMessage) {
+        sendAckMessage(peersNodeAddress, supportMessage, peersPubKeyRing, result, errorMessage, null);
+    }
+
+    protected void sendAckMessage(NodeAddress peersNodeAddress, SupportMessage supportMessage, PubKeyRing peersPubKeyRing,
+                                  boolean result, @Nullable String errorMessage, @Nullable String updatedMultisigHex) {
         String tradeId = supportMessage.getTradeId();
         String uid = supportMessage.getUid();
         AckMessage ackMessage = new AckMessage(p2PService.getNetworkNode().getNodeAddress(),
@@ -362,7 +374,8 @@ public abstract class SupportManager {
                 uid,
                 tradeId,
                 result,
-                errorMessage);
+                errorMessage,
+                updatedMultisigHex);
         log.info("Send AckMessage for {} to peer {}. tradeId={}, uid={}",
                 ackMessage.getSourceMsgClassName(), peersNodeAddress, tradeId, uid);
         mailboxMessageService.sendEncryptedMailboxMessage(

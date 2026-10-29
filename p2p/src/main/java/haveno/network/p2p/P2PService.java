@@ -39,6 +39,7 @@ import haveno.network.p2p.network.ConnectionListener;
 import haveno.network.p2p.network.MessageListener;
 import haveno.network.p2p.network.NetworkNode;
 import haveno.network.p2p.network.SetupListener;
+import haveno.network.p2p.peers.BroadcastHandler;
 import haveno.network.p2p.peers.Broadcaster;
 import haveno.network.p2p.peers.PeerManager;
 import haveno.network.p2p.peers.getdata.RequestDataManager;
@@ -528,6 +529,11 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
         return p2PDataStorage.addPersistableNetworkPayload(payload, networkNode.getNodeAddress(), allowBroadcast, reBroadcast);
     }
 
+    // the listener learns whether enough peers received the broadcast, so the caller can retry an unconfirmed publish
+    public boolean addPersistableNetworkPayload(PersistableNetworkPayload payload, boolean reBroadcast, @Nullable BroadcastHandler.Listener listener) {
+        return p2PDataStorage.addPersistableNetworkPayload(payload, networkNode.getNodeAddress(), true, reBroadcast, listener);
+    }
+
     public boolean addProtectedStorageEntry(ProtectedStoragePayload protectedStoragePayload) {
         if (isBootstrapped()) {
             try {
@@ -614,6 +620,11 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
         return isBootstrapped;
     }
 
+    // true once the hidden service is published and preliminary data has arrived
+    public boolean isNetworkReady() {
+        return networkReadyBinding.get();
+    }
+
     // Re-requests P2P data from seed nodes so missing append-only data (e.g. signed witnesses) can be filled
     // in without a restart. Requests carry our known payload hashes, so responses only contain items we lack,
     // but the requests themselves grow with the data store, so callers should limit their frequency. See #2182.
@@ -621,6 +632,11 @@ public class P2PService implements SetupListener, MessageListener, ConnectionLis
         if (isBootstrapped() && requestDataManager.getNodeAddressOfPreliminaryDataRequest().isPresent()) {
             requestDataManager.requestUpdateData();
         }
+    }
+
+    // Requests data missing from our store from the given peer, e.g. a seed pulling payloads held only by an arbitrator.
+    public void requestData(NodeAddress nodeAddress) {
+        if (isBootstrapped()) requestDataManager.requestUpdateDataFrom(nodeAddress);
     }
 
     public NetworkNode getNetworkNode() {

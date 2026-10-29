@@ -17,19 +17,45 @@
 
 package haveno.desktop.main.overlays;
 
+import haveno.common.ClockWatcher;
+import haveno.desktop.main.overlays.windows.PaymentConfirmationWindow;
+import haveno.desktop.main.overlays.windows.TxDetailsWindow;
+import haveno.desktop.main.overlays.windows.TxHeroWindow;
+import haveno.desktop.main.overlays.windows.PaymentInstructionsWindow;
+import haveno.desktop.main.overlays.windows.TradePeriodWindow;
+import haveno.core.payment.payload.AssetAccountPayload;
+import haveno.core.payment.payload.CashDepositAccountPayload;
+import haveno.core.payment.payload.WesternUnionAccountPayload;
+import haveno.core.payment.payload.MoneyGramAccountPayload;
+import haveno.core.payment.payload.HalCashAccountPayload;
+import haveno.core.payment.payload.SepaAccountPayload;
+import haveno.core.payment.payload.BlikAccountPayload;
+import java.util.Date;
 import haveno.common.ThreadUtils;
+import haveno.common.config.Config;
+import haveno.common.persistence.PersistenceManager;
 import haveno.common.Timer;
 import haveno.common.UserThread;
+import haveno.common.app.Version;
 import haveno.common.util.Utilities;
+import haveno.common.crypto.KeyRing;
 import haveno.common.crypto.PubKeyRing;
 import haveno.common.crypto.PubKeyRingProvider;
 import haveno.core.api.CoreNotificationService;
+import haveno.core.api.XmrConnectionService;
+import haveno.core.api.XmrLocalNode;
+import haveno.core.filter.Filter;
+import haveno.core.filter.FilterManager;
 import haveno.core.locale.GlobalSettings;
 import haveno.core.locale.Res;
 import haveno.core.monetary.Price;
+import haveno.core.monetary.Volume;
+import haveno.core.provider.price.PriceFeedService;
 import haveno.core.support.SupportSession;
+import haveno.core.support.SupportManager;
 import haveno.core.support.SupportType;
 import haveno.core.support.dispute.Dispute;
+import haveno.core.support.dispute.DisputeSession;
 import haveno.core.support.dispute.arbitration.ArbitrationManager;
 import haveno.core.support.dispute.mediation.MediationManager;
 import haveno.core.support.dispute.refund.RefundManager;
@@ -38,8 +64,16 @@ import haveno.core.support.traderchat.TraderChatManager;
 import haveno.core.trade.Contract;
 import haveno.core.trade.Trade;
 import haveno.core.trade.TradeManager;
+import haveno.core.trade.BuyerTrade;
+import haveno.core.trade.SellerTrade;
+import haveno.core.trade.protocol.BuyerProtocol;
+import haveno.core.trade.protocol.SellerProtocol;
 import haveno.core.trade.protocol.TradePeer;
 import haveno.core.user.Preferences;
+import haveno.core.user.Preferences.UseTorForXmr;
+import haveno.core.xmr.nodes.XmrNodes;
+import haveno.core.xmr.nodes.XmrNodes.MoneroNodesOption;
+import haveno.core.xmr.wallet.XmrWalletService;
 import haveno.desktop.Navigation;
 import haveno.desktop.common.model.WithDataModel;
 import haveno.desktop.common.view.AbstractView;
@@ -47,6 +81,9 @@ import haveno.desktop.common.view.CachingViewLoader;
 import haveno.desktop.common.view.View;
 import haveno.desktop.common.view.ViewPath;
 import haveno.desktop.main.MainView;
+import haveno.desktop.main.funds.transactions.TransactionsListItem;
+import haveno.desktop.main.settings.network.NetworkSettingsView;
+import haveno.desktop.main.overlays.windows.TorNetworkSettingsWindow;
 import haveno.desktop.main.overlays.notifications.Notification;
 import haveno.desktop.main.overlays.notifications.NotificationCenter;
 import haveno.desktop.main.overlays.notifications.NotificationManager;
@@ -60,6 +97,8 @@ import haveno.desktop.main.portfolio.pendingtrades.PendingTradesView;
 import haveno.desktop.main.portfolio.pendingtrades.PendingTradesViewModel;
 import haveno.desktop.main.shared.ChatView;
 import haveno.desktop.main.support.SupportView;
+import haveno.desktop.main.support.dispute.DisputeChatPopup;
+import haveno.desktop.main.support.dispute.agent.DisputeAgentView;
 import haveno.desktop.main.support.dispute.client.arbitration.ArbitrationClientView;
 import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.CssTheme;
@@ -71,6 +110,7 @@ import haveno.network.p2p.mailbox.MailboxMessageService;
 import haveno.proto.grpc.NotificationMessage;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Field;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -84,6 +124,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.property.ObjectProperty;
@@ -91,17 +132,30 @@ import javafx.beans.property.ReadOnlyBooleanWrapper;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleDoubleProperty;
 import javafx.beans.property.SimpleObjectProperty;
+import javafx.beans.property.SimpleLongProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.collections.ObservableMap;
 import javafx.collections.transformation.FilteredList;
 import javafx.event.EventHandler;
 import javafx.event.EventType;
+import javafx.fxml.FXMLLoader;
 import javafx.geometry.Insets;
 import javafx.geometry.NodeOrientation;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
 import javafx.scene.Scene;
+import javafx.scene.control.Button;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.Label;
+import javafx.scene.control.ListCell;
+import javafx.scene.control.ListView;
+import javafx.scene.control.TextField;
+import javafx.scene.control.TextArea;
+import javafx.scene.control.TableCell;
+import javafx.scene.control.TableRow;
+import javafx.scene.control.TableView;
+import javafx.scene.control.Tooltip;
 import javafx.scene.effect.BoxBlur;
 import javafx.scene.effect.ColorAdjust;
 import javafx.scene.effect.GaussianBlur;
@@ -115,6 +169,7 @@ import javafx.scene.input.ScrollEvent;
 import javafx.scene.input.TouchEvent;
 import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.GridPane;
+import javafx.scene.layout.HBox;
 import javafx.scene.layout.VBox;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.StackPane;
@@ -122,6 +177,10 @@ import javafx.stage.Popup;
 import javafx.stage.Stage;
 import javafx.stage.Window;
 import javafx.stage.WindowEvent;
+import monero.common.MoneroRpcConnection;
+import monero.daemon.model.MoneroTx;
+import monero.wallet.model.MoneroTxWallet;
+import monero.wallet.model.MoneroWalletListener;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -133,6 +192,7 @@ import org.mockito.MockedStatic;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -143,8 +203,10 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
@@ -158,6 +220,17 @@ import static org.mockito.Mockito.withSettings;
 public class OverlayTest {
 
     @Test
+    public void popupLinksOnlyAcceptWebSchemes() throws Exception {
+        Res.setup();
+        A overlay = new A();
+        overlay.information("[HYPERLINK:file:///tmp/test] [HYPERLINK:smb://host/share] "
+                + "[HYPERLINK:javascript:alert(1)] [HYPERLINK:https://example.org] [HYPERLINK:http://example.org]");
+        Field field = Overlay.class.getDeclaredField("messageHyperlinks");
+        field.setAccessible(true);
+        assertEquals(List.of("https://example.org", "http://example.org"), field.get(overlay));
+    }
+
+    @Test
     public void typeSafeCreation() {
         new A();
         new C();
@@ -167,6 +240,806 @@ public class OverlayTest {
     @Test
     public void typeUnsafeCreation() {
         assertThrows(RuntimeException.class, () -> new B());
+    }
+
+    @Test
+    void transactionStatusSurvivesUnavailableDaemonAndAcceptsLaterUpdates() throws ReflectiveOperationException {
+        class StatusWindow extends TxHeroWindow<StatusWindow> {
+            @Override
+            protected void addContent() {
+            }
+
+            Label seed(MoneroTx tx) {
+                return (Label) txStatusRow(tx, null).getChildren().getLast();
+            }
+        }
+
+        Res.setup();
+        Executor originalExecutor = UserThread.getExecutor();
+        UserThread.setExecutor(Runnable::run);
+        try (MockedStatic<Application> application = mockStatic(Application.class)) {
+            application.when(Application::getUserAgentStylesheet).thenReturn(Application.STYLESHEET_MODENA);
+            StatusWindow window = new StatusWindow();
+            MoneroTx tx = new MoneroTxWallet().setHash("tx").setIsRelayed(true)
+                    .setIsConfirmed(true).setNumConfirmations(4L);
+            Label status = window.seed(tx);
+            assertEquals(Res.get("txDetailsWindow.status.confirmations", 4L, 10), status.getText());
+
+            XmrWalletService wallet = mock(XmrWalletService.class);
+            XmrConnectionService connection = mock(XmrConnectionService.class);
+            when(wallet.getXmrConnectionService()).thenReturn(connection);
+            var service = TxHeroWindow.class.getDeclaredField("xmrWalletService");
+            service.setAccessible(true);
+            service.set(window, wallet);
+            var refresh = TxHeroWindow.class.getDeclaredMethod("updateConfidence", boolean.class, MoneroWalletListener.class);
+            refresh.setAccessible(true);
+
+            refresh.invoke(window, true, null);
+            assertEquals(Res.get("txDetailsWindow.status.confirmations", 4L, 10), status.getText());
+
+            when(connection.getTx("tx")).thenThrow(new IllegalStateException("disconnected"));
+            refresh.invoke(window, false, null);
+            assertEquals(Res.get("txDetailsWindow.status.confirmations", 4L, 10), status.getText());
+
+            when(connection.getTxWithCache("tx")).thenReturn(tx.copy().setNumConfirmations(10L));
+            refresh.invoke(window, true, null);
+            assertEquals(Res.get("txDetailsWindow.status.confirmed"), status.getText());
+        } finally {
+            UserThread.setExecutor(originalExecutor);
+        }
+    }
+
+    @Nested
+    class TransactionMemos {
+        private final XmrWalletService wallet = mock(XmrWalletService.class);
+        private final Runnable refresh = mock(Runnable.class);
+        private final List<Runnable> background = new ArrayList<>();
+        private Executor originalExecutor;
+        private MockedStatic<Application> application;
+        private MockedStatic<GUIUtil> gui;
+        private MockedStatic<ThreadUtils> tasks;
+        private MockedConstruction<Tooltip> tooltips;
+        private MockedConstruction<haveno.desktop.main.overlays.popups.Popup> popups;
+        private TxDetailsWindow window;
+        private TextArea memo;
+        private TextArea displayedMemo;
+        private Label edit;
+        private Button add;
+        private Button save;
+        private Button cancel;
+        private int closes;
+        private boolean deferHide;
+
+        @BeforeEach
+        void setUp() {
+            Res.setup();
+            originalExecutor = UserThread.getExecutor();
+            UserThread.setExecutor(Runnable::run);
+            application = mockStatic(Application.class);
+            application.when(Application::getUserAgentStylesheet).thenReturn(Application.STYLESHEET_MODENA);
+            gui = mockStatic(GUIUtil.class);
+            tooltips = mockConstruction(Tooltip.class);
+            popups = mockConstruction(haveno.desktop.main.overlays.popups.Popup.class, withSettings().defaultAnswer(RETURNS_SELF));
+            tasks = mockStatic(ThreadUtils.class);
+            tasks.when(() -> ThreadUtils.submitToPool(any(Runnable.class))).thenAnswer(invocation -> {
+                background.add(invocation.getArgument(0));
+                return CompletableFuture.completedFuture(null);
+            });
+            window = new TxDetailsWindow(wallet, mock(Preferences.class), mock(PriceFeedService.class)) {
+                @Override
+                protected HBox txStatusRow(MoneroTx tx, XmrWalletService service) {
+                    return new HBox();
+                }
+
+                @Override
+                @SuppressWarnings("unchecked")
+                protected void onShow() {
+                    isDisplayed = true;
+                    Scene scene = mock(Scene.class);
+                    setupKeyHandler(scene);
+                    ArgumentCaptor<EventHandler<KeyEvent>> handler = ArgumentCaptor.forClass(EventHandler.class);
+                    verify(scene).setOnKeyPressed(handler.capture());
+                    gridPane.addEventHandler(KeyEvent.KEY_PRESSED, event -> {
+                        if (event.getCode() == KeyCode.ESCAPE) handler.getValue().handle(event);
+                    });
+                }
+
+                @Override
+                protected void animateHide() {
+                    closes++;
+                    if (!deferHide) onHidden();
+                }
+            };
+        }
+
+        @AfterEach
+        void tearDown() {
+            tasks.close();
+            popups.close();
+            tooltips.close();
+            gui.close();
+            application.close();
+            UserThread.setExecutor(originalExecutor);
+        }
+
+        @Test
+        void addEditAndClearMemoRefreshOnlyAfterSaving() {
+            show("tx", null);
+            assertFalse(shown(save));
+            assertFalse(shown(displayedMemo));
+            assertFalse(displayedMemo.isEditable());
+            assertTrue(shown(add));
+            VBox sheet = (VBox) ((Overlay<?>) window).gridPane.lookup(".confirm-send-sheet");
+            assertEquals(add.getParent(), sheet.getChildren().getLast());
+            int saves = 0;
+            List<String> drafts = List.of("\n \t added \t \n", "\u2003edited\n  with unicode: café\n\nlast\u2003", " \n \t ");
+            List<String> notes = List.of("added", "edited\n  with unicode: café\n\nlast", "");
+            for (String note : notes) {
+                beginEdit();
+                assertTrue(shown(save));
+                assertFalse(shown(displayedMemo));
+                assertFalse(shown(edit));
+                assertFalse(shown(add));
+                memo.setText(drafts.get(saves));
+                save.fire();
+                assertTrue(memo.isDisabled());
+                assertTrue(cancel.isDisabled());
+                verify(refresh, times(saves)).run();
+                background.remove(0).run();
+                verify(wallet).setTxNote("tx", note);
+                verify(refresh, times(++saves)).run();
+                assertFalse(memo.isDisabled());
+                assertFalse(shown(save));
+                assertEquals(!note.isEmpty(), shown(displayedMemo));
+                assertEquals(note.isEmpty(), shown(add));
+                assertEquals(note, displayedMemo.getText());
+                assertEquals(add.getParent(), sheet.getChildren().getLast());
+            }
+        }
+
+        @Test
+        void savedMemoDisplayTrimsWhitespaceWithoutChangingStoredNoteOrDraft() {
+            List<String> notes = List.of(" \n\t\u2003", "\u2003hello there\n\nhow's it going\n  \u2003");
+            List<String> displayed = List.of("", "hello there\n\nhow's it going");
+            for (int i = 0; i < notes.size(); i++) {
+                show("tx", notes.get(i));
+                assertEquals(displayed.get(i), displayedMemo.getText());
+                assertEquals(displayed.get(i).isEmpty(), shown(add));
+                assertEquals(!displayed.get(i).isEmpty(), shown(displayedMemo));
+                beginEdit();
+                assertEquals(notes.get(i), memo.getText());
+                cancel.fire();
+                assertEquals(displayed.get(i), displayedMemo.getText());
+                assertEquals(displayed.get(i).isEmpty(), shown(add));
+                ((Overlay<?>) window).actionButton.fire();
+                assertEquals(i + 1, closes);
+            }
+            assertTrue(background.isEmpty());
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void unchangedPaddedMemoDoesNotWrite() {
+            for (String note : List.of(" \n\t\u2003", "\u2003hello\nthere \n")) {
+                show("tx", note);
+                beginEdit();
+                assertEquals(note, memo.getText());
+
+                save.fire();
+
+                assertFalse(shown(save));
+                assertEquals(note.strip(), displayedMemo.getText());
+            }
+            assertTrue(background.isEmpty());
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void editedPaddedMemoCanBeTrimmedOrCleared() {
+            for (String note : List.of(" \n\t\u2003", "\u2003hello\nthere \n")) {
+                show("tx", note);
+                beginEdit();
+                memo.setText(note.strip());
+
+                save.fire();
+                assertEquals(1, background.size());
+                background.remove(0).run();
+
+                verify(wallet).setTxNote("tx", note.strip());
+                assertFalse(shown(save));
+                assertEquals(note.strip(), displayedMemo.getText());
+            }
+            verify(refresh, times(2)).run();
+        }
+
+        @Test
+        void openingAStaleRowUsesTheLatestCachedMemo() {
+            for (String note : List.of("saved memo", "")) {
+                when(wallet.getTx("tx")).thenReturn(new MoneroTxWallet().setNote(note));
+                show("tx", "old memo");
+                assertEquals(note, displayedMemo.getText());
+                beginEdit();
+                assertEquals(note, memo.getText());
+
+                save.fire();
+
+                assertFalse(shown(save));
+            }
+            assertTrue(background.isEmpty());
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void savedNoteOnlyEditsUsingPencil() {
+            show("tx", "saved note");
+            for (MouseButton button : List.of(MouseButton.SECONDARY, MouseButton.PRIMARY)) {
+                for (int clicks = 1; clicks <= 3; clicks++) {
+                    displayedMemo.fireEvent(new MouseEvent(MouseEvent.MOUSE_CLICKED, 0, 0, 0, 0, button, clicks,
+                            false, false, false, false, false, false, false, false, false, true, null));
+                    assertFalse(shown(save));
+                    assertTrue(shown(displayedMemo));
+                }
+            }
+            edit.fireEvent(new MouseEvent(MouseEvent.MOUSE_CLICKED, 0, 0, 0, 0, MouseButton.PRIMARY, 1,
+                    false, false, false, false, false, false, false, false, false, true, null));
+            assertTrue(shown(save));
+            assertEquals("saved note", memo.getText());
+            assertTrue(background.isEmpty());
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void cancelAndEscapeDiscardDraftWithoutSaving() {
+            show("tx", "saved note");
+            for (boolean escape : List.of(false, true)) {
+                beginEdit();
+                memo.setText("discard this");
+                if (escape) key(KeyCode.ESCAPE, false);
+                else {
+                    press(cancel);
+                    cancel.fire();
+                }
+                assertEquals("saved note", displayedMemo.getText());
+                assertFalse(shown(save));
+                assertTrue(shown(edit));
+                assertEquals(0, closes);
+            }
+            beginEdit();
+            assertEquals("saved note", memo.getText());
+            assertTrue(background.isEmpty());
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void enterLeavesEditorOpenWithoutSaving() {
+            show("tx", "saved note");
+            beginEdit();
+            memo.setText("first\nsecond");
+            memo.end();
+            key(KeyCode.ENTER, false);
+            assertTrue(shown(save));
+            assertTrue(background.isEmpty());
+            assertEquals(0, closes);
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void clickingOutsideSavesAndUnchangedSaveDoesNotWrite() {
+            show("tx", "saved note");
+            beginEdit();
+            memo.setText("\n  saved note \t");
+            save.fire();
+            assertFalse(shown(save));
+            assertTrue(background.isEmpty());
+            beginEdit();
+            memo.setText("  updated\n");
+            press(memo);
+            assertTrue(background.isEmpty());
+            press(((Overlay<?>) window).gridPane);
+            assertEquals(1, background.size());
+            background.remove(0).run();
+            assertEquals("updated", displayedMemo.getText());
+            verify(wallet).setTxNote("tx", "updated");
+        }
+
+        @Test
+        void hidingAndReopeningDiscardsTheDraftWithoutSaving() {
+            show("tx", "saved note");
+            beginEdit();
+            memo.setText("discard this");
+            ((Overlay<?>) window).onHidden();
+            show("tx", "saved note");
+            assertEquals("saved note", displayedMemo.getText());
+            assertFalse(shown(save));
+            assertTrue(background.isEmpty());
+            verify(wallet, never()).setTxNote(anyString(), anyString());
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void failedSaveRetainsInputAndDoneWaitsForSuccessfulRetry() {
+            show("tx", "old");
+            beginEdit();
+            memo.setText("  new\n");
+            doThrow(new IllegalStateException("disk full")).doNothing().when(wallet).setTxNote("tx", "new");
+            Button done = ((Overlay<?>) window).actionButton;
+            press(done);
+            assertTrue(background.isEmpty());
+            done.fire();
+            assertEquals(0, closes);
+            assertTrue(done.isDisabled());
+            assertEquals(Res.get("txDetailsWindow.note.saving"), done.getText());
+            assertTrue(shown(save));
+            background.remove(0).run();
+            assertFalse(done.isDisabled());
+            assertEquals(Res.get("funds.withdrawal.sent.done"), done.getText());
+            assertEquals("  new\n", memo.getText());
+            assertTrue(shown(save));
+            assertFalse(save.isDisabled());
+            assertFalse(cancel.isDisabled());
+            assertEquals("old", displayedMemo.getText());
+            Label error = (Label) ((Overlay<?>) window).gridPane.lookup(".error-text");
+            assertTrue(error.isVisible());
+            assertEquals(0, closes);
+            verifyNoInteractions(refresh);
+            done.fire();
+            background.remove(0).run();
+            assertFalse(error.isVisible());
+            assertFalse(shown(save));
+            assertEquals("new", displayedMemo.getText());
+            assertEquals(1, closes);
+            verify(refresh).run();
+            assertTrue(popups.constructed().isEmpty());
+        }
+
+        @Test
+        void failedSaveCanBeCancelledWithoutRetrying() {
+            show("tx", "old");
+            beginEdit();
+            memo.setText("new");
+            doThrow(new IllegalStateException("disk full")).when(wallet).setTxNote("tx", "new");
+            save.fire();
+            ((Overlay<?>) window).actionButton.fire();
+            assertEquals(0, closes);
+            key(KeyCode.ESCAPE, false);
+            assertEquals(0, closes);
+            ((Overlay<?>) window).doClose();
+            assertEquals(0, closes);
+            assertEquals(1, background.size());
+            background.remove(0).run();
+            assertEquals("new", memo.getText());
+            assertTrue(shown(save));
+            assertFalse(save.isDisabled());
+            assertTrue(((Overlay<?>) window).gridPane.lookup(".error-text").isVisible());
+            assertTrue(popups.constructed().isEmpty());
+
+            cancel.fire();
+
+            assertEquals("old", displayedMemo.getText());
+            assertFalse(shown(save));
+            ((Overlay<?>) window).actionButton.fire();
+            assertEquals(1, closes);
+            assertTrue(background.isEmpty());
+            verify(wallet).setTxNote("tx", "new");
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void pendingSaveDoesNotChangeOrCloseAReusedWindow() {
+            show("first", "old");
+            beginEdit();
+            memo.setText("edited");
+            ((Overlay<?>) window).actionButton.fire();
+            show("second", "second memo");
+            background.remove(0).run();
+            verify(wallet).setTxNote("first", "edited");
+            assertEquals("second memo", displayedMemo.getText());
+            assertFalse(shown(save));
+            assertEquals(0, closes);
+        }
+
+        @Test
+        void pendingSaveCannotBeDismissedOrSubmittedAgain() {
+            for (String dismissal : List.of("done", "escape", "close")) {
+                show(dismissal, "old");
+                beginEdit();
+                memo.setText("edited");
+                Button done = ((Overlay<?>) window).actionButton;
+                save.fire();
+                assertTrue(done.isDisabled());
+                assertEquals(Res.get("txDetailsWindow.note.saving"), done.getText());
+                assertTrue(save.isDisabled());
+                save.fire();
+                int previousCloses = closes;
+
+                if (dismissal.equals("done")) done.fire();
+                else if (dismissal.equals("escape")) key(KeyCode.ESCAPE, false);
+                else ((Overlay<?>) window).doClose();
+
+                assertEquals(previousCloses, closes);
+                assertTrue(((Overlay<?>) window).isDisplayed);
+                assertEquals(1, background.size());
+                background.remove(0).run();
+                verify(wallet).setTxNote(dismissal, "edited");
+                assertEquals(previousCloses, closes);
+                assertFalse(done.isDisabled());
+                assertEquals(Res.get("funds.withdrawal.sent.done"), done.getText());
+                done.fire();
+                assertEquals(previousCloses + 1, closes);
+            }
+            verify(refresh, times(3)).run();
+            assertTrue(popups.constructed().isEmpty());
+        }
+
+        @Test
+        void saveCompletionDuringHideDoesNotCloseAgainOrLoseFailure() {
+            deferHide = true;
+            for (boolean fail : List.of(false, true)) {
+                String txId = fail ? "failure" : "success";
+                show(txId, "old");
+                beginEdit();
+                memo.setText("edited");
+                if (fail) doThrow(new IllegalStateException("disk full")).when(wallet).setTxNote(txId, "edited");
+                ((Overlay<?>) window).actionButton.fire();
+                window.hide();
+                int previousCloses = closes;
+
+                background.remove(0).run();
+
+                assertEquals(previousCloses, closes);
+                ((Overlay<?>) window).onHidden();
+            }
+            assertEquals(1, popups.constructed().size());
+            verify(popups.constructed().getFirst()).warning(Res.get("funds.tx.memo.saveFailedForTx", "failure"));
+            verify(popups.constructed().getFirst()).show();
+            verify(refresh).run();
+        }
+
+        @Test
+        void saveFailureAfterReopeningLeavesTheNewDraftAlone() {
+            show("first", "old");
+            beginEdit();
+            memo.setText("edited");
+            doThrow(new IllegalStateException("disk full")).when(wallet).setTxNote("first", "edited");
+            save.fire();
+            window.hide();
+            show("second", "second memo");
+            beginEdit();
+            memo.setText("second draft");
+
+            background.remove(0).run();
+
+            assertEquals("second draft", memo.getText());
+            assertEquals("second memo", displayedMemo.getText());
+            assertTrue(shown(save));
+            assertFalse(save.isDisabled());
+            assertFalse(((Overlay<?>) window).gridPane.lookup(".error-text").isVisible());
+            assertEquals(1, closes);
+            assertEquals(1, popups.constructed().size());
+            verify(popups.constructed().getFirst()).warning(Res.get("funds.tx.memo.saveFailedForTx", "first"));
+            verify(popups.constructed().getFirst()).show();
+            verifyNoInteractions(refresh);
+        }
+
+        @Test
+        void reopeningTheSameTransactionWaitsForThePendingSave() {
+            for (boolean fail : List.of(false, true)) {
+                String txId = fail ? "failure" : "success";
+                show(txId, "old");
+                beginEdit();
+                memo.setText("edited");
+                if (fail) doThrow(new IllegalStateException("disk full")).when(wallet).setTxNote(txId, "edited");
+                ((Overlay<?>) window).actionButton.fire();
+                window.hide();
+                show(txId, "old");
+                assertTrue(edit.isDisabled());
+                assertTrue(save.isDisabled());
+                assertTrue(((Overlay<?>) window).actionButton.isDisabled());
+                int previousCloses = closes;
+
+                background.remove(0).run();
+
+                verify(wallet).setTxNote(txId, "edited");
+                assertEquals(fail ? "old" : "edited", displayedMemo.getText());
+                assertFalse(edit.isDisabled());
+                assertEquals(previousCloses, closes);
+                assertFalse(shown(save));
+                assertTrue(background.isEmpty());
+                beginEdit();
+                assertEquals(fail ? "old" : "edited", memo.getText());
+            }
+            verify(refresh).run();
+            assertEquals(1, popups.constructed().size());
+            verify(popups.constructed().getFirst()).warning(Res.get("funds.tx.memo.saveFailedForTx", "failure"));
+            verify(popups.constructed().getFirst()).show();
+        }
+
+        private void beginEdit() {
+            if (shown(add)) add.fire();
+            else edit.fireEvent(new KeyEvent(KeyEvent.KEY_PRESSED, " ", " ", KeyCode.SPACE, false, false, false, false));
+        }
+
+        private void key(KeyCode code, boolean shift) {
+            memo.fireEvent(new KeyEvent(KeyEvent.KEY_PRESSED, "", "", code, shift, false, false, false));
+        }
+
+        private void press(Node node) {
+            node.fireEvent(new MouseEvent(MouseEvent.MOUSE_PRESSED, 0, 0, 0, 0, MouseButton.PRIMARY, 1,
+                    false, false, false, false, true, false, false, false, false, true, null));
+        }
+
+        private boolean shown(Node node) {
+            while (node != null) {
+                if (!node.isVisible()) return false;
+                node = node.getParent();
+            }
+            return true;
+        }
+
+        private void show(String hash, String note) {
+            TransactionsListItem item = mock(TransactionsListItem.class);
+            when(item.getTx()).thenReturn(new MoneroTxWallet().setHash(hash).setNote(note).setIncomingTransfers(List.of()));
+            window.show(item, refresh);
+            GridPane pane = ((Overlay<?>) window).gridPane;
+            memo = pane.lookupAll(".text-area").stream().map(node -> (TextArea) node)
+                    .filter(TextArea::isEditable).findFirst().orElseThrow();
+            displayedMemo = pane.lookupAll(".text-area").stream().map(node -> (TextArea) node)
+                    .filter(area -> !area.isEditable() && area.getStyleClass().contains("confirm-send-row-value"))
+                    .findFirst().orElseThrow();
+            edit = pane.lookupAll(".confirm-send-copy").stream().map(node -> (Label) node)
+                    .filter(label -> Res.get("shared.edit").equals(label.getAccessibleText())).findFirst().orElseThrow();
+            assertEquals(1, ((Pane) edit.getParent()).getChildren().stream()
+                    .filter(node -> node.getStyleClass().contains("confirm-send-copy")).count());
+            add = (Button) pane.lookup(".tx-note-add");
+            save = (Button) pane.lookup(".tx-note-save");
+            cancel = pane.lookupAll(".button").stream().map(node -> (Button) node)
+                    .filter(button -> Res.get("shared.cancel").equals(button.getText())).findFirst().orElseThrow();
+        }
+    }
+
+    @Nested
+    class NetworkSettings {
+        private final XmrConnectionService connections = mock(XmrConnectionService.class);
+        private final SimpleObjectProperty<Filter> filter = new SimpleObjectProperty<>();
+        private final List<MoneroRpcConnection> live = new ArrayList<>();
+        private final List<Runnable> background = new ArrayList<>();
+        private final String customAddress = "custom.example:18081";
+        private Executor originalExecutor;
+        private MockedStatic<Application> application;
+        private MockedStatic<GUIUtil> gui;
+        private MockedStatic<ThreadUtils> tasks;
+        private MockedStatic<UserThread> userThread;
+        private Preferences preferences;
+        private NetworkSettingsView view;
+        private Map<String, Object> controls;
+        private Runnable refresh;
+
+        @BeforeEach
+        void setUp() throws IOException {
+            Res.setup();
+            originalExecutor = UserThread.getExecutor();
+            UserThread.setExecutor(Runnable::run);
+            application = mockStatic(Application.class);
+            application.when(Application::getUserAgentStylesheet).thenReturn(Application.STYLESHEET_MODENA);
+            gui = mockStatic(GUIUtil.class);
+            tasks = mockStatic(ThreadUtils.class);
+            tasks.when(() -> ThreadUtils.submitToPool(any(Runnable.class))).thenAnswer(invocation -> {
+                background.add(invocation.getArgument(0));
+                return CompletableFuture.completedFuture(null);
+            });
+            userThread = mockStatic(UserThread.class, CALLS_REAL_METHODS);
+            userThread.when(() -> UserThread.runPeriodically(any(Runnable.class), anyLong())).thenAnswer(invocation -> {
+                refresh = invocation.getArgument(0);
+                return mock(Timer.class);
+            });
+            Config config = new Config();
+            XmrNodes nodes = mock(XmrNodes.class);
+            var provided = new XmrNodes.XmrNode(MoneroNodesOption.PROVIDED, null, null, "provided.example", 18081, 1, null);
+            var publicNode = new XmrNodes.XmrNode(MoneroNodesOption.PUBLIC, null, null, "public.example", 18081, 2, null);
+            when(nodes.getProvidedXmrNodes()).thenReturn(List.of(provided));
+            when(nodes.getPublicXmrNodes()).thenReturn(List.of(publicNode));
+            when(nodes.getAllXmrNodes()).thenReturn(List.of(provided, publicNode));
+            preferences = new Preferences(mock(PersistenceManager.class), config, null, nodes);
+            preferences.setUseTorForXmrOrdinal(UseTorForXmr.OFF.ordinal());
+            preferences.applyNodeSettings(MoneroNodesOption.PUBLIC, customAddress);
+            live.add(new MoneroRpcConnection(publicNode.getUri()));
+            when(connections.getConnections()).thenAnswer(invocation -> new ArrayList<>(live));
+            when(connections.getConnection()).thenAnswer(invocation -> live.isEmpty() ? null : live.get(0));
+            when(connections.isConnected()).thenReturn(true);
+            when(connections.chainHeightProperty()).thenReturn(new SimpleLongProperty(1000));
+            doAnswer(invocation -> {
+                preferences.applyNodeSettings(invocation.getArgument(0), invocation.getArgument(1));
+                return null;
+            }).when(connections).setNodeSettings(any(), any());
+            XmrLocalNode local = mock(XmrLocalNode.class);
+            when(local.shouldBeIgnored()).thenReturn(true);
+            FilterManager filters = mock(FilterManager.class);
+            when(filters.filterProperty()).thenReturn(filter);
+            when(filters.getFilter()).thenAnswer(invocation -> filter.get());
+            P2PService p2p = mock(P2PService.class, RETURNS_DEEP_STUBS);
+            when(p2p.getNetworkNode().getNodeAddress()).thenReturn(null);
+            view = new NetworkSettingsView(config, p2p, connections, preferences, nodes, filters,
+                    mock(TorNetworkSettingsWindow.class), mock(ClockWatcher.class), mock(XmrWalletService.class), local);
+            FXMLLoader loader = new FXMLLoader(NetworkSettingsView.class.getResource("NetworkSettingsView.fxml"));
+            loader.setControllerFactory(type -> view);
+            loader.load();
+            controls = loader.getNamespace();
+            view.activate();
+        }
+
+        @AfterEach
+        void tearDown() {
+            if (view != null) view.deactivate();
+            if (userThread != null) userThread.close();
+            if (tasks != null) tasks.close();
+            if (gui != null) gui.close();
+            if (application != null) application.close();
+            UserThread.setExecutor(originalExecutor);
+        }
+
+        @Test
+        void queuedSourceChangesApplyOnlyTheLatestSelection() {
+            source().setValue(MoneroNodesOption.CUSTOM);
+            source().setValue(MoneroNodesOption.PROVIDED);
+            source().setValue(MoneroNodesOption.PUBLIC);
+            assertEquals(1, background.size());
+            assertEquals(MoneroNodesOption.PUBLIC, source().getValue());
+
+            background.remove(0).run();
+            assertEquals(1, background.size());
+            background.remove(0).run();
+
+            var order = inOrder(connections);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.PUBLIC, customAddress);
+            verify(connections, never()).setNodeSettings(eq(MoneroNodesOption.PROVIDED), any());
+            assertEquals(MoneroNodesOption.PUBLIC, preferences.getMoneroNodesOption());
+            assertFalse(source().isDisabled());
+        }
+
+        @Test
+        void emptyCustomSelectionAndTorChangesDoNotChangeTheRunningSettings() {
+            preferences.applyNodeSettings(MoneroNodesOption.PUBLIC, "");
+            refresh.run();
+            source().setValue(MoneroNodesOption.CUSTOM);
+            assertEquals(MoneroNodesOption.PUBLIC, preferences.getMoneroNodesOption());
+            assertTrue(((TableView<?>) controls.get("moneroConnectionsTableView")).getItems().isEmpty());
+            source().setValue(MoneroNodesOption.PUBLIC);
+            assertEquals(1, ((TableView<?>) controls.get("moneroConnectionsTableView")).getItems().size());
+
+            @SuppressWarnings("unchecked")
+            ComboBox<UseTorForXmr> tor = (ComboBox<UseTorForXmr>) controls.get("tor");
+            tor.setValue(UseTorForXmr.ON);
+            assertEquals(UseTorForXmr.ON, preferences.getNetworkSettings().tor());
+            assertEquals(UseTorForXmr.OFF, preferences.getUseTorForXmr());
+            assertTrue(((Node) controls.get("torPending")).isVisible());
+            tor.setValue(UseTorForXmr.OFF);
+            assertFalse(((Node) controls.get("torPending")).isVisible());
+            assertTrue(background.isEmpty());
+        }
+
+        @Test
+        void filterNoticePersistsUntilTheRunningListIsAllowed() {
+            Filter restriction = mock(Filter.class);
+            when(restriction.isPreventPublicXmrNetwork()).thenReturn(true);
+            preferences.setPublicMoneroNodesBlocked(true);
+            filter.set(restriction);
+            refresh.run();
+
+            assertEquals(MoneroNodesOption.PROVIDED, source().getValue());
+            assertTrue(((Node) controls.get("statusNote")).isVisible());
+            assertEquals(Res.get("settings.net.filterPending"), ((Label) controls.get("statusTitle")).getText());
+            verify(connections, never()).setNodeSettings(any(), any());
+
+            live.clear();
+            refresh.run();
+            assertEquals(Res.get("settings.net.noUsableNodes"), ((Label) controls.get("statusTitle")).getText());
+            live.add(new MoneroRpcConnection("http://provided.example:18081"));
+            refresh.run();
+            assertFalse(((Node) controls.get("statusNote")).isVisible());
+            live.set(0, new MoneroRpcConnection("http://custom.example:18081"));
+            preferences.applyNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
+            refresh.run();
+            assertFalse(((Node) controls.get("statusNote")).isVisible());
+        }
+
+        @Test
+        void rejectedNodeEditsShowLocalizedErrorsAndKeepTheInput() {
+            preferences.applyNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
+            refresh.run();
+            TextField input = (TextField) controls.get("addInput");
+            input.setText("another.example:18081");
+            doThrow(new IllegalStateException("Connection service is not running")).when(connections).addCustomNode(anyString());
+
+            ((Button) controls.get("addButton")).fire();
+            background.remove(0).run();
+
+            assertEquals("another.example:18081", input.getText());
+            assertEquals("another.example:18081: " + Res.get("settings.net.serviceNotRunning"), ((Label) controls.get("addHint")).getText());
+            assertFalse(input.isDisabled());
+            verify(connections, never()).probeConnection(any());
+        }
+
+        @SuppressWarnings("unchecked")
+        private ComboBox<MoneroNodesOption> source() {
+            return (ComboBox<MoneroNodesOption>) controls.get("source");
+        }
+    }
+
+    @Nested
+    class RedesignedPopups {
+        @Test
+        void tradeRemindersAndConfirmationsHaveDistinctQueueIdentities() {
+            Trade first = mock(Trade.class);
+            Trade second = mock(Trade.class);
+            when(first.getId()).thenReturn("first-trade");
+            when(second.getId()).thenReturn("second-trade");
+            when(first.getMaxTradePeriodDate()).thenReturn(new Date(Long.MAX_VALUE));
+            when(second.getMaxTradePeriodDate()).thenReturn(new Date(Long.MAX_VALUE));
+            assertNotEquals(new PaymentConfirmationWindow(first, null).toString(), new PaymentConfirmationWindow(second, null).toString());
+            assertNotEquals(new PaymentConfirmationWindow(first, null).toString(), new PaymentConfirmationWindow(first, null, null, false).toString());
+            assertNotEquals(new PaymentInstructionsWindow(first, null, true, null, false).toString(),
+                    new PaymentInstructionsWindow(second, null, true, null, false).toString());
+            assertNotEquals(new TradePeriodWindow(first).toString(), new TradePeriodWindow(second).toString());
+        }
+
+        @Test
+        void reviewAmountsPreserveMetalAndCryptoPrecision() throws ReflectiveOperationException {
+            var formatter = Class.forName("haveno.desktop.main.overlays.windows.HeroWindowComponents")
+                    .getDeclaredMethod("volume", Volume.class);
+            formatter.setAccessible(true);
+            assertEquals("0.1234", formatter.invoke(null, Volume.parse("0.1234", "XAU")));
+            assertEquals("0.0001", formatter.invoke(null, Volume.parse("0.0001", "XAG")));
+            assertEquals("0.01234567", formatter.invoke(null, Volume.parse("0.01234567", "BTC")));
+            assertEquals("506.00", formatter.invoke(null, Volume.parse("506", "EUR")));
+            assertEquals(Res.get("shared.na"), formatter.invoke(null, new Object[]{null}));
+        }
+
+        @Test
+        void paymentActionsUseTheReviewedTradeAfterSelectionChanges() {
+            TradeManager manager = mock(TradeManager.class);
+            PendingTradesDataModel dataModel = spy(new PendingTradesDataModel(manager, null, null, null, null,
+                    null, null, null, null, null, null, null, null, null, null));
+            BuyerTrade buyer = mock(BuyerTrade.class);
+            SellerTrade seller = mock(SellerTrade.class);
+            BuyerProtocol buyerProtocol = mock(BuyerProtocol.class);
+            SellerProtocol sellerProtocol = mock(SellerProtocol.class);
+            when(manager.getTradeProtocol(buyer)).thenReturn(buyerProtocol);
+            when(manager.getTradeProtocol(seller)).thenReturn(sellerProtocol);
+
+            when(dataModel.getTrade()).thenReturn(seller);
+            dataModel.onPaymentSent(buyer, () -> {}, error -> {});
+            verify(buyerProtocol).onPaymentSent(any(), any());
+
+            when(dataModel.getTrade()).thenReturn(buyer);
+            dataModel.onPaymentReceived(seller, () -> {}, error -> {});
+            verify(sellerProtocol).onPaymentReceived(any(), any());
+        }
+
+        @Test
+        void methodSpecificConfirmationPreferencesArePreserved() {
+            assertEquals("confirmPaperReceiptSent", PaymentConfirmationWindow.methodConfirmationKey(mock(CashDepositAccountPayload.class)));
+            assertEquals("westernUnionMTCNSent", PaymentConfirmationWindow.methodConfirmationKey(mock(WesternUnionAccountPayload.class)));
+            assertEquals("moneyGramMTCNSent", PaymentConfirmationWindow.methodConfirmationKey(mock(MoneyGramAccountPayload.class)));
+            assertEquals("halCashCodeInfo", PaymentConfirmationWindow.methodConfirmationKey(mock(HalCashAccountPayload.class)));
+            assertNull(PaymentConfirmationWindow.methodConfirmationKey(mock(SepaAccountPayload.class)));
+        }
+
+        @Test
+        void referenceWarningsRemainMethodSpecific() {
+            assertTrue(PaymentInstructionsWindow.shouldShowReferenceWarning(mock(SepaAccountPayload.class)));
+            assertTrue(PaymentInstructionsWindow.shouldShowReferenceWarning(mock(CashDepositAccountPayload.class)));
+            assertFalse(PaymentInstructionsWindow.shouldShowReferenceWarning(mock(AssetAccountPayload.class)));
+            assertFalse(PaymentInstructionsWindow.shouldShowReferenceWarning(mock(BlikAccountPayload.class)));
+            assertFalse(PaymentInstructionsWindow.shouldShowReferenceWarning(mock(WesternUnionAccountPayload.class)));
+            assertFalse(PaymentInstructionsWindow.shouldShowReferenceWarning(mock(HalCashAccountPayload.class)));
+        }
     }
 
     @Nested
@@ -240,6 +1113,385 @@ public class OverlayTest {
             var method = SupportView.class.getDeclaredMethod("onNavigationRequested", ViewPath.class, Object.class);
             method.setAccessible(true);
             method.invoke(support, path, null);
+        }
+    }
+
+    @Nested
+    class DisputeFilters {
+        private final ObservableList<Dispute> disputes = FXCollections.observableArrayList();
+        private final ArbitrationManager manager = mock(ArbitrationManager.class);
+        private final TradeManager tradeManager = mock(TradeManager.class);
+        private final KeyRing keyRing = mock(KeyRing.class);
+        private final PubKeyRing agent = mock(PubKeyRing.class);
+        private Executor originalExecutor;
+        private MockedStatic<Application> application;
+        private MockedStatic<GUIUtil> gui;
+        private MockedConstruction<Tooltip> tooltips;
+        private TicketView view;
+
+        @BeforeEach
+        void setUp() {
+            Res.setup();
+            originalExecutor = UserThread.getExecutor();
+            UserThread.setExecutor(Runnable::run);
+            // avoid starting the JavaFX toolkit; these tests exercise controls without rendering them
+            application = mockStatic(Application.class);
+            application.when(Application::getUserAgentStylesheet).thenReturn(Application.STYLESHEET_MODENA);
+            gui = mockStatic(GUIUtil.class);
+            tooltips = mockConstruction(Tooltip.class);
+            when(keyRing.getPubKeyRing()).thenReturn(agent);
+            when(manager.getDisputesAsObservableList()).thenReturn(disputes);
+            when(manager.getValidationExceptions()).thenReturn(FXCollections.observableArrayList());
+            view = new TicketView();
+            view.initialize();
+            view.activate();
+        }
+
+        @AfterEach
+        void tearDown() {
+            if (view != null && view.isActive()) view.deactivate();
+            if (tooltips != null) tooltips.close();
+            if (gui != null) gui.close();
+            if (application != null) application.close();
+            UserThread.setExecutor(originalExecutor);
+        }
+
+        @Test
+        void agentDefaultsToOpenAndUnreadWithIndependentTextSearch() {
+            Dispute open = addDispute("trade-open", false, agent);
+            Dispute closed = addDispute("trade-closed", true, agent);
+            reply(closed);
+            addDispute("trade-read", true, agent);
+            assertEquals(List.of(open, closed), view.items());
+            assertEquals("Open or unread", view.filterName());
+            assertEquals("", view.searchText());
+
+            view.search("closed");
+            assertEquals(List.of(closed), view.items());
+            view.selectFilter("ALL");
+            assertEquals(List.of(closed), view.items());
+            view.search("trade-open");
+            assertEquals(List.of(open), view.items());
+        }
+
+        @Test
+        void traderDefaultsToAllAndHidesTicketsWhereItIsTheAgent() {
+            addDispute("own-agent-ticket", false, agent);
+            PubKeyRing otherAgent = mock(PubKeyRing.class);
+            Dispute open = addDispute("trader-open", false, otherAgent);
+            Dispute closed = addDispute("trader-closed", true, otherAgent);
+            var client = new ArbitrationClientView(manager, keyRing, tradeManager, null, null, null,
+                    null, null, null, null, null, false) {
+                {
+                    root = mock(VBox.class);
+                    when(root.getChildren()).thenReturn(FXCollections.observableArrayList());
+                }
+
+                void checkDefaultView() {
+                    initialize();
+                    activate();
+                    try {
+                        assertEquals("All", ticketFilterComboBox.getValue().toString());
+                        assertEquals(List.of(open, closed), new ArrayList<>(filteredList));
+                    } finally {
+                        deactivate();
+                    }
+                }
+            };
+            client.checkDefaultView();
+        }
+
+        @Test
+        void closedAndUnreadViewsApplyTheirOwnPredicates() {
+            Dispute open = addDispute("open", false, agent);
+            Dispute closed = addDispute("closed", true, agent);
+            Dispute unread = addDispute("unread", true, agent);
+            reply(open);
+            reply(unread);
+            view.selectFilter("CLOSED");
+            assertEquals(List.of(closed, unread), view.items());
+            view.selectFilter("UNREAD");
+            assertEquals(List.of(open, unread), view.items());
+            view.selectFilter("ALL");
+            assertEquals(List.of(open, closed, unread), view.items());
+        }
+
+        @Test
+        void closingAndReadingRetainRowsUntilFilterAdjustmentOrRevisit() {
+            Dispute closing = addDispute("closing", false, agent);
+            Dispute unread = addDispute("unread", true, agent);
+            reply(unread);
+            closing.setIsClosed();
+            unread.setChatMessagesSeen(true);
+            assertEquals(List.of(closing, unread), view.items());
+            assertTrue(closing.isClosed());
+            assertEquals(0, unread.unreadMessageCount(true));
+
+            view.search(" ");
+            assertTrue(view.items().isEmpty());
+            closing.reOpen();
+            assertEquals(List.of(closing), view.items());
+            closing.setIsClosed();
+            view.deactivate();
+            view.activate();
+            assertTrue(view.items().isEmpty());
+        }
+
+        @Test
+        void unreadViewRetainsReadTicketsUntilDropdownChanges() {
+            Dispute dispute = addDispute("trade", true, agent);
+            reply(dispute);
+            view.selectFilter("UNREAD");
+            dispute.setChatMessagesSeen(true);
+            assertEquals(List.of(dispute), view.items());
+            view.selectFilter("CLOSED");
+            view.selectFilter("UNREAD");
+            assertTrue(view.items().isEmpty());
+        }
+
+        @Test
+        void inactiveViewDoesNotRetainRowsForTheNextVisit() {
+            view.selectFilter("ALL");
+            view.deactivate();
+            view.selectFilter("OPEN");
+            addDispute("closed-while-away", true, agent);
+            view.activate();
+            assertTrue(view.items().isEmpty());
+            addDispute("closed-after-return", true, agent);
+            assertTrue(view.items().isEmpty());
+            Dispute open = addDispute("new-open", false, agent);
+            assertEquals(List.of(open), view.items());
+        }
+
+        @Test
+        void revisitingPreservesSelectionWhenTheTicketStillMatches() {
+            addDispute("first", false, agent);
+            Dispute selected = addDispute("selected", false, agent);
+            view.selectDispute(selected);
+            view.deactivate();
+            view.activate();
+            assertEquals(selected, view.getSelectedDispute());
+        }
+
+        @Test
+        void retainedIdentityCannotAdmitAReplacementFromAnotherAgent() {
+            Dispute visible = addDispute("trade", false, agent);
+            Dispute foreign = createDispute("trade", false, mock(PubKeyRing.class));
+            disputes.set(0, foreign);
+            assertEquals(visible, foreign);
+            assertTrue(view.items().isEmpty());
+        }
+
+        @Test
+        void replacingATicketInPlaceKeepsItRetained() {
+            Dispute dispute = addDispute("trade", false, agent);
+            Dispute other = addDispute("other", false, agent);
+            dispute.setIsClosed();
+            Dispute replacement = createDispute("trade", true, agent);
+            disputes.set(0, replacement);
+            reply(other);
+            assertEquals(List.of(replacement, other), view.items());
+        }
+
+        @Test
+        void placeholderTracksTicketsHiddenByTheView() {
+            view.selectFilter("CLOSED");
+            gui.clearInvocations();
+            Dispute open = addDispute("open", false, agent);
+            gui.verify(() -> GUIUtil.updateFilterPlaceholder(any(TableView.class), eq(true)));
+            disputes.remove(open);
+            gui.verify(() -> GUIUtil.updateFilterPlaceholder(any(TableView.class), eq(false)));
+
+            view.selectFilter("ALL");
+            gui.clearInvocations();
+            addDispute("foreign", false, mock(PubKeyRing.class));
+            gui.verify(() -> GUIUtil.updateFilterPlaceholder(any(TableView.class), eq(false)));
+            gui.clearInvocations();
+            view.search("foreign");
+            gui.verify(() -> GUIUtil.updateFilterPlaceholder(any(TableView.class), eq(true)));
+            gui.clearInvocations();
+            view.search(" ");
+            gui.verify(() -> GUIUtil.updateFilterPlaceholder(any(TableView.class), eq(false)));
+        }
+
+        @Test
+        void liveArrivalsRespectTextAndRoleFilters() {
+            view.search("target");
+            Dispute target = addDispute("target", true, agent);
+            Dispute other = addDispute("other", true, agent);
+            Dispute foreign = addDispute("target-foreign", true, mock(PubKeyRing.class));
+            reply(other);
+            reply(foreign);
+            assertTrue(view.items().isEmpty());
+            reply(target);
+            assertEquals(List.of(target), view.items());
+            target.setChatMessagesSeen(true);
+            Dispute incoming = addDispute("target-new", false, agent);
+            assertEquals(List.of(target, incoming), view.items());
+        }
+
+        @Test
+        void removingTicketsClearsRetentionAndDetachesListeners() {
+            Dispute dispute = addDispute("trade", false, agent);
+            dispute.setIsClosed();
+            disputes.remove(dispute);
+            assertTrue(view.items().isEmpty());
+            disputes.add(dispute);
+            assertTrue(view.items().isEmpty());
+            reply(dispute);
+            assertEquals(List.of(dispute), view.items());
+            disputes.remove(dispute);
+
+            List<Runnable> updates = captureUpdates();
+            reply(dispute);
+            assertTrue(updates.isEmpty());
+        }
+
+        @Test
+        void queuedRefreshDoesNotUndoAnExplicitFilterChangeOrRevisit() {
+            Dispute dispute = addDispute("trade", false, agent);
+            List<Runnable> updates = captureUpdates();
+            reply(dispute);
+            view.selectFilter("CLOSED");
+            List.copyOf(updates).forEach(Runnable::run);
+            assertTrue(view.items().isEmpty());
+            updates.clear();
+            reply(dispute);
+            view.deactivate();
+            List.copyOf(updates).forEach(Runnable::run);
+            UserThread.setExecutor(Runnable::run);
+            view.activate();
+            assertTrue(view.items().isEmpty());
+            dispute.setIsClosed();
+            assertEquals(List.of(dispute), view.items());
+        }
+
+        @Test
+        void navigationToHiddenTicketClearsBothFilters() {
+            Dispute dispute = addDispute("target", true, agent);
+            view.search("other");
+            view.deactivate();
+            view.setDisputeToSelect(dispute);
+            view.activate();
+            assertEquals(List.of(dispute), view.items());
+            assertEquals("All", view.filterName());
+            assertEquals("", view.searchText());
+            assertEquals(dispute, view.getSelectedDispute());
+        }
+
+        @Test
+        void closedRowBecomesGreyWhenItsLastUnreadMessageIsRead() throws ReflectiveOperationException {
+            Dispute dispute = addDispute("trade", true, agent);
+            reply(dispute);
+            Trade trade = mock(Trade.class);
+            SimpleObjectProperty<Trade.DisputeState> tradeState = new SimpleObjectProperty<>(Trade.DisputeState.DISPUTE_REQUESTED);
+            when(tradeManager.getTrade(dispute.getTradeId())).thenReturn(trade);
+            when(trade.disputeStateProperty()).thenReturn(tradeState);
+            TableRow<Dispute> row = new TableRow<>();
+            TableCell<Dispute, Dispute> cell = view.stateCell();
+            cell.updateTableRow(row);
+            var update = cell.getClass().getDeclaredMethod("updateItem", Dispute.class, boolean.class);
+            update.setAccessible(true);
+            update.invoke(cell, dispute, false);
+            assertEquals(1, row.getOpacity());
+            dispute.setChatMessagesSeen(true);
+            assertEquals(0.4, row.getOpacity());
+            assertEquals(List.of(dispute), view.items());
+            update.invoke(cell, null, true);
+            reply(dispute);
+            tradeState.set(Trade.DisputeState.DISPUTE_CLOSED);
+            assertEquals(0.4, row.getOpacity());
+            assertEquals("", cell.getText());
+        }
+
+        private Dispute addDispute(String tradeId, boolean closed, PubKeyRing disputeAgent) {
+            Dispute dispute = createDispute(tradeId, closed, disputeAgent);
+            disputes.add(dispute);
+            return dispute;
+        }
+
+        private Dispute createDispute(String tradeId, boolean closed, PubKeyRing disputeAgent) {
+            Contract contract = mock(Contract.class);
+            when(contract.getBuyerNodeAddress()).thenReturn(new NodeAddress("buyer:9999"));
+            when(contract.getSellerNodeAddress()).thenReturn(new NodeAddress("seller:9999"));
+            Dispute dispute = new Dispute(0L, tradeId, 1, true, true, true, null, 0L, 0L,
+                    contract, null, null, null, "{}", null, null, null, null, disputeAgent, false, SupportType.ARBITRATION);
+            dispute.setState(closed ? Dispute.State.CLOSED : Dispute.State.OPEN);
+            dispute.refreshAlertLevel(true);
+            return dispute;
+        }
+
+        private void reply(Dispute dispute) {
+            dispute.getChatMessages().add(new ChatMessage(SupportType.ARBITRATION, dispute.getTradeId(), 1,
+                    true, "Trader reply", new NodeAddress("trader:9999")));
+            dispute.refreshAlertLevel(true);
+        }
+
+        private class TicketView extends DisputeAgentView {
+            TicketView() {
+                super(manager, DisputeFilters.this.keyRing, DisputeFilters.this.tradeManager, null, null, null,
+                        null, null, null, null, null, false);
+                root = mock(VBox.class);
+                when(root.getChildren()).thenReturn(FXCollections.observableArrayList());
+                when(root.getScene()).thenReturn(mock(Scene.class));
+                chatPopup = mock(DisputeChatPopup.class);
+            }
+
+            @Override
+            public void activate() {
+                super.activate();
+            }
+
+            @Override
+            public void deactivate() {
+                super.deactivate();
+            }
+
+            @Override
+            protected SupportType getType() {
+                return SupportType.ARBITRATION;
+            }
+
+            @Override
+            protected DisputeSession getConcreteDisputeChatSession(Dispute dispute) {
+                return mock(DisputeSession.class);
+            }
+
+            @Override
+            protected void onCloseDispute(Dispute dispute) {
+            }
+
+            void selectFilter(String filter) {
+                ticketFilterComboBox.setValue(TicketFilter.valueOf(filter));
+            }
+
+            void search(String text) {
+                filterTextField.setText(text);
+            }
+
+            void selectDispute(Dispute dispute) {
+                tableView.getSelectionModel().select(dispute);
+            }
+
+            List<Dispute> items() {
+                return new ArrayList<>(filteredList);
+            }
+
+            boolean isActive() {
+                return filteredList != null;
+            }
+
+            String filterName() {
+                return ticketFilterComboBox.getValue().toString();
+            }
+
+            String searchText() {
+                return filterTextField.getText();
+            }
+
+            TableCell<Dispute, Dispute> stateCell() {
+                return stateColumn.getCellFactory().call(stateColumn);
+            }
         }
     }
 
@@ -879,6 +2131,7 @@ public class OverlayTest {
         void setUp() throws ReflectiveOperationException {
             resetQueue();
             scheduler = mockStatic(UserThread.class);
+            scheduler.when(() -> UserThread.isUserThread(any())).thenReturn(true);
             scheduler.when(() -> UserThread.runAfter(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS))).thenAnswer(invocation -> {
                 timeouts.add(invocation.getArgument(0));
                 delays.add(invocation.getArgument(1));
@@ -1493,6 +2746,197 @@ public class OverlayTest {
     }
 
     @Nested
+    class ChatDeliveryState {
+        private final ObservableList<ChatMessage> messages = FXCollections.observableArrayList();
+        private final SupportManager manager = mock(SupportManager.class);
+        private final SupportSession session = mock(SupportSession.class);
+        private Executor originalExecutor;
+        private MockedStatic<Application> application;
+        private MockedStatic<GUIUtil> gui;
+        private MockedStatic<UserThread> scheduler;
+        private MockedConstruction<Tooltip> tooltips;
+        private ChatView view;
+        private ListCell<ChatMessage> cell;
+        private Runnable timeout;
+
+        @BeforeEach
+        void setUp() throws ReflectiveOperationException {
+            Res.setup();
+            // initialize the message version for protobuf round trips
+            Version.setBaseCryptoNetworkId(Version.getBaseCurrencyNetwork());
+            originalExecutor = UserThread.getExecutor();
+            UserThread.setExecutor(Runnable::run);
+            // exercise the real cell and its listeners without starting the JavaFX toolkit
+            application = mockStatic(Application.class);
+            application.when(Application::getUserAgentStylesheet).thenReturn(Application.STYLESHEET_MODENA);
+            gui = mockStatic(GUIUtil.class);
+            tooltips = mockConstruction(Tooltip.class);
+            scheduler = mockStatic(UserThread.class, CALLS_REAL_METHODS);
+            scheduler.when(() -> UserThread.runAfter(any(Runnable.class), eq(60L), eq(TimeUnit.SECONDS)))
+                    .thenAnswer(invocation -> {
+                        timeout = invocation.getArgument(0);
+                        return mock(Timer.class);
+                    });
+            when(session.isClient()).thenReturn(true);
+            when(session.getTradeId()).thenReturn("trade-id");
+            when(session.getObservableChatMessageList()).thenReturn(messages);
+            when(manager.getSupportType()).thenReturn(SupportType.TRADE);
+            when(manager.getMyAddress()).thenReturn(new NodeAddress("sender:9999"));
+            when(manager.sendChatMessage(any())).thenAnswer(invocation -> invocation.getArgument(0));
+            doAnswer(invocation -> messages.add(invocation.getArgument(0)))
+                    .when(manager).addAndPersistChatMessage(any());
+            view = new ChatView(manager, "Peer");
+            view.initialize();
+            display();
+        }
+
+        @AfterEach
+        void tearDown() {
+            messages.forEach(message -> message.setAcknowledged(true));
+            if (view != null) view.deactivate();
+            if (scheduler != null) scheduler.close();
+            if (tooltips != null) tooltips.close();
+            if (gui != null) gui.close();
+            if (application != null) application.close();
+            UserThread.setExecutor(originalExecutor);
+        }
+
+        @Test
+        void lateMailboxAndAcknowledgementReplaceTimeout() throws ReflectiveOperationException {
+            ChatMessage message = send();
+            assertStatus(Res.get("support.sendingMessage"), false);
+            timeout.run();
+            assertStatus(Res.get("support.error", Res.get("support.errorTimeout")), true);
+            assertNull(message.ackErrorProperty().get());
+            message.setStoredInMailbox(true);
+            assertStatus(Res.get("support.savedInMailbox"), false);
+            message.setAcknowledged(true);
+            assertStatus(Res.get("support.acknowledged"), false);
+        }
+
+        @Test
+        void lateReceiverRejectionOutranksMailboxStorage() throws ReflectiveOperationException {
+            ChatMessage message = send();
+            timeout.run();
+            message.setAckError(TraderChatManager.TRADE_COMPLETED_ERROR);
+            message.setStoredInMailbox(true);
+            assertStatus(Res.get("support.errorTradeCompleted"), true);
+        }
+
+        @Test
+        void lateTransportFailureReplacesTimeout() throws ReflectiveOperationException {
+            ChatMessage message = send();
+            timeout.run();
+            message.setSendMessageError("transport failed");
+            assertStatus(Res.get("support.sendMessageError", "transport failed"), true);
+        }
+
+        @Test
+        void mailboxStorageBeforeTimerPreventsTimeout() throws ReflectiveOperationException {
+            ChatMessage message = send();
+            message.setStoredInMailbox(true);
+            timeout.run();
+            assertFalse(message.ackTimedOutProperty().get());
+            assertStatus(Res.get("support.savedInMailbox"), false);
+        }
+
+        @Test
+        void reopeningAnActiveSendKeepsItsStatus() throws ReflectiveOperationException {
+            ChatMessage message = send();
+            message.setArrived(true);
+            display();
+            show(message);
+            assertStatus(Res.get("support.transient"), false);
+            timeout.run();
+            assertStatus(Res.get("support.error", Res.get("support.errorTimeout")), true);
+        }
+
+        @Test
+        void restoredUnresolvedMessagesRemainUnconfirmed() throws ReflectiveOperationException {
+            for (boolean arrived : List.of(false, true)) {
+                ChatMessage message = send();
+                message.setArrived(arrived);
+                timeout.run();
+                ChatMessage restored = restore(message);
+                assertFalse(restored.ackTimedOutProperty().get());
+                assertEquals(arrived, restored.arrivedProperty().get());
+                show(restored);
+                assertStatus(Res.get("support.deliveryUnconfirmed"), false);
+                restored.setAcknowledged(true);
+                assertStatus(Res.get("support.acknowledged"), false);
+            }
+        }
+
+        @Test
+        void restoredMailboxAndReceiverErrorKeepTheirStatus() throws ReflectiveOperationException {
+            ChatMessage message = send();
+            timeout.run();
+            message.setStoredInMailbox(true);
+            show(restore(message));
+            assertStatus(Res.get("support.savedInMailbox"), false);
+            message.setAckError(TraderChatManager.TRADE_COMPLETED_ERROR);
+            show(restore(message));
+            assertStatus(Res.get("support.errorTradeCompleted"), true);
+        }
+
+        @Test
+        void incomingAndSystemMessagesDoNotGainUnconfirmedStatus() throws ReflectiveOperationException {
+            ChatMessage outgoing = restore(send());
+            show(outgoing);
+            assertStatus(Res.get("support.deliveryUnconfirmed"), false);
+            ChatMessage incoming = new ChatMessage(SupportType.TRADE, "trade-id", 0, false,
+                    "incoming", new NodeAddress("peer:9999"));
+            show(incoming);
+            assertFalse(statusRow().isVisible());
+            outgoing.setSystemMessage(true);
+            show(outgoing);
+            assertFalse(statusRow().isVisible());
+        }
+
+        private ChatMessage send() throws ReflectiveOperationException {
+            var method = ChatView.class.getDeclaredMethod("onSendMessage", String.class);
+            method.setAccessible(true);
+            method.invoke(view, "message");
+            ChatMessage message = messages.get(messages.size() - 1);
+            show(message);
+            return message;
+        }
+
+        private void display() throws ReflectiveOperationException {
+            if (cell != null) show(null);
+            view.display(session, new SimpleDoubleProperty(600));
+            var field = ChatView.class.getDeclaredField("messageListView");
+            field.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            ListView<ChatMessage> list = (ListView<ChatMessage>) field.get(view);
+            cell = list.getCellFactory().call(list);
+        }
+
+        private void show(ChatMessage message) throws ReflectiveOperationException {
+            var method = cell.getClass().getDeclaredMethod("updateItem", ChatMessage.class, boolean.class);
+            method.setAccessible(true);
+            method.invoke(cell, message, message == null);
+        }
+
+        private ChatMessage restore(ChatMessage message) {
+            return ChatMessage.fromPayloadProto(message.toProtoNetworkEnvelope().getChatMessage());
+        }
+
+        private HBox statusRow() throws ReflectiveOperationException {
+            var field = cell.getClass().getDeclaredField("statusHBox");
+            field.setAccessible(true);
+            return (HBox) field.get(cell);
+        }
+
+        private void assertStatus(String text, boolean error) throws ReflectiveOperationException {
+            HBox row = statusRow();
+            assertTrue(row.isVisible());
+            assertEquals(text, ((Label) row.getChildren().get(1)).getText());
+            row.getChildren().forEach(node -> assertEquals(error, node.getStyleClass().contains("error-text")));
+        }
+    }
+
+    @Nested
     class TraderChatAccess {
         private final Trade trade = mock(Trade.class);
         private final TradeManager tradeManager = mock(TradeManager.class);
@@ -1771,6 +3215,85 @@ public class OverlayTest {
         }
 
         @Test
+        void openTradeCountRestoresTradesAndSurvivesAcknowledgment() {
+            Trade maker = addTrade(true);
+            Trade taker = addTrade(false);
+            addTrade(true);
+            setPhase(maker, Trade.Phase.DEPOSITS_PUBLISHED);
+            setPhase(taker, Trade.Phase.DEPOSITS_CONFIRMED);
+            notificationCenter.onAllServicesAndViewsInitialized();
+            assertEquals(3, notificationCenter.openTradeCountProperty().get());
+            assertTrue(notificationCenter.unreadPortfolioProperty().get());
+
+            viewTrade(maker);
+            viewTrade(taker);
+            assertFalse(notificationCenter.unreadPortfolioProperty().get());
+            assertEquals(3, notificationCenter.openTradeCountProperty().get());
+
+            trades.remove(maker);
+            assertEquals(2, notificationCenter.openTradeCountProperty().get());
+            trades.remove(taker);
+            assertEquals(1, notificationCenter.openTradeCountProperty().get());
+        }
+
+        @Test
+        void openTradeCountTracksTakeRemovalAndRestoration() {
+            notificationCenter.onAllServicesAndViewsInitialized();
+            Trade trade = addTrade(true);
+            assertEquals(1, notificationCenter.openTradeCountProperty().get());
+            try (MockedConstruction<Notification> notifications = mockNotifications()) {
+                setPhase(trade, Trade.Phase.DEPOSITS_PUBLISHED);
+                assertEquals(1, notificationCenter.openTradeCountProperty().get());
+                assertTrue(notificationCenter.unreadPortfolioProperty().get());
+                assertEquals(1, notifications.constructed().size());
+                trades.remove(trade);
+                assertEquals(0, notificationCenter.openTradeCountProperty().get());
+                assertFalse(notificationCenter.unreadPortfolioProperty().get());
+                setPhase(trade, Trade.Phase.DEPOSITS_CONFIRMED);
+                assertEquals(0, notificationCenter.openTradeCountProperty().get());
+                trades.add(trade);
+                assertEquals(1, notificationCenter.openTradeCountProperty().get());
+                assertEquals(1, notifications.constructed().size());
+            }
+        }
+
+        @Test
+        void openTradeCountIncludesArbitratorTradesBeforePayout() {
+            Trade trade = addTrade(false);
+            when(trade.isArbitrator()).thenReturn(true);
+            notificationCenter.onAllServicesAndViewsInitialized();
+            assertEquals(1, notificationCenter.openTradeCountProperty().get());
+            setPhase(trade, Trade.Phase.DEPOSITS_PUBLISHED);
+            assertEquals(1, notificationCenter.openTradeCountProperty().get());
+            assertFalse(notificationCenter.unreadPortfolioProperty().get());
+            trades.clear();
+            assertEquals(0, notificationCenter.openTradeCountProperty().get());
+            setPhase(trade, Trade.Phase.DEPOSITS_CONFIRMED);
+            assertEquals(0, notificationCenter.openTradeCountProperty().get());
+        }
+
+        @Test
+        void queuedOpenTradeCountUsesCurrentList() {
+            notificationCenter.onAllServicesAndViewsInitialized();
+            List<Runnable> updates = captureUpdates();
+            Trade removed = addTrade(true);
+            Trade retained = addTrade(false);
+            setPhase(removed, Trade.Phase.DEPOSITS_PUBLISHED);
+            setPhase(retained, Trade.Phase.DEPOSITS_PUBLISHED);
+            trades.remove(removed);
+            try (MockedConstruction<Notification> notifications = mockNotifications()) {
+                assertEquals(0, notificationCenter.openTradeCountProperty().get());
+                drainUpdates(updates);
+                assertEquals(1, notificationCenter.openTradeCountProperty().get());
+                trades.clear();
+                drainUpdates(updates);
+                assertEquals(0, notificationCenter.openTradeCountProperty().get());
+                assertFalse(notificationCenter.unreadPortfolioProperty().get());
+                assertTrue(notifications.constructed().isEmpty());
+            }
+        }
+
+        @Test
         void restoresUnreadMessagesForMakerAndTakerUntilBothChatsAreRead() {
             Trade maker = addTrade(true);
             Trade taker = addTrade(false);
@@ -1778,6 +3301,8 @@ public class OverlayTest {
             taker.getChatMessages().add(message(taker, true));
             notificationCenter.onAllServicesAndViewsInitialized();
             assertTrue(hasUnreadChat());
+            assertTrue(notificationCenter.unreadPortfolioProperty().get());
+            assertEquals(2, notificationCenter.openTradeCountProperty().get());
 
             markRead(maker);
             assertTrue(hasUnreadChat());
@@ -2044,8 +3569,7 @@ public class OverlayTest {
         void dispatchesUnreadUpdatesThroughUserThread() {
             Trade trade = addTrade(true);
             notificationCenter.onAllServicesAndViewsInitialized();
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             trade.getChatMessages().add(message(trade, true));
             assertFalse(hasUnreadChat());
             assertFalse(updates.isEmpty());
@@ -2721,8 +4245,7 @@ public class OverlayTest {
             viewTrade(trade);
             assertTrue(notificationCenter.unreadPortfolioProperty().get());
             assertTrue(seenUpdates.isEmpty());
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             mainWindowFocused.set(true);
             keyPressedHandler.handle(mock(KeyEvent.class));
             mainWindowFocused.set(false);
@@ -2906,8 +4429,7 @@ public class OverlayTest {
             setPhase(trade, Trade.Phase.DEPOSITS_CONFIRMED);
             seenUpdates.put("NotificationCenter_DEPOSITS_PUBLISHED" + trade.getId(), true);
             notificationCenter.onAllServicesAndViewsInitialized();
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 seenUpdates.clear();
                 setPhase(trade, Trade.Phase.DEPOSITS_UNLOCKED);
@@ -2922,8 +4444,7 @@ public class OverlayTest {
         void queuedTradeUpdatesUseLatestStateAndIgnoreRemovedTrades() {
             notificationCenter.onAllServicesAndViewsInitialized();
             Trade trade = addTrade(false);
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 setPhase(trade, Trade.Phase.DEPOSITS_UNLOCKED);
                 setPhase(trade, Trade.Phase.DEPOSITS_FINALIZED);
@@ -2943,8 +4464,7 @@ public class OverlayTest {
         void startupSuppressionSurvivesQueuedCallbacksAndNextConfirmation() {
             Trade trade = addTrade(true);
             setPhase(trade, Trade.Phase.DEPOSITS_PUBLISHED);
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 notificationCenter.onAllServicesAndViewsInitialized();
                 drainUpdates(updates);
@@ -2995,8 +4515,7 @@ public class OverlayTest {
         void makerAcceptanceSurvivesDepositsConfirmingBeforeQueuedUpdatesRun() {
             notificationCenter.onAllServicesAndViewsInitialized();
             Trade trade = addTrade(true);
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 setPhase(trade, Trade.Phase.DEPOSITS_PUBLISHED);
                 setPhase(trade, Trade.Phase.DEPOSITS_CONFIRMED);
@@ -3009,8 +4528,7 @@ public class OverlayTest {
         @Test
         void newTradeStillNotifiesIfItAdvancesBeforeSubscriptionsAttach() {
             notificationCenter.onAllServicesAndViewsInitialized();
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 Trade trade = addTrade(true);
                 setPhase(trade, Trade.Phase.DEPOSITS_PUBLISHED);
@@ -3025,8 +4543,7 @@ public class OverlayTest {
         void startupRestoreDoesNotSuppressAMilestoneReachedBeforeItRuns() {
             Trade trade = addTrade(true);
             setPhase(trade, Trade.Phase.DEPOSITS_CONFIRMED);
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 notificationCenter.onAllServicesAndViewsInitialized();
                 // the trade state advances before its queued phase update and the restore refresh run
@@ -3045,8 +4562,7 @@ public class OverlayTest {
             Trade trade = addTrade(true);
             setPhase(trade, Trade.Phase.PAYMENT_SENT);
             setPayout(trade, Trade.PayoutState.PAYOUT_PUBLISHED);
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 notificationCenter.onAllServicesAndViewsInitialized();
                 // the phase advances before its property update, but the payout was already published
@@ -3068,8 +4584,7 @@ public class OverlayTest {
         void startupRestoreDoesNotSuppressAPayoutPublishedBeforeItRuns() {
             Trade trade = addTrade(true);
             setPhase(trade, Trade.Phase.PAYMENT_SENT);
-            List<Runnable> updates = new ArrayList<>();
-            UserThread.setExecutor(updates::add);
+            List<Runnable> updates = captureUpdates();
             try (MockedConstruction<Notification> notifications = mockNotifications()) {
                 notificationCenter.onAllServicesAndViewsInitialized();
                 // the payout advances before its queued property update and the restore refresh run
@@ -3167,6 +4682,17 @@ public class OverlayTest {
         private boolean hasUnreadChat() {
             return notificationCenter.unreadTradeChatProperty().get();
         }
+    }
+
+    // capture dispatches from the test thread only; timer threads keep running theirs directly
+    private static List<Runnable> captureUpdates() {
+        Thread testThread = Thread.currentThread();
+        List<Runnable> updates = new ArrayList<>();
+        UserThread.setExecutor(update -> {
+            if (Thread.currentThread() == testThread) updates.add(update);
+            else update.run();
+        });
+        return updates;
     }
 
     private static class A extends Overlay<A> {

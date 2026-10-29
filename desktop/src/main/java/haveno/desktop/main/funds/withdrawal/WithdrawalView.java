@@ -61,6 +61,7 @@ import haveno.desktop.main.overlays.windows.WalletPasswordWindow;
 import haveno.desktop.main.overlays.windows.WithdrawConfirmationWindow;
 import haveno.desktop.main.presentation.MarketPricePresentation;
 import haveno.desktop.util.DisplayUtils;
+import static haveno.desktop.util.FormBuilder.setButtonBusyContent;
 import haveno.desktop.util.GUIUtil;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
@@ -70,6 +71,10 @@ import javafx.geometry.Pos;
 import javafx.scene.Cursor;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
+import javafx.scene.control.TextFormatter;
+import javafx.scene.input.InputMethodEvent;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
@@ -91,11 +96,11 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
     private static final double NOMINAL_CARD_HEIGHT = 490; // anchor against this fixed height so errors grow the card downward without shifting it
 
     private BusyAnimation spinningWheel;
-    private VBox card;
+    private VBox form;
 
     private Label balanceAmountLabel, balanceFiatLabel, amountFeedbackLabel, addressErrorLabel, currencyToggle;
-    private InputTextField addressField, amountField;
-    private HavenoTextArea noteArea;
+    private HavenoTextArea addressField, noteArea;
+    private InputTextField amountField;
     private MaterialDesignIconView addressCheck;
     private Button sendButton;
     private boolean amountInFiat = false;
@@ -112,6 +117,7 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
     private ChangeListener<Boolean> addressFocusListener, amountFocusListener;
     private boolean sendMax = false;
     private boolean sending = false;
+    private boolean composing = false;
     private boolean amountErrorFlagged = false;
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -148,11 +154,38 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
         balanceBox.setAlignment(Pos.CENTER);
         VBox.setMargin(balanceBox, new Insets(2, 0, 6, 0));
 
-        // destination address: single line, monospace, with a green check once it validates
+        // destination address: one line that grows to show a whole address, monospace, with a green check once it validates
         Label addressLabel = fieldLabel(Res.get("funds.withdrawal.destinationAddress"));
-        addressField = new InputTextField();
+        addressField = new HavenoTextArea();
         addressField.setLabelFloat(false);
+        addressField.setWrapText(true);
+        GUIUtil.fitRows(addressField, 1, 4); // grows from one line to fit the address
         addressField.getStyleClass().add("send-address-field");
+        addressField.addEventFilter(InputMethodEvent.INPUT_METHOD_TEXT_CHANGED, e -> {
+            composing = e.getComposed().stream().anyMatch(run -> !run.getText().isEmpty());
+            String committed = e.getCommitted().replaceAll("\\s", "");
+            if (!committed.equals(e.getCommitted())) { // normalize committed text without changing the active composition
+                e.consume();
+                addressField.fireEvent(new InputMethodEvent(e.getEventType(), e.getComposed(), committed, e.getCaretPosition()));
+            }
+        });
+        addressField.setTextFormatter(new TextFormatter<>(change -> { // addresses never contain whitespace, so drop it as entered, except while an input method composes
+            String text = change.getText().replaceAll("\\s", "");
+            if (!composing && text.length() != change.getText().length()) {
+                change.setText(text);
+                int end = change.getRangeStart() + text.length();
+                change.selectRange(end, end); // setText leaves the caret where the unstripped text would have ended
+            }
+            return change;
+        }));
+        addressField.addEventFilter(KeyEvent.KEY_PRESSED, e -> { // plain enter sends and plain tab moves on, as in a single line field
+            boolean modified = e.isShiftDown() || e.isControlDown() || e.isAltDown() || e.isMetaDown();
+            if (e.getCode() == KeyCode.ENTER) {
+                if (!modified) sendButton.fire();
+            } else if (e.getCode() == KeyCode.TAB && !modified) amountField.requestFocus();
+            else return;
+            e.consume();
+        });
         addressCheck = new MaterialDesignIconView(MaterialDesignIcon.CHECK, "1.25em");
         addressCheck.getStyleClass().add("send-valid-check");
         addressCheck.setMouseTransparent(true);
@@ -192,10 +225,10 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
         noteArea = new HavenoTextArea();
         noteArea.setLabelFloat(false);
         noteArea.setWrapText(true);
-        noteArea.setPrefRowCount(3); // shows two full lines (the skin clips the last ~half row)
+        GUIUtil.fitRows(noteArea, 2);
         VBox noteGroup = new VBox(5, noteLabel, noteArea);
 
-        // send action
+        // send action, showing a busy spinner inside the button while a send is building
         sendButton = new AutoTooltipButton(Res.get("funds.withdrawal.send"));
         sendButton.getStyleClass().add("action-button");
         sendButton.setDefaultButton(true);
@@ -203,25 +236,23 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
         sendButton.setDisable(true);
         sendButton.setOnAction(event -> onSend());
         VBox.setMargin(sendButton, new Insets(10, 0, 0, 0));
+        spinningWheel = new BusyAnimation(false);
+        setButtonBusyContent(sendButton, spinningWheel).setText(Res.get("funds.withdrawal.preparing"));
 
-        card = new VBox(16, heading, balanceBox, addressGroup, amountGroup, noteGroup, sendButton);
+        form = new VBox(16, addressGroup, amountGroup, noteGroup);
+        VBox card = new VBox(16, heading, balanceBox, form, sendButton);
         card.getStyleClass().add("send-card");
         card.setAlignment(Pos.TOP_CENTER);
         card.setFillWidth(true);
         card.setMaxWidth(520);
         card.setMaxHeight(Region.USE_PREF_SIZE);
 
-        // busy spinner centered over the card while a send is building
-        spinningWheel = new BusyAnimation(false);
-        StackPane cardStack = new StackPane(card, spinningWheel);
-        StackPane.setAlignment(spinningWheel, Pos.CENTER);
-
         // root the card at a window-height-based top offset, like the receive tab
         Region topSpacer = new Region();
         Region bottomSpacer = new Region();
         topSpacer.setMinHeight(14);
         VBox.setVgrow(bottomSpacer, Priority.ALWAYS);
-        VBox layoutBox = new VBox(topSpacer, cardStack, bottomSpacer);
+        VBox layoutBox = new VBox(topSpacer, card, bottomSpacer);
         layoutBox.setAlignment(Pos.TOP_CENTER);
         layoutBox.setFillWidth(true);
         topSpacer.prefHeightProperty().bind(Bindings.createDoubleBinding(() ->
@@ -283,7 +314,10 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
         xmrWalletService.addBalanceListener(balanceListener);
         marketPricePresentation.balancePriceProperty().addListener(priceChangeListener);
 
-        GUIUtil.requestFocus(addressField);
+        UserThread.execute(() -> {
+            addressField.requestFocus();
+            addressField.selectAll();
+        });
     }
 
     @Override
@@ -436,13 +470,15 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
     private void showLoadingIndicator() {
         sending = true;
         spinningWheel.play();
-        card.setDisable(true); // dim and lock the form, leaving the spinner crisp on top
+        form.setDisable(true); // lock the fields, leaving the heading and balance crisp
+        sendButton.setDisable(true);
     }
 
     private void hideLoadingIndicator() {
         sending = false;
         spinningWheel.stop();
-        card.setDisable(false);
+        form.setDisable(false);
+        updateSendButtonState();
     }
 
     private void updateBalanceDisplay() {
@@ -502,7 +538,7 @@ public class WithdrawalView extends ActivatableView<StackPane, Void> {
         boolean amountValid = sendMax
                 ? available.signum() > 0
                 : parsed != null && parsed.signum() > 0 && parsed.compareTo(available) <= 0;
-        sendButton.setDisable(!(isAddressValid() && amountValid));
+        sendButton.setDisable(sending || !(isAddressValid() && amountValid)); // balance updates during a send must not re-enable it
     }
 
     // sync the green check and the error label; the error appears when flagged (focus out) and stays until valid

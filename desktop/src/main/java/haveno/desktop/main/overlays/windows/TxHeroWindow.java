@@ -34,10 +34,12 @@ import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.GlyphsDude;
 import haveno.desktop.util.Layout;
 import javafx.beans.binding.Bindings;
+import javafx.css.PseudoClass;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Cursor;
 import javafx.scene.Node;
+import javafx.scene.text.TextAlignment;
 import javafx.scene.control.Label;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
@@ -56,7 +58,7 @@ import java.math.BigInteger;
 public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T> {
 
     private TxConfidenceIndicator confidenceIndicator;
-    private Tooltip confidenceTooltip;
+    private Label confidenceLabel;
     private MoneroWalletListener walletListener;
     private XmrWalletService xmrWalletService;
     private String confidenceTxId;
@@ -114,6 +116,14 @@ public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T>
     }
 
     protected static VBox hero(MaterialDesignIcon glyph, String badgeStyle, String titleText, String amountText, String fiat) {
+        Label amountLabel = new AutoTooltipLabel(amountText);
+        amountLabel.getStyleClass().add("confirm-send-amount");
+        VBox hero = hero(glyph, badgeStyle, titleText, amountLabel, fiat);
+        VBox.setMargin(amountLabel, new Insets(8, 0, 0, 0));
+        return hero;
+    }
+
+    protected static VBox hero(MaterialDesignIcon glyph, String badgeStyle, String titleText, Node amount, String fiat) {
         Label badge = new Label();
         badge.setGraphic(GlyphsDude.createIcon(glyph, "1.6em"));
         badge.getStyleClass().add(badgeStyle);
@@ -123,16 +133,18 @@ public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T>
 
         Label title = new AutoTooltipLabel(titleText);
         title.getStyleClass().add("confirm-send-title");
-        Label amountLabel = new AutoTooltipLabel(amountText);
-        amountLabel.getStyleClass().add("confirm-send-amount");
-
-        VBox hero = new VBox(badge, title, amountLabel);
+        title.setWrapText(true);
+        title.setTextAlignment(TextAlignment.CENTER);
+        VBox hero = new VBox(badge, title);
+        if (amount != null) hero.getChildren().add(amount);
         hero.setAlignment(Pos.CENTER);
         VBox.setMargin(title, new Insets(16, 0, 0, 0));
-        VBox.setMargin(amountLabel, new Insets(8, 0, 0, 0));
+        if (amount != null) VBox.setMargin(amount, new Insets(6, 0, 0, 0));
         if (fiat != null) {
             Label fiatLabel = new AutoTooltipLabel(fiat);
             fiatLabel.getStyleClass().add("confirm-send-fiat");
+            fiatLabel.setWrapText(true);
+            fiatLabel.setTextAlignment(TextAlignment.CENTER);
             VBox.setMargin(fiatLabel, new Insets(3, 0, 0, 0));
             hero.getChildren().add(fiatLabel);
         }
@@ -207,12 +219,16 @@ public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T>
 
     // read-only text area styled as a plain label so the value text can be selected
     protected static TextArea selectableLabel(String text, String styleClass) {
+        return selectableLabel(text, styleClass, false);
+    }
+
+    protected static TextArea selectableLabel(String text, String styleClass, boolean compact) {
         TextArea area = new TextArea(text);
         area.setEditable(false);
         area.setWrapText(true);
         area.setFocusTraversable(false);
         area.getStyleClass().addAll("selectable-label", styleClass);
-        GUIUtil.adjustHeightAutomatically(area);
+        GUIUtil.adjustHeightAutomatically(area, null, !compact, compact ? 0d : null);
         return area;
     }
 
@@ -238,19 +254,29 @@ public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T>
         return icon;
     }
 
-    // tx id with confirmation progress, block explorer and copy shortcuts; updates until fully confirmed or hidden
-    protected VBox txIdGroup(String txId, XmrWalletService xmrWalletService, Preferences preferences) {
+    // status updates until fully confirmed or hidden
+    protected HBox txStatusRow(String txId, XmrWalletService xmrWalletService) {
+        return txStatusRow(txId, null, xmrWalletService);
+    }
+
+    // the wallet's copy of the tx seeds the status so the first frame does not show it as unknown
+    protected HBox txStatusRow(MoneroTx tx, XmrWalletService xmrWalletService) {
+        return txStatusRow(tx.getHash(), tx, xmrWalletService);
+    }
+
+    private HBox txStatusRow(String txId, MoneroTx tx, XmrWalletService xmrWalletService) {
         this.xmrWalletService = xmrWalletService;
         this.confidenceTxId = txId;
+        confidenceIndicator = new TxConfidenceIndicator(-1);
+        confidenceIndicator.setMinSize(15, 15);
+        confidenceIndicator.setMaxSize(15, 15);
+        confidenceLabel = new Label(Res.get("confidence.unknown"), confidenceIndicator);
+        confidenceLabel.getStyleClass().add("tx-status");
+        if (tx == null || !updateStatus(tx)) startConfidenceUpdates();
+        return detailRow(Res.get("txDetailsWindow.status"), confidenceLabel);
+    }
 
-        confidenceIndicator = new TxConfidenceIndicator();
-        confidenceIndicator.setFocusTraversable(false);
-        confidenceIndicator.setMaxSize(20, 20);
-        confidenceIndicator.setId("funds-confidence");
-        confidenceIndicator.setProgress(0);
-        confidenceTooltip = new Tooltip("-");
-        confidenceIndicator.setTooltip(confidenceTooltip);
-
+    protected VBox txIdGroup(String txId, Preferences preferences) {
         Label explorerIcon = new Label();
         explorerIcon.setGraphic(GlyphsDude.createIcon(FontAwesomeIcon.EXTERNAL_LINK, "1.0em"));
         explorerIcon.getStyleClass().add("confirm-send-copy");
@@ -259,9 +285,8 @@ public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T>
         explorerIcon.setOnMouseClicked(e -> openBlockExplorer(txId, preferences));
         Accessibility.asButton(explorerIcon, Res.get("txIdTextField.blockExplorerIcon.tooltip"));
 
-        startConfidenceUpdates();
         return sheetGroup(Res.get("funds.withdrawal.sent.txId"), selectableLabel(txId, "confirm-send-address"),
-                confidenceIndicator, explorerIcon, copyIcon(txId));
+                explorerIcon, copyIcon(txId));
     }
 
     private static void openBlockExplorer(String txId, Preferences preferences) {
@@ -290,20 +315,38 @@ public abstract class TxHeroWindow<T extends TxHeroWindow<T>> extends Overlay<T>
     }
 
     private void updateConfidence(boolean useCache, MoneroWalletListener listener) {
-        MoneroTx tx = null;
+        MoneroTx tx;
         try {
             tx = useCache ? xmrWalletService.getXmrConnectionService().getTxWithCache(confidenceTxId) : xmrWalletService.getXmrConnectionService().getTx(confidenceTxId);
+            if (tx == null) return;
             if (tx.getNumConfirmations() == null) { // TODO: don't set if tx.getNumConfirmations() works reliably on non-local testnet
-                tx.setNumConfirmations(tx.isConfirmed() ? xmrWalletService.getXmrConnectionService().getLastInfo().getHeight() - tx.getHeight() : 0L);
+                tx.setNumConfirmations(Boolean.TRUE.equals(tx.isConfirmed()) ? xmrWalletService.getXmrConnectionService().getLastInfo().getHeight() - tx.getHeight() : 0L);
             }
         } catch (Exception e) {
-            // tx may not be visible to the connected node yet
+            // keep the last known status if the tx cannot be fetched
+            return;
         }
-        MoneroTx finalTx = tx;
         UserThread.execute(() -> {
             if (walletListener != listener) return; // superseded by rebuilt content or hidden
-            GUIUtil.updateConfidence(finalTx, confidenceTooltip, confidenceIndicator);
-            if (confidenceIndicator.getProgress() >= 1.0) stopConfidenceUpdates();
+            updateStatus(tx);
         });
+    }
+
+    private boolean updateStatus(MoneroTx tx) {
+        boolean failed = tx != null && Boolean.TRUE.equals(tx.isFailed());
+        boolean known = tx != null && tx.getNumConfirmations() != null && Boolean.TRUE.equals(tx.isRelayed());
+        long confirmations = known && Boolean.TRUE.equals(tx.isConfirmed()) ? Math.max(0, tx.getNumConfirmations()) : 0;
+        boolean confirmed = !failed && known && confirmations >= XmrWalletService.NUM_BLOCKS_UNLOCK;
+        confidenceLabel.setText(failed ? Res.get("confidence.invalid")
+                : !known ? Res.get("confidence.unknown")
+                : confirmed ? Res.get("txDetailsWindow.status.confirmed")
+                : Res.get("txDetailsWindow.status.confirmations", confirmations, XmrWalletService.NUM_BLOCKS_UNLOCK));
+        confidenceLabel.pseudoClassStateChanged(PseudoClass.getPseudoClass("confirmed"), confirmed);
+        confidenceLabel.pseudoClassStateChanged(PseudoClass.getPseudoClass("failed"), failed);
+        confidenceIndicator.setProgress(confirmations == 0 ? -1 : (double) confirmations / XmrWalletService.NUM_BLOCKS_UNLOCK);
+        confidenceLabel.setGraphic(confirmed ? GlyphsDude.createIcon(MaterialDesignIcon.CHECK_CIRCLE, "1.1em")
+                : failed ? GlyphsDude.createIcon(MaterialDesignIcon.CLOSE_CIRCLE, "1.1em") : confidenceIndicator);
+        if (confirmed) stopConfidenceUpdates();
+        return confirmed;
     }
 }

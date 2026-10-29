@@ -22,17 +22,17 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.zxing.BarcodeFormat;
+import com.google.zxing.EncodeHintType;
 import com.google.zxing.client.j2se.MatrixToImageWriter;
 import com.google.zxing.common.BitMatrix;
 import com.google.zxing.qrcode.QRCodeWriter;
 
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIconView;
+import haveno.common.ThreadUtils;
 import haveno.common.UserThread;
 import haveno.common.config.Config;
-import haveno.common.file.CorruptedStorageFileHandler;
-import haveno.common.persistence.PersistenceManager;
-import haveno.common.proto.persistable.PersistableEnvelope;
+import haveno.common.file.FileUtil;
 import haveno.common.proto.persistable.PersistenceProtoResolver;
 import haveno.common.util.Tuple2;
 import haveno.common.util.Tuple3;
@@ -91,10 +91,12 @@ import javafx.geometry.Rectangle2D;
 import javafx.scene.AccessibleRole;
 import javafx.scene.Cursor;
 import javafx.scene.Node;
+import javafx.scene.Parent;
 import javafx.scene.Scene;
 import javafx.scene.control.ButtonBase;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContentDisplay;
+import javafx.scene.control.ContextMenu;
 import javafx.scene.control.DatePicker;
 import javafx.scene.control.Label;
 import javafx.scene.control.Labeled;
@@ -145,8 +147,11 @@ import org.apache.commons.lang3.StringUtils;
 import org.bitcoinj.core.Coin;
 import org.jetbrains.annotations.NotNull;
 
+import javax.annotation.Nullable;
+
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -157,7 +162,6 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Paths;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -225,21 +229,32 @@ public class GUIUtil {
     public static void exportAccounts(ArrayList<PaymentAccount> accounts,
                                       String fileName,
                                       Preferences preferences,
-                                      Stage stage,
-                                      PersistenceProtoResolver persistenceProtoResolver,
-                                      CorruptedStorageFileHandler corruptedStorageFileHandler) {
+                                      Stage stage) {
         if (!accounts.isEmpty()) {
             String directory = getDirectoryFromChooser(preferences, stage);
             if (!directory.isEmpty()) {
-                PersistenceManager<PersistableEnvelope> persistenceManager = new PersistenceManager<>(new File(directory), persistenceProtoResolver, corruptedStorageFileHandler, null);
-                PaymentAccountList paymentAccounts = new PaymentAccountList(accounts);
-                persistenceManager.initialize(paymentAccounts, fileName, PersistenceManager.Source.PRIVATE_LOW_PRIO);
-                persistenceManager.persistNow(() -> {
-                    persistenceManager.shutdown();
-                    new Popup().feedback(Res.get("guiUtil.accountExport.savedToPath",
-                            Paths.get(directory, fileName).toAbsolutePath()))
-                            .show();
-                });
+                File file = new File(directory, fileName);
+                byte[] serialized;
+                try {
+                    // snapshot mutable accounts on the user thread before queuing the write
+                    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                    new PaymentAccountList(accounts).toProtoMessage().writeDelimitedTo(outputStream);
+                    serialized = outputStream.toByteArray();
+                } catch (Exception e) {
+                    log.error("Exporting accounts to {} failed", file, e);
+                    new Popup().warning(Res.get("guiUtil.accountExport.saveFailed", file.getAbsolutePath(), e.getMessage())).show();
+                    return;
+                }
+                ThreadUtils.execute(() -> {
+                    try {
+                        FileUtil.writeAtomically(file.toPath(), serialized);
+                    } catch (Exception e) {
+                        log.error("Exporting accounts to {} failed", file, e);
+                        UserThread.execute(() -> new Popup().warning(Res.get("guiUtil.accountExport.saveFailed", file.getAbsolutePath(), e.getMessage())).show());
+                        return;
+                    }
+                    UserThread.execute(() -> new Popup().feedback(Res.get("guiUtil.accountExport.savedToPath", file.getAbsolutePath())).show());
+                }, "PaymentAccountIO");
             }
         } else {
             new Popup().warning(Res.get("guiUtil.accountExport.noAccountSetup")).show();
@@ -250,8 +265,7 @@ public class GUIUtil {
                                       String fileName,
                                       Preferences preferences,
                                       Stage stage,
-                                      PersistenceProtoResolver persistenceProtoResolver,
-                                      CorruptedStorageFileHandler corruptedStorageFileHandler) {
+                                      PersistenceProtoResolver persistenceProtoResolver) {
         FileChooser fileChooser = new FileChooser();
         File initDir = new File(preferences.getDirectoryChooserPath());
         if (initDir.isDirectory()) {
@@ -261,30 +275,35 @@ public class GUIUtil {
         File file = fileChooser.showOpenDialog(stage.getOwner());
         if (file != null) {
             String path = file.getAbsolutePath();
-            if (Paths.get(path).getFileName().toString().equals(fileName)) {
-                String directory = Paths.get(path).getParent().toString();
-                preferences.setDirectoryChooserPath(directory);
-                PersistenceManager<PaymentAccountList> persistenceManager = new PersistenceManager<>(new File(directory), persistenceProtoResolver, corruptedStorageFileHandler, null);
-                persistenceManager.readPersisted(fileName, persisted -> {
-                            StringBuilder msg = new StringBuilder();
-                            HashSet<PaymentAccount> paymentAccounts = new HashSet<>();
-                            synchronized (persisted.getList()) {
-                                persisted.getList().forEach(paymentAccount -> {
-                                    String id = paymentAccount.getId();
-                                    if (user.getPaymentAccount(id) == null) {
-                                        paymentAccounts.add(paymentAccount);
-                                        msg.append(Res.get("guiUtil.accountExport.tradingAccount", id));
-                                    } else {
-                                        msg.append(Res.get("guiUtil.accountImport.noImport", id));
-                                    }
-                                });
-                            }
-                            user.addImportedPaymentAccounts(paymentAccounts);
-                            new Popup().feedback(Res.get("guiUtil.accountImport.imported", path, msg)).show();
-                        },
-                        () -> {
-                            new Popup().warning(Res.get("guiUtil.accountImport.noAccountsFound", path, fileName)).show();
-                        });
+            if (file.getName().equals(fileName)) {
+                preferences.setDirectoryChooserPath(file.getParent());
+                ThreadUtils.execute(() -> {
+                    PaymentAccountList persisted;
+                    try (FileInputStream inputStream = new FileInputStream(file)) {
+                        persisted = (PaymentAccountList) persistenceProtoResolver.fromProto(protobuf.PersistableEnvelope.parseDelimitedFrom(inputStream));
+                    } catch (Exception e) {
+                        log.error("Importing accounts from {} failed", path, e);
+                        UserThread.execute(() -> new Popup().warning(Res.get("guiUtil.accountImport.failed", path, e.getMessage())).show());
+                        return;
+                    }
+                    UserThread.execute(() -> {
+                        StringBuilder msg = new StringBuilder();
+                        HashSet<PaymentAccount> paymentAccounts = new HashSet<>();
+                        synchronized (persisted.getList()) {
+                            persisted.getList().forEach(paymentAccount -> {
+                                String id = paymentAccount.getId();
+                                if (user.getPaymentAccount(id) == null) {
+                                    paymentAccounts.add(paymentAccount);
+                                    msg.append(Res.get("guiUtil.accountExport.tradingAccount", id));
+                                } else {
+                                    msg.append(Res.get("guiUtil.accountImport.noImport", id));
+                                }
+                            });
+                        }
+                        user.addImportedPaymentAccounts(paymentAccounts);
+                        new Popup().feedback(Res.get("guiUtil.accountImport.imported", path, msg)).show();
+                    });
+                }, "PaymentAccountIO");
             } else {
                 log.error("The selected file is not the expected file for import. The expected file name is: " + fileName + ".");
             }
@@ -293,9 +312,13 @@ public class GUIUtil {
 
 
     public static byte[] generateQrCodePng(String data, int width, int height) {
+        return generateQrCodePng(data, width, height, Map.of());
+    }
+
+    public static byte[] generateQrCodePng(String data, int width, int height, Map<EncodeHintType, ?> hints) {
         try {
             QRCodeWriter qrCodeWriter = new QRCodeWriter();
-            BitMatrix bitMatrix = qrCodeWriter.encode(data, BarcodeFormat.QR_CODE, width, height);
+            BitMatrix bitMatrix = qrCodeWriter.encode(data, BarcodeFormat.QR_CODE, width, height, hints);
             ByteArrayOutputStream pngOutputStream = new ByteArrayOutputStream();
             MatrixToImageWriter.writeToStream(bitMatrix, "PNG", pngOutputStream);
             return pngOutputStream.toByteArray();
@@ -970,21 +993,6 @@ public class GUIUtil {
         UserThread.execute(node::requestFocus);
     }
 
-    public static void rescanOutputs(Preferences preferences) {
-        try {
-            new Popup().information(Res.get("settings.net.rescanOutputsSuccess"))
-                    .actionButtonText(Res.get("shared.yes"))
-                    .onAction(() -> {
-                        throw new RuntimeException("Rescanning wallet outputs not yet implemented");
-                        //UserThread.runAfter(HavenoApp.getShutDownHandler(), 100, TimeUnit.MILLISECONDS);
-                    })
-                    .closeButtonText(Res.get("shared.cancel"))
-                    .show();
-        } catch (Throwable t) {
-            new Popup().error(Res.get("settings.net.rescanOutputsFailed", t)).show();
-        }
-    }
-
     // apply the theme to a window's scene and follow theme toggles until the window hides
     public static void loadWindowStyles(Stage stage, Preferences preferences, boolean devHeader) {
         Scene scene = stage.getScene();
@@ -1027,6 +1035,10 @@ public class GUIUtil {
         double y = Math.round(rootSceneWindow.getY() + rootScene.getY() + (rootScene.getHeight() - height) / 2);
         stage.setX(Math.max(screenBounds.getMinX(), Math.min(x, screenBounds.getMaxX() - width)));
         stage.setY(Math.max(screenBounds.getMinY(), Math.min(y, screenBounds.getMaxY() - height)));
+        // hiding a fullscreen window deadlocks JavaFX on macOS while rendering, so leave fullscreen first
+        stage.addEventHandler(WindowEvent.WINDOW_HIDING, e -> {
+            if (stage.isFullScreen()) stage.setFullScreen(false);
+        });
         // let the chat render before revealing the native window
         stage.setOpacity(0);
         stage.show();
@@ -1307,6 +1319,42 @@ public class GUIUtil {
                 MaterialDesignIcon.APPROVAL : MaterialDesignIcon.ALERT_CIRCLE_OUTLINE;
     }
 
+    // scrolls the least needed to show the node, repeating after each layout pulse until the content
+    // stops resizing since newly set content and its auto sized text areas take a few pulses to settle
+    public static void scrollIntoView(ScrollPane scrollPane, Node node) {
+        Scene scene = scrollPane.getScene();
+        if (scene == null) return;
+        int[] pulses = {6};
+        double[] last = {Double.NaN, Double.NaN};
+        Runnable[] scroll = new Runnable[1];
+        scroll[0] = () -> {
+            Node content = scrollPane.getContent();
+            if (content == null || node.getScene() != scene) {
+                scene.removePostLayoutPulseListener(scroll[0]);
+                return;
+            }
+            Bounds bounds = content.sceneToLocal(node.localToScene(node.getBoundsInLocal()));
+            double contentHeight = content.getLayoutBounds().getHeight();
+            boolean settled = bounds.getMaxY() == last[0] && contentHeight == last[1];
+            last[0] = bounds.getMaxY();
+            last[1] = contentHeight;
+            if (settled || --pulses[0] == 0) scene.removePostLayoutPulseListener(scroll[0]);
+            else Platform.requestNextPulse();
+            double viewportHeight = scrollPane.getViewportBounds().getHeight();
+            double scrollable = contentHeight - viewportHeight;
+            double range = scrollPane.getVmax() - scrollPane.getVmin();
+            if (scrollable <= 0 || range <= 0) return;
+            double offset = (scrollPane.getVvalue() - scrollPane.getVmin()) / range * scrollable;
+            // the bottom edge wins when the node is taller than the viewport
+            if (bounds.getMaxY() > offset + viewportHeight) offset = bounds.getMaxY() - viewportHeight;
+            else if (bounds.getMinY() < offset) offset = Math.max(bounds.getMinY(), bounds.getMaxY() - viewportHeight);
+            else return;
+            scrollPane.setVvalue(scrollPane.getVmin() + Math.max(0, Math.min(1, offset / scrollable)) * range);
+        };
+        scene.addPostLayoutPulseListener(scroll[0]);
+        Platform.requestNextPulse();
+    }
+
     public static ScrollPane createScrollPane() {
         ScrollPane scrollPane = new ScrollPane();
         scrollPane.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
@@ -1362,7 +1410,23 @@ public class GUIUtil {
         }
     }
 
+    // TODO: workaround for JDK-8351867, remove once JavaFX is bumped to a release with the fix
+    public static void repaintOnRestore(Stage stage) {
+        stage.iconifiedProperty().addListener((observable, wasIconified, iconified) -> {
+            if (!iconified) Platform.runLater(() -> {
+                Scene scene = stage.getScene();
+                if (!stage.isShowing() || stage.isIconified() || scene == null || scene.fillProperty().isBound()) return;
+                if (scene.getFill() instanceof Color fill) {
+                    // an equal but distinct fill forces a full repaint and refreshes JavaFX's cached minimized state
+                    // after restore (JDK-8351867), without changing the background color
+                    scene.setFill(new Color(fill.getRed(), fill.getGreen(), fill.getBlue(), fill.getOpacity()));
+                }
+            });
+        });
+    }
+
     private static final String CURSOR_REFRESH = "haveno.cursorRefresh";
+    private static final String SHADOW_DISMISS = "haveno.shadowDismiss";
     private static Field mouseHandlerField, currCursorField, currCursorFrameField;
     private static boolean cursorCacheUnavailable;
 
@@ -1372,6 +1436,59 @@ public class GUIUtil {
         Window.getWindows().forEach(GUIUtil::installWindowCursorRefresh);
         Window.getWindows().addListener((ListChangeListener<Window>) change -> {
             while (change.next()) change.getAddedSubList().forEach(GUIUtil::installWindowCursorRefresh);
+        });
+    }
+
+    private static final String SCROLL_FORWARDING = "haveno.scrollForwarding";
+
+    // A trackpad scroll gesture, inertia included, stays aimed at the node first under the pointer; when a view
+    // rebuilds that node (e.g. a reused cell's graphic), forward the stranded gesture to its nearest attached ancestor.
+    public static void keepScrollGesturesAttached() {
+        Window.getWindows().forEach(GUIUtil::installWindowScrollForwarding);
+        Window.getWindows().addListener((ListChangeListener<Window>) change -> {
+            while (change.next()) change.getAddedSubList().forEach(GUIUtil::installWindowScrollForwarding);
+        });
+    }
+
+    private static void installWindowScrollForwarding(Window window) {
+        if (window.getProperties().put(SCROLL_FORWARDING, Boolean.TRUE) != null) return;
+        window.sceneProperty().addListener((obs, oldScene, scene) -> installSceneScrollForwarding(scene));
+        installSceneScrollForwarding(window.getScene());
+    }
+
+    private static void installSceneScrollForwarding(Scene scene) {
+        if (scene == null || scene.getProperties().put(SCROLL_FORWARDING, Boolean.TRUE) != null) return;
+        AtomicReference<Runnable> release = new AtomicReference<>(() -> {});
+        scene.addEventFilter(ScrollEvent.SCROLL_STARTED, event -> {
+            release.getAndSet(() -> {}).run();
+            if (!(event.getTarget() instanceof Node target)) return;
+            List<Node> ancestors = new ArrayList<>();
+            for (Node node = target.getParent(); node != null; node = node.getParent()) ancestors.add(node);
+            EventHandler<ScrollEvent> forward = e -> {
+                if (target.getScene() != null) return;
+                ancestors.stream().filter(node -> node.getScene() != null).findFirst().ifPresent(node -> {
+                    e.consume();
+                    node.fireEvent(e.copyFor(node, node));
+                });
+            };
+            target.addEventFilter(ScrollEvent.ANY, forward);
+            release.set(() -> target.removeEventFilter(ScrollEvent.ANY, forward)); // also holds the target, which the scene references weakly
+        });
+    }
+
+    // A popup window covers its drop shadow, so a press on the shadow reaches the menu's own scene
+    // instead of auto-hiding it; dismiss any context menu on presses outside its card.
+    public static void dismissContextMenusOnShadowPress() {
+        Window.getWindows().addListener((ListChangeListener<Window>) change -> {
+            while (change.next()) change.getAddedSubList().forEach(GUIUtil::installShadowDismiss);
+        });
+    }
+
+    private static void installShadowDismiss(Window window) {
+        if (!(window instanceof ContextMenu menu) || menu.getProperties().put(SHADOW_DISMISS, Boolean.TRUE) != null) return;
+        menu.getScene().addEventFilter(MouseEvent.MOUSE_PRESSED, event -> {
+            Parent card = menu.getScene().getRoot();
+            if (!card.getLayoutBounds().contains(card.sceneToLocal(event.getSceneX(), event.getSceneY()))) menu.hide();
         });
     }
 
@@ -1540,14 +1657,24 @@ public class GUIUtil {
         skinListener.invalidated(null);
     }
 
-    private static void applyRoundedArc(TableView<?> tableView) {
+    public static void applyRoundedArc(Region region) {
+        applyRoundedArc(region, 0);
+    }
+
+    // rounds only the bottom corners by extending the clip above the region's top edge
+    public static void applyRoundedBottomArc(Region region) {
+        applyRoundedArc(region, Layout.ROUNDED_ARC);
+    }
+
+    private static void applyRoundedArc(Region region, double topOverhang) {
         Rectangle clip = new Rectangle();
         clip.setArcWidth(Layout.ROUNDED_ARC);
         clip.setArcHeight(Layout.ROUNDED_ARC);
-        tableView.setClip(clip);
-        tableView.layoutBoundsProperty().addListener((obs, oldVal, newVal) -> {
+        clip.setY(-topOverhang);
+        region.setClip(clip);
+        region.layoutBoundsProperty().addListener((obs, oldVal, newVal) -> {
             clip.setWidth(newVal.getWidth());
-            clip.setHeight(newVal.getHeight());
+            clip.setHeight(newVal.getHeight() + topOverhang);
         });
     }
 
@@ -1864,10 +1991,6 @@ public class GUIUtil {
         return (int) Math.ceil(CURRENCY_ICON_MARGIN * scale);
     }
 
-    public static StackPane getCurrencyIconWithBorder(String currencyCode) {
-        return getCurrencyIconWithBorder(currencyCode, 25, 1);
-    }
-
     public static StackPane getCurrencyIconWithBorder(String currencyCode, double size, double borderWidth) {
         if (currencyCode == null) return null;
 
@@ -1891,6 +2014,13 @@ public class GUIUtil {
         StackPane.setAlignment(icon, Pos.CENTER);
 
         return circleWrapper;
+    }
+
+    // single color Monero mark for colored buttons
+    public static Region getMoneroMark() {
+        Region mark = new Region();
+        mark.getStyleClass().add("monero-mark");
+        return mark;
     }
 
     private static String getImageId(String currencyCode) {
@@ -1937,6 +2067,30 @@ public class GUIUtil {
                 });
             }
         });
+    }
+
+    public static void fitRows(TextArea textArea, int rows) {
+        fitRows(textArea, rows, rows);
+    }
+
+    // size a text area to its wrapped lines, between minRows and maxRows; the skin sizes its rows with the font it has before css applies
+    public static void fitRows(TextArea textArea, int minRows, int maxRows) {
+        textArea.setMinHeight(Region.USE_PREF_SIZE); // the skin's minimum reserves a row at the pre css font plus a horizontal bar
+        textArea.prefHeightProperty().bind(Bindings.createDoubleBinding(() -> {
+            Region content = (Region) textArea.lookup(".content");
+            Text line = content == null ? null : (Text) content.lookup(".text");
+            if (line == null) return Region.USE_COMPUTED_SIZE;
+            Text probe = new Text("X");
+            probe.setFont(line.getFont());
+            probe.setBoundsType(line.getBoundsType());
+            double lineHeight = probe.getLayoutBounds().getHeight();
+            probe.setText(textArea.getText());
+            probe.setWrappingWidth(textArea.isWrapText() ? Math.max(0, textArea.getWidth() - textArea.snappedLeftInset() - textArea.snappedRightInset()
+                    - content.snappedLeftInset() - content.snappedRightInset()) : 0); // the width without a scrollbar, which only shows past maxRows
+            int rows = Math.max(minRows, Math.min(maxRows, (int) Math.round(probe.getLayoutBounds().getHeight() / lineHeight)));
+            return rows * lineHeight + textArea.snappedTopInset() + textArea.snappedBottomInset()
+                    + content.snappedTopInset() + content.snappedBottomInset();
+        }, textArea.fontProperty(), textArea.insetsProperty(), textArea.skinProperty(), textArea.textProperty(), textArea.widthProperty()));
     }
 
     public static Label getLockLabel() {
@@ -2027,6 +2181,10 @@ public class GUIUtil {
         return getBigXmrQrCodePane(BIG_QR_CODE_SIZE);
     }
 
+    public static Tuple2<StackPane, ImageView> getBigQrCodePane() {
+        return getQrCodePane(BIG_QR_CODE_SIZE, null);
+    }
+
     public static Tuple2<StackPane, ImageView> getBigXmrQrCodePane(int qrCodeSize) {
         int baseLogoSize = disablePaymentUriLabel ? 47 : 45; // logo size at the default code size
         int logoSize = (int) Math.round((double) baseLogoSize * qrCodeSize / BIG_QR_CODE_SIZE);
@@ -2097,14 +2255,17 @@ public class GUIUtil {
     }
 
     private static Tuple2<StackPane, ImageView> getXmrQrCodePane(int qrCodeSize, int logoSize, int logoBorderWidth) {
+        Tuple2<StackPane, ImageView> qrCodeTuple = getQrCodePane(qrCodeSize, GUIUtil.getCurrencyIconWithBorder(Res.getBaseCurrencyCode(), logoSize, logoBorderWidth));
+        qrCodeTuple.first.setCursor(Cursor.HAND);
+        return qrCodeTuple;
+    }
+
+    private static Tuple2<StackPane, ImageView> getQrCodePane(int qrCodeSize, @Nullable Node logo) {
         ImageView qrCodeImageView = new ImageView();
         qrCodeImageView.setFitHeight(qrCodeSize);
         qrCodeImageView.setFitWidth(qrCodeSize);
-        qrCodeImageView.getStyleClass().add("qr-code");
 
-        StackPane xmrLogo = GUIUtil.getCurrencyIconWithBorder(Res.getBaseCurrencyCode(), logoSize, logoBorderWidth);
-        StackPane qrCodePane = new StackPane(qrCodeImageView, xmrLogo);
-        qrCodePane.setCursor(Cursor.HAND);
+        StackPane qrCodePane = logo == null ? new StackPane(qrCodeImageView) : new StackPane(qrCodeImageView, logo);
         qrCodePane.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
 
         // round the corners, with the shadow on a wrapper so the clip does not cut it off

@@ -70,7 +70,6 @@ import haveno.core.trade.protocol.SellerProtocol;
 import haveno.core.trade.protocol.TradeListener;
 import haveno.core.trade.protocol.TradePeer;
 import haveno.core.trade.protocol.TradeProtocol;
-import haveno.core.trade.statistics.TradeStatisticsManager;
 import haveno.core.util.PriceUtil;
 import haveno.core.util.VolumeUtil;
 import haveno.core.xmr.exceptions.WalletUnavailableException;
@@ -415,6 +414,10 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
 
     @Setter
     private long takeOfferDate;
+    @Getter
+    private long paymentSentDate; // local time payment was first marked sent, 0 if unknown
+    @Getter
+    private long paymentReceivedDate; // local time payment was first marked received, 0 if unknown
 
     // Initialization
     private static final int TOTAL_INIT_STEPS = 24; // total estimated steps
@@ -540,6 +543,12 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
     private volatile long completedRevision;
     @Getter
     private final String challenge;
+    @Getter
+    @Setter
+    private volatile long tradeStatisticsPublishTime; // persisted so restarts resume the publish schedule, 0 until scheduled
+    @Getter
+    @Setter
+    private volatile boolean tradeStatisticsPublished; // set once enough peers confirmed the broadcast
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Constructors
@@ -2483,6 +2492,12 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
             log.warn(message);
         }
 
+        // record when payment is first marked sent or received, excluding persisted state applied over the initial state
+        if (this.state != State.PREPARATION && state.getPhase().ordinal() > this.state.getPhase().ordinal()) {
+            if (state.getPhase() == Phase.PAYMENT_SENT && paymentSentDate == 0) paymentSentDate = System.currentTimeMillis();
+            if (state.getPhase() == Phase.PAYMENT_RECEIVED && paymentReceivedDate == 0) paymentReceivedDate = System.currentTimeMillis();
+        }
+
         this.state = state;
 
         persistNow(null);
@@ -3223,13 +3238,7 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
     }
 
     public void maybePublishTradeStatistics() {
-        if (shouldPublishTradeStatistics()) {
-
-            // publish after random delay within 24 hours
-            UserThread.runAfterRandomDelay(() -> {
-                if (!isShutDownStarted) doPublishTradeStatistics();
-            }, 0, TradeStatisticsManager.PUBLISH_STATS_RANDOM_DELAY_HOURS * 60 * 60 * 1000, TimeUnit.MILLISECONDS);
-        }
+        if (shouldPublishTradeStatistics()) doPublishTradeStatistics();
     }
 
     public boolean shouldPublishTradeStatistics() {
@@ -4564,10 +4573,10 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
             // freeze outputs until spent
             xmrWalletService.freezeOutputs(getSelf().getReserveTxKeyImages());
 
-            // release unused offer inputs; failed-trade restoration reconciles after restoring ownership
+            // release offer inputs not spent by the deposit tx; failed-trade restoration reconciles after restoring ownership
             if (this instanceof MakerTrade && processModel.getTradeManager().hasOpenTrade(this)) {
                 try {
-                    xmrWalletService.fixReservedOutputs();
+                    xmrWalletService.fixReservedOutputs(offer.getOfferPayload().getReserveTxKeyImages());
                 } catch (Exception e) {
                     log.warn("Error updating reserved outputs after publishing deposits for trade {}", getId(), e);
                 }
@@ -4603,6 +4612,8 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
         protobuf.Trade.Builder builder = protobuf.Trade.newBuilder()
                 .setOffer(offer.toProtoMessage())
                 .setTakeOfferDate(takeOfferDate)
+                .setPaymentSentDate(paymentSentDate)
+                .setPaymentReceivedDate(paymentReceivedDate)
                 .setProcessModel(processModel.toProtoMessage())
                 .setAmount(amount)
                 .setPrice(price)
@@ -4614,7 +4625,9 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
                 .setStartTime(startTime)
                 .setUid(uid)
                 .setIsCompleted(isCompleted)
-                .setCompletedRevision(completedRevision);
+                .setCompletedRevision(completedRevision)
+                .setTradeStatisticsPublishTime(tradeStatisticsPublishTime)
+                .setTradeStatisticsPublished(tradeStatisticsPublished);
 
         synchronized (getChatMessages()) {
             builder.addAllChatMessage(getChatMessages().stream()
@@ -4640,6 +4653,8 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
 
     public static Trade fromProto(Trade trade, protobuf.Trade proto, CoreProtoResolver coreProtoResolver) {
         trade.setTakeOfferDate(proto.getTakeOfferDate());
+        trade.paymentSentDate = proto.getPaymentSentDate();
+        trade.paymentReceivedDate = proto.getPaymentReceivedDate();
         trade.setState(State.fromProto(proto.getState()));
         trade.setPayoutState(PayoutState.fromProto(proto.getPayoutState()));
         trade.setDisputeState(DisputeState.fromProto(proto.getDisputeState()));
@@ -4659,6 +4674,8 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
         trade.setCounterCurrencyExtraData(ProtoUtil.stringOrNullFromProto(proto.getCounterCurrencyExtraData()));
         trade.isCompleted = proto.getIsCompleted();
         trade.completedRevision = proto.getCompletedRevision();
+        trade.tradeStatisticsPublishTime = proto.getTradeStatisticsPublishTime();
+        trade.tradeStatisticsPublished = proto.getTradeStatisticsPublished();
         trade.payoutHeight = proto.getPayoutHeight() == 0 || !trade.isPayoutConfirmed() ? null : proto.getPayoutHeight(); // drop a height stored without a confirmed payout, e.g. after a reorg, so pool checks resume
 
         trade.chatMessages.addAll(proto.getChatMessageList().stream()

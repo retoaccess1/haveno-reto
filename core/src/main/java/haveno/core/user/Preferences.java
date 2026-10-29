@@ -79,6 +79,8 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         }
     }
 
+    public record NetworkSettings(MoneroNodesOption nodes, UseTorForXmr tor, String customNodes) {}
+
     private static final ArrayList<BlockChainExplorer> XMR_MAIN_NET_EXPLORERS = new ArrayList<>(Arrays.asList(
             new BlockChainExplorer("xmrchain.net", "https://xmrchain.net/tx/")
     ));
@@ -113,6 +115,10 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
     public static final int CLEAR_DATA_AFTER_DAYS_DEFAULT = 60; // used with new instance or when existing user has agreed to settings notification
     public static final int CLEAR_DATA_AFTER_DAYS_DISABLED = 99999; // feature effectively disabled until existing user agrees to settings notification
 
+
+    // node edits, fallback, and filters update this snapshot; Tor changes wait for the next start
+    private volatile NetworkSettings effectiveNetworkSettings;
+    private boolean publicMoneroNodesBlocked;
 
     // payload is initialized so the default values are available for Property initialization.
     @Setter
@@ -374,8 +380,67 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
     // API
     ///////////////////////////////////////////////////////////////////////////////////////////
 
+    public synchronized NetworkSettings getNetworkSettings() {
+        return new NetworkSettings(MoneroNodesOption.values()[getMoneroNodesOptionOrdinal()],
+                UseTorForXmr.values()[getUseTorForXmrOrdinal()], getMoneroNodes());
+    }
+
+    public NetworkSettings getEffectiveNetworkSettings() {
+        return effectiveNetworkSettings == null ? getNetworkSettings() : effectiveNetworkSettings;
+    }
+
+    public synchronized void captureEffectiveNetworkSettings() {
+        if (effectiveNetworkSettings == null) effectiveNetworkSettings = getNetworkSettings();
+    }
+
+    public synchronized void setEffectiveMoneroNodesOption(MoneroNodesOption option) {
+        applyNodeSettings(option, getEffectiveNetworkSettings().customNodes());
+    }
+
+    public synchronized void applyNodeSettings(MoneroNodesOption nodes, String customNodes) {
+        captureEffectiveNetworkSettings();
+        synchronized (prefPayload) { // serialization reads both fields, so write them under the payload lock
+            prefPayload.setMoneroNodesOptionOrdinal(nodes.ordinal());
+            prefPayload.setMoneroNodes(customNodes);
+        }
+        effectiveNetworkSettings = new NetworkSettings(nodes, effectiveNetworkSettings.tor(), customNodes);
+        requestPersistence();
+    }
+
+    // check the filter and save atomically before a live node edit
+    public synchronized boolean applyNodeSettingsUnlessBlocked(MoneroNodesOption nodes, String customNodes) {
+        if (nodes == MoneroNodesOption.PUBLIC && publicMoneroNodesBlocked) return false;
+        applyNodeSettings(nodes, customNodes);
+        return true;
+    }
+
+    public synchronized void restoreNodeSettings(NetworkSettings previous) {
+        MoneroNodesOption nodes = previous.nodes() == MoneroNodesOption.PUBLIC && publicMoneroNodesBlocked ?
+                MoneroNodesOption.PROVIDED : previous.nodes();
+        applyNodeSettings(nodes, previous.customNodes());
+    }
+
+    public synchronized void setTorForNextStart(UseTorForXmr tor) {
+        captureEffectiveNetworkSettings();
+        prefPayload.setUseTorForXmrOrdinal(tor.ordinal());
+        requestPersistence();
+    }
+
+    public synchronized void setPublicMoneroNodesBlocked(boolean blocked) {
+        publicMoneroNodesBlocked = blocked;
+        if (!blocked) return;
+        captureEffectiveNetworkSettings();
+        if (effectiveNetworkSettings.nodes() == MoneroNodesOption.PUBLIC) {
+            setEffectiveMoneroNodesOption(MoneroNodesOption.PROVIDED);
+        }
+        if (getNetworkSettings().nodes() == MoneroNodesOption.PUBLIC) {
+            prefPayload.setMoneroNodesOptionOrdinal(MoneroNodesOption.PROVIDED.ordinal());
+            requestPersistence();
+        }
+    }
+
     public MoneroNodesOption getMoneroNodesOption() {
-        return XmrNodes.MoneroNodesOption.values()[getMoneroNodesOptionOrdinal()];
+        return getEffectiveNetworkSettings().nodes();
     }
 
     public void dontShowAgain(String key, boolean dontShowAgain) {
@@ -742,8 +807,9 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         requestPersistence();
     }
 
-    public void setMoneroNodes(String moneroNodes) {
+    public synchronized void setMoneroNodes(String moneroNodes) {
         prefPayload.setMoneroNodes(moneroNodes);
+        if (effectiveNetworkSettings != null) effectiveNetworkSettings = new NetworkSettings(effectiveNetworkSettings.nodes(), effectiveNetworkSettings.tor(), moneroNodes);
         requestPersistence();
     }
 
@@ -828,13 +894,15 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         persistenceManager.forcePersistNow();
     }
 
-    public void setUseTorForXmrOrdinal(int useTorForXmrOrdinal) {
+    public synchronized void setUseTorForXmrOrdinal(int useTorForXmrOrdinal) {
         prefPayload.setUseTorForXmrOrdinal(useTorForXmrOrdinal);
+        if (effectiveNetworkSettings != null) effectiveNetworkSettings = new NetworkSettings(effectiveNetworkSettings.nodes(), UseTorForXmr.values()[useTorForXmrOrdinal], effectiveNetworkSettings.customNodes());
         requestPersistence();
     }
 
-    public void setMoneroNodesOptionOrdinal(int moneroNodesOptionOrdinal) {
+    public synchronized void setMoneroNodesOptionOrdinal(int moneroNodesOptionOrdinal) {
         prefPayload.setMoneroNodesOptionOrdinal(moneroNodesOptionOrdinal);
+        if (effectiveNetworkSettings != null) effectiveNetworkSettings = new NetworkSettings(MoneroNodesOption.values()[moneroNodesOptionOrdinal], effectiveNetworkSettings.tor(), effectiveNetworkSettings.customNodes());
         requestPersistence();
     }
 
@@ -983,7 +1051,7 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
     }
 
     public UseTorForXmr getUseTorForXmr() {
-        return UseTorForXmr.class.getEnumConstants()[prefPayload.getUseTorForXmrOrdinal()];
+        return getEffectiveNetworkSettings().tor();
     }
 
     public boolean isProxyApplied(boolean wasWalletSynced) {
@@ -996,6 +1064,11 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
 
     public boolean isDepositAddressesExpanded() {
         return prefPayload.isDepositAddressesExpanded();
+    }
+
+    // an explicit option also applies before the preferences are read, which needs an open account
+    public boolean isUseNativeXmrWallet() {
+        return config.useNativeXmrWalletOptionSetExplicitly ? config.useNativeXmrWallet : prefPayload.isUseNativeXmrWallet();
     }
 
     public double getSecurityDepositAsPercent(PaymentAccount paymentAccount) {
@@ -1051,6 +1124,8 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         void setTacAccepted(boolean tacAccepted);
 
         void setUseNativeXmrWallet(boolean useNativeXmrWallet);
+
+        boolean isUseNativeXmrWallet();
 
         void setUseAnimations(boolean useAnimations);
 

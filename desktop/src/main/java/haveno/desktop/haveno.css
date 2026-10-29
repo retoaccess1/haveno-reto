@@ -328,6 +328,52 @@
     -fx-shape: "M 0 0 l 3.5 4 l 3.5 -4";
 }
 
+/* Context menus: rounded card with a soft hover tint on items */
+.context-menu {
+    -fx-min-width: 190;
+    -fx-padding: 5;
+    -fx-background-color: -bs-context-menu-background;
+    -fx-background-insets: 0;
+    -fx-background-radius: 9;
+    -fx-border-color: -bs-color-border-form-field;
+    -fx-border-width: 1;
+    -fx-border-radius: 9;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.35), 35, 0, 0, 10);
+}
+
+.context-menu .menu-item {
+    -fx-padding: 8 10;
+    -fx-background-radius: 6;
+}
+
+.context-menu .menu-item .label {
+    -fx-text-fill: -bs-text-color;
+    -fx-font-size: 13.5;
+}
+
+.context-menu .menu-item:focused {
+    -fx-background-color: -bs-context-menu-hover;
+}
+
+.context-menu .menu-item,
+.context-menu .menu-item * {
+    -fx-cursor: hand;
+}
+
+.context-menu .menu-item:disabled,
+.context-menu .menu-item:disabled * {
+    -fx-cursor: default;
+}
+
+.context-menu .separator {
+    -fx-padding: 4;
+}
+
+.context-menu .separator .line {
+    -fx-border-color: -bs-color-gray-1;
+    -fx-border-width: 1 0 0 0;
+}
+
 .combo-box-popup {
     -fx-background-color: -bs-color-background-pane;
     -fx-background-radius: 8;
@@ -1146,19 +1192,6 @@ tree-table-view:focused {
     -fx-padding: 0 12;
 }
 
-.portfolio-header .pending-trades-count {
-    -fx-font-size: 11px;
-    -fx-font-family: "IBM Plex Sans Medium";
-    -fx-text-fill: -bs-rd-font-dark;
-    -fx-background-color: -bs-color-background-form-field;
-    -fx-background-radius: 9;
-    -fx-border-color: -bs-color-gray-2;
-    -fx-border-radius: 9;
-    -fx-min-width: 20;
-    -fx-alignment: center;
-    -fx-padding: 0 6;
-}
-
 .nav-separator {
     -fx-max-width: 1;
     -fx-min-width: 1;
@@ -1208,6 +1241,25 @@ tree-table-view:focused {
 .nav-primary .nav-unread-dot {
     -fx-translate-x: 4;
     -fx-translate-y: -4;
+}
+
+.nav-count-badge {
+    -fx-font-size: 10px;
+    -fx-font-family: "IBM Plex Sans";
+    -fx-font-weight: bold;
+    -fx-min-width: 17;
+    -fx-min-height: 17;
+    -fx-max-height: 17;
+    -fx-padding: 0 4 0 4;
+    -fx-alignment: center;
+    -fx-text-fill: white;
+    -fx-background-color: -bs-rd-nav-unread-dot-stroke, -bs-rd-nav-badge-neutral;
+    -fx-background-insets: 0, 1.5;
+    -fx-background-radius: 999;
+}
+
+.nav-count-badge:unread {
+    -fx-background-color: -bs-rd-nav-unread-dot-stroke, -bs-red;
 }
 
 .nav-secondary .nav-unread-dot {
@@ -1801,7 +1853,8 @@ tree-table-view:focused {
  * Icons                                                                       *
  *                                                                             *
  ******************************************************************************/
-.icon, .icon:hover {
+.icon, .icon:hover,
+.peer-info-icon, .peer-info-icon * {
     -fx-cursor: hand;
 }
 
@@ -1827,6 +1880,9 @@ tree-table-view:focused {
     -fx-stroke-width: 1.35;
     -fx-stroke-line-cap: round;
     -fx-stroke-line-join: round;
+}
+.chat-icon-button, .chat-icon-button * {
+    -fx-cursor: hand;
 }
 .chat-badge:hover .chat-icon,
 .chat-icon-button:hover .chat-icon,
@@ -2403,7 +2459,7 @@ textfield */
 .send-address-field {
     -fx-font-family: "IBM Plex Mono";
     -fx-font-size: 0.923em;
-    -fx-padding: 7 34 7 14;
+    -fx-padding: 8 34 8 14; /* one line matches the amount field's height, with room for the check */
 }
 
 .send-valid-check {
@@ -2498,6 +2554,66 @@ textfield */
     -fx-text-fill: -bs-text-color;
 }
 
+/* Transaction notes and confirmation status in the detail sheet. */
+.tx-note-add {
+    -fx-background-color: transparent;
+    -fx-background-insets: -1 0 0 0; /* cover the divider so the hover tint's top edge is even */
+    -fx-background-radius: 0 0 9 9;
+    -fx-text-fill: -bs-color-primary;
+    -fx-font-family: "IBM Plex Sans Medium";
+    -fx-graphic-text-gap: 8;
+    -fx-padding: 13 18;
+    -fx-cursor: hand;
+}
+
+.tx-note-add .glyph-icon {
+    -fx-fill: -bs-color-primary;
+}
+.tx-note-add:hover {
+    -fx-background-color: rgba(35, 92, 188, 0.07);
+}
+.tx-note-save {
+    -fx-padding: 5 14;
+}
+
+/* keep the scrollbar background from covering the editor's rounded outline */
+.tx-note-editor .scroll-bar,
+.tx-note-editor .scroll-bar .track,
+.tx-note-editor .scroll-bar .track-background {
+    -fx-background-color: transparent;
+}
+
+.tx-note-editor .scroll-bar .track {
+    -fx-border-color: transparent;
+}
+
+.tx-status {
+    -fx-background-color: rgba(194, 124, 14, 0.12);
+    -fx-background-radius: 999;
+    -fx-padding: 1 10 3 7;
+    -fx-graphic-text-gap: 6;
+    -fx-font-size: 0.923em;
+    -fx-text-fill: #c27c0e;
+}
+
+.tx-status .progress-indicator {
+    -fx-progress-color: #c27c0e;
+}
+.tx-status:confirmed {
+    -fx-background-color: rgba(62, 163, 74, 0.12);
+    -fx-text-fill: -bs-rd-green-dark;
+}
+.tx-status:confirmed .glyph-icon {
+    -fx-fill: -bs-rd-green-dark;
+}
+.tx-status:failed {
+    -fx-background-color: rgba(204, 51, 51, 0.12);
+    -fx-text-fill: -bs-rd-error-red;
+}
+.tx-status:failed .glyph-icon {
+    -fx-fill: -bs-rd-error-red;
+}
+
 /* Withdraw success — green check badge over the same detail sheet. */
 .tx-sent-icon {
     -fx-background-color: linear-gradient(to bottom right, rgba(62, 163, 74, 0.20), rgba(62, 163, 74, 0.07));
@@ -2576,9 +2692,10 @@ textfield */
 }
 
 .offer-table-top .jfx-button {
-    -fx-pref-width: 300px;
-    -fx-min-height: 35px;
-    -fx-padding: 5 25 5 25;
+    -fx-pref-width: 260px;
+    -fx-min-height: 30px;
+    -fx-max-height: 30px;
+    -fx-padding: 0 25 0 25;
 }
 
 /*******************************************************************************
@@ -2631,10 +2748,6 @@ textfield */
  * Images                                                                      *
  *                                                                             *
  ******************************************************************************/
-.qr-code {
-    -fx-cursor: hand;
-}
-
 .qr-code-pane {
     -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.2), 12, 0, 0, 3);
 }
@@ -3329,6 +3442,10 @@ textfield */
     -fx-background-insets: 0;
     -fx-border-width: 0;
     -fx-padding: 0;
+    -fx-background-image: url("../../images/chatbg_light.png");
+    -fx-background-repeat: repeat;
+    -fx-background-position: 0 0;
+    -fx-background-size: 700px;
 }
 
 #message-list-view.list-view:focused {
@@ -3667,6 +3784,18 @@ textfield */
     -fx-background-color: derive(-bs-buy, -10%);
 }
 
+/* single color Monero mark for colored buttons */
+.monero-mark {
+    -fx-shape: "M12 0C5.365 0 0 5.373 0 12.015c0 1.335.228 2.607.618 3.81h3.577V5.729L12 13.545l7.805-7.815v10.095h3.577c.389-1.203.618-2.475.618-3.81C24 5.375 18.635 0 12 0m-1.788 15.307-3.417-3.421v6.351H1.758C3.87 21.689 7.678 24 12 24s8.162-2.311 10.245-5.764h-5.04v-6.351l-3.386 3.421-1.788 1.79-1.814-1.79z";
+    -fx-background-color: -bs-white;
+    -fx-min-width: 18px;
+    -fx-pref-width: 18px;
+    -fx-max-width: 18px;
+    -fx-min-height: 18px;
+    -fx-pref-height: 18px;
+    -fx-max-height: 18px;
+}
+
 #copy-button-thin {
     -fx-background-color: -bs-buy;
     -fx-text-fill: -bs-white;
@@ -3700,6 +3829,23 @@ textfield */
 .action-button:disabled, #sell-button:disabled, #buy-button:disabled {
     -fx-background-color: -bs-color-gray-0;
     -fx-text-fill: -bs-rd-font-dark-gray;
+}
+
+.action-button.busy-button:busy {
+    -fx-background-color: -bs-color-background-form-field;
+    -fx-text-fill: -bs-text-color;
+    -fx-opacity: 1;
+    -fx-cursor: default;
+}
+
+.busy-button .busyanimation,
+.busy-button .label {
+    -fx-opacity: 1;
+}
+
+.busy-button .busyanimation .arc {
+    -fx-stroke: -bs-hero-primary;
+    -fx-stroke-width: 2;
 }
 
 /********************************************************************************************************************
@@ -4367,3 +4513,149 @@ textfield */
 .popup-with-input {
     -fx-background-color: -bs-color-background-popup-input;
 }
+
+/* Confirmation and payment instruction popups */
+.review-popup {
+    -fx-font-size: 14px;
+    -review-red: #d73030;
+    -review-green: #3ea34a;
+    -review-amber: #c98a1c;
+    -review-gated-background: #e7eaef;
+    -review-gated-text: #53657f;
+}
+.review-popup.hero-accent-green, .review-popup .hero-accent-green { -hero-accent: -review-green; }
+.review-popup.hero-accent-amber, .review-popup .hero-accent-amber { -hero-accent: -review-amber; }
+.review-popup.hero-accent-red, .review-popup .hero-accent-red {
+    -hero-accent: -review-red;
+    -hero-accent-strong: rgba(215, 48, 48, 0.20);
+    -hero-accent-faint: rgba(215, 48, 48, 0.07);
+}
+.review-popup .confirm-send-icon {
+    -fx-background-color: linear-gradient(to bottom right, -hero-accent-strong, -hero-accent-faint);
+}
+.review-popup .confirm-send-icon .glyph-icon { -fx-fill: -hero-accent; }
+.review-popup .confirm-send-title { -fx-font-size: 16px; }
+.review-popup .confirm-send-fiat { -fx-font-size: 14px; }
+.review-popup .confirm-send-sheet {
+    -fx-background-radius: 8;
+    -fx-border-radius: 8;
+    -fx-padding: 14 18;
+    -fx-spacing: 12;
+}
+.review-popup .confirm-send-row-label,
+.review-popup .confirm-send-row-value { -fx-font-size: 13px; }
+.review-popup .confirm-send-row-fiat { -fx-font-size: 12px; }
+.review-popup .confirm-send-address { -fx-font-size: 12.5px; }
+.review-popup .review-mono { -fx-font-family: "IBM Plex Mono"; -fx-font-size: 12.5px; -fx-text-fill: -bs-text-color; }
+.review-popup .review-name { -fx-font-size: 15px; -fx-font-family: "IBM Plex Sans Medium"; -fx-text-fill: -bs-text-color; }
+.review-popup .review-amount-number { -fx-fill: -bs-text-color; -fx-font-family: "IBM Plex Sans Medium"; }
+.review-popup .review-amount-currency { -fx-fill: -bs-color-gray-6; -fx-font-family: "IBM Plex Sans Medium"; }
+.review-popup .review-hero-amount .review-amount-number { -fx-font-size: 28px; }
+.review-popup .review-hero-amount .review-amount-currency { -fx-font-size: 20px; }
+.review-popup .review-strip-amount .review-amount-number { -fx-font-size: 22px; }
+.review-popup .review-strip-amount .review-amount-currency { -fx-font-size: 16px; }
+.review-popup .review-small-amount .review-amount-number { -fx-font-size: 16px; }
+.review-popup .review-small-amount .review-amount-currency { -fx-font-size: 13px; }
+.review-popup .review-footer { -fx-font-size: 12.5px; -fx-text-fill: -bs-color-gray-6; }
+.review-popup .review-footer-icon { -fx-fill: -bs-color-gray-6; }
+.review-popup .action-button { -fx-font-family: "IBM Plex Sans Medium"; -fx-font-size: 14px; -fx-min-height: 40; -fx-padding: 8 28; }
+.review-popup .confirm-send-cancel { -fx-font-size: 13px; -fx-min-height: 36; }
+.review-popup .review-danger { -fx-background-color: -review-red; }
+.review-popup .review-danger:hover { -fx-background-color: derive(-review-red, -10%); }
+.review-popup .action-button-gated:disabled {
+    -fx-opacity: 1;
+    -fx-background-color: -review-gated-background;
+    -fx-text-fill: -review-gated-text;
+}
+.review-popup .review-dont-show { -fx-font-size: 13px; -fx-text-fill: -bs-color-gray-6; }
+.review-popup .review-acknowledgement { -fx-font-size: 13.5px; -fx-text-fill: -bs-text-color; }
+.review-popup .hero-header-title { -fx-font-size: 19.5px; }
+.review-popup .hero-header-subtitle { -fx-font-size: 13px; }
+.review-popup .hero-feature-title { -fx-font-size: 14px; -fx-text-fill: -bs-text-color; }
+.review-popup .hero-feature-body { -fx-font-size: 13.5px; }
+.review-popup .hero-feature-row { -fx-padding: 12 20; }
+.review-popup .review-callout {
+    -fx-background-color: -hero-accent-faint;
+    -fx-border-color: -hero-accent-border;
+    -fx-background-radius: 8;
+    -fx-border-radius: 8;
+    -fx-padding: 14 16;
+    -fx-spacing: 14;
+}
+.review-popup .review-callout.hero-accent-amber { -hero-accent-border: rgba(248, 178, 73, 0.30); }
+.review-popup .review-callout.hero-accent-purple { -hero-accent-border: rgba(126, 87, 194, 0.30); }
+.review-popup .review-callout .hero-feature-body { -fx-font-size: 13px; }
+.review-popup .review-callout .hero-feature-icon-box,
+.review-popup .review-compact-rows .hero-feature-icon-box {
+    -fx-min-width: 36; -fx-pref-width: 36; -fx-max-width: 36;
+    -fx-min-height: 36; -fx-pref-height: 36; -fx-max-height: 36;
+}
+.review-popup .review-callout .hero-feature-icon,
+.review-popup .review-compact-rows .hero-feature-icon { -fx-font-size: 18px; }
+.review-popup .review-copy-value {
+    -fx-background-color: -bs-confirm-sheet-background;
+    -fx-border-color: -bs-offer-card-border;
+    -fx-background-radius: 6;
+    -fx-border-radius: 6;
+    -fx-padding: 4 9;
+}
+.review-popup .review-callout .review-copy-value { -fx-background-color: -bs-color-background-popup-blur; -fx-padding: 5 10; }
+.review-popup .review-compact-rows .hero-feature-row { -fx-padding: 12 4; -fx-spacing: 14; }
+.review-popup .review-compact-rows .hero-feature-body { -fx-font-size: 13px; }
+.review-popup .review-restore-sheet { -fx-padding: 6 4; -fx-spacing: 0; }
+.review-popup .review-restore-sheet .hero-feature-row { -fx-padding: 10 14; }
+.review-popup .review-restore-sheet .hero-feature-icon-box {
+    -fx-min-width: 38; -fx-pref-width: 38; -fx-max-width: 38;
+    -fx-min-height: 38; -fx-pref-height: 38; -fx-max-height: 38;
+}
+.review-popup .review-restore-sheet .hero-feature-icon { -fx-font-size: 18px; }
+.review-popup .review-strip,
+.review-popup .review-timeline {
+    -fx-background-color: -bs-confirm-sheet-background;
+    -fx-border-color: -bs-offer-card-border;
+    -fx-background-radius: 8;
+    -fx-border-radius: 8;
+    -fx-padding: 12 16;
+}
+.review-popup .review-strip-label { -fx-font-size: 12.5px; -fx-text-fill: -bs-color-gray-6; }
+.review-popup .review-pill {
+    -fx-background-color: -hero-accent-faint;
+    -fx-background-radius: 999;
+    -fx-padding: 3 10;
+    -fx-font-size: 12.5px;
+    -fx-font-family: "IBM Plex Sans Medium";
+    -fx-text-fill: -hero-accent;
+}
+.review-popup .review-pill .glyph-icon { -fx-fill: -hero-accent; }
+.review-popup .review-info-buttons .button { -fx-font-size: 13px; -fx-min-height: 36; -fx-padding: 6 28; }
+.review-popup .review-track { -fx-background-color: -bs-offer-card-border; -fx-background-radius: 4; }
+.review-popup .review-track-fill { -fx-background-color: linear-gradient(to right, -hero-accent-strong, -hero-accent); -fx-background-radius: 4; }
+.review-popup .review-track-mid { -fx-background-color: -bs-color-background-popup-blur; }
+.review-popup .review-track-marker {
+    -fx-background-color: -bs-color-background-popup-blur;
+    -fx-background-radius: 7;
+    -fx-border-color: -hero-accent;
+    -fx-border-width: 3;
+    -fx-border-radius: 7;
+}
+.review-popup .review-time-left { -fx-font-size: 20px; -fx-font-family: "IBM Plex Sans Medium"; -fx-text-fill: -bs-text-color; }
+.review-popup .review-timeline-caption { -fx-font-size: 12px; -fx-text-fill: -bs-color-gray-6; }
+.review-popup .review-count { -fx-fill: -bs-text-color; -fx-font-family: "IBM Plex Sans Medium"; }
+.review-popup .review-subtitle-text { -fx-fill: -bs-color-gray-6; -fx-font-size: 14px; }
+.review-popup .review-scroll,
+.review-popup .review-scroll > .viewport { -fx-background-color: transparent; -fx-padding: 0; }
+/* the inner borders are outside the text area's insets, so its auto height would leave the text scrollable by their width */
+.review-popup .selectable-label .scroll-pane,
+.review-popup .selectable-label .content { -fx-border-width: 0; }
+
+.review-popup .jfx-check-box .box {
+    -fx-pref-width: 16;
+    -fx-pref-height: 16;
+    -fx-border-radius: 3;
+    -fx-border-width: 1.5;
+}
+
+.review-popup.hero-accent-amber .review-track-fill { -fx-background-color: linear-gradient(to right, rgba(248, 178, 73, 0.55), -hero-accent); }
+.review-popup.hero-accent-red .review-track-fill { -fx-background-color: linear-gradient(to right, rgba(215, 48, 48, 0.55), -hero-accent); }
+
+.review-popup .review-strong-value { -fx-font-family: "IBM Plex Sans Medium"; }

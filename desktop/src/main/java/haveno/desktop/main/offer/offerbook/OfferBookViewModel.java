@@ -19,7 +19,6 @@ package haveno.desktop.main.offer.offerbook;
 
 import com.google.common.base.Joiner;
 
-import haveno.common.ThreadUtils;
 import haveno.common.Timer;
 import haveno.common.UserThread;
 import haveno.common.handlers.ErrorMessageHandler;
@@ -123,10 +122,9 @@ abstract class OfferBookViewModel extends ActivatableViewModel {
 
     final StringProperty tradeCurrencyCode = new SimpleStringProperty();
     
-    private static final Object processOfferBookListItemsLock = new Object();
     @Nullable
-    private static Timer processOfferBookListItemsTimer;
-    private final String THREAD_ID = OfferBookViewModel.class.getSimpleName();
+    private Timer fillCurrenciesTimer;
+    private Timer filtersHideOffersTimer;
 
     private OfferView.OfferActionHandler offerActionHandler;
 
@@ -136,7 +134,7 @@ abstract class OfferBookViewModel extends ActivatableViewModel {
 
     boolean isTabSelected;
     String filterText = "";
-    final BooleanProperty filterTextHidesOffers = new SimpleBooleanProperty();
+    final BooleanProperty filtersHideOffers = new SimpleBooleanProperty();
     final BooleanProperty showAllTradeCurrenciesProperty = new SimpleBooleanProperty(true);
     final BooleanProperty disableMatchToggle = new SimpleBooleanProperty();
     final IntegerProperty maxPlacesForAmount = new SimpleIntegerProperty();
@@ -194,18 +192,18 @@ abstract class OfferBookViewModel extends ActivatableViewModel {
 
         // refresh on offer changes
         offerBook.getOfferBookListItems().addListener((ListChangeListener<OfferBookListItem>) c -> {
-            synchronized (processOfferBookListItemsLock) {
-                if (processOfferBookListItemsTimer == null) {
-                    processOfferBookListItemsTimer = UserThread.runAfter(() -> {
-                        ThreadUtils.execute(() -> {
-                            offerBook.fillOfferCountMaps();
-                            fillCurrencies();
-                            synchronized (processOfferBookListItemsLock) {
-                                processOfferBookListItemsTimer = null;
-                            }
-                        }, THREAD_ID);
-                    }, 100, TimeUnit.MILLISECONDS);
-                }
+            if (fillCurrenciesTimer == null) {
+                fillCurrenciesTimer = UserThread.runAfter(() -> {
+                    fillCurrenciesTimer = null;
+                    fillCurrencies();
+                }, 100, TimeUnit.MILLISECONDS);
+            }
+
+            if (filtersHideOffersTimer == null) {
+                filtersHideOffersTimer = UserThread.runAfter(() -> {
+                    filtersHideOffersTimer = null;
+                    updateFiltersHideOffers();
+                }, 100, TimeUnit.MILLISECONDS);
             }
 
             // TODO: This is removed because it's expensive to re-filter offers for every change (high cpu for many offers).
@@ -724,11 +722,18 @@ abstract class OfferBookViewModel extends ActivatableViewModel {
             });
 
             filteredItems.setPredicate(predicate.and(nextPredicate));
-            filterTextHidesOffers.set(filteredItems.isEmpty() && offerBook.getOfferBookListItems().stream().anyMatch(predicate));
         } else {
             filteredItems.setPredicate(predicate);
-            filterTextHidesOffers.set(false);
         }
+        updateFiltersHideOffers();
+    }
+
+    private void updateFiltersHideOffers() {
+        // active filters hide every offer which would otherwise show for the selected currency and payment method
+        boolean filterActive = !filterText.isEmpty() || useOffersMatchingMyAccountsFilter || showPrivateOffers || (direction == OfferDirection.BUY && showNoDepositOffers);
+        Predicate<OfferBookListItem> unfiltered = getCurrencyAndMethodPredicate(direction, selectedTradeCurrency, true);
+        filtersHideOffers.set(filterActive && filteredItems.isEmpty() && offerBook.getOfferBookListItems().stream()
+                .anyMatch(item -> (matchesOfferType(item) || !item.getOffer().isPrivateOffer()) && unfiltered.test(item)));
     }
 
     private boolean matchesOfferType(OfferBookListItem item) {
@@ -839,6 +844,10 @@ abstract class OfferBookViewModel extends ActivatableViewModel {
     }
 
     abstract String getCurrencyCodeFromPreferences(OfferDirection direction);
+
+    public boolean hasClonedOffer(Offer offer) {
+        return openOfferManager.hasClonedOffer(offer.getId());
+    }
 
     public OpenOffer getOpenOffer(Offer offer) {
         return openOfferManager.getOpenOffer(offer.getId()).orElse(null);

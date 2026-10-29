@@ -55,6 +55,7 @@ import javafx.geometry.Bounds;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.NodeOrientation;
+import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
 import javafx.geometry.Rectangle2D;
 import javafx.scene.Cursor;
@@ -83,6 +84,7 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
+import javafx.scene.shape.Rectangle;
 import javafx.scene.text.Text;
 import javafx.stage.Modality;
 import javafx.stage.Screen;
@@ -198,9 +200,10 @@ public abstract class Overlay<T extends Overlay<T>> {
     private ArrayList<String> messageHyperlinks;
     private String headlineStyle;
     protected Button actionButton, secondaryActionButton;
-    private HBox buttonBox;
+    protected HBox buttonBox;
     protected AutoTooltipButton closeButton;
     protected ScrollPane scrollPane;
+    protected ScrollPane pinnedScrollPane;
 
     private HPos buttonAlignment = HPos.RIGHT;
 
@@ -291,6 +294,11 @@ public abstract class Overlay<T extends Overlay<T>> {
     }
 
     protected void animateHide() {
+        // stage changes must run on the user thread
+        if (!UserThread.isUserThread(Thread.currentThread())) {
+            UserThread.execute(this::animateHide);
+            return;
+        }
         if (hiding) return;
         hiding = true;
         displayGeneration++;
@@ -570,7 +578,6 @@ public abstract class Overlay<T extends Overlay<T>> {
         gridPane.setVgap(5);
         gridPane.setPadding(new Insets(64, 64, 64, 64));
         gridPane.setPrefWidth(width);
-        gridPane.setMaxHeight(Layout.MAX_POPUP_HEIGHT);
 
         ColumnConstraints columnConstraints1 = new ColumnConstraints();
         columnConstraints1.setHalignment(HPos.RIGHT);
@@ -764,6 +771,24 @@ public abstract class Overlay<T extends Overlay<T>> {
         return new Insets(CARD_INSET);
     }
 
+    // opt-in scrolling for review windows whose header and actions stay visible
+    protected ScrollPane createPinnedScrollPane(Region content) {
+        // report a horizontal bias so containers measure the pane's height at its width, like the wrapping rows it holds
+        pinnedScrollPane = new ScrollPane(content) {
+            @Override
+            public Orientation getContentBias() {
+                return Orientation.HORIZONTAL;
+            }
+        };
+        pinnedScrollPane.getStyleClass().add("review-scroll");
+        pinnedScrollPane.setFitToWidth(true);
+        pinnedScrollPane.setHbarPolicy(ScrollBarPolicy.NEVER);
+        pinnedScrollPane.setVbarPolicy(ScrollBarPolicy.NEVER);
+        pinnedScrollPane.setFocusTraversable(false);
+        pinnedScrollPane.setMaxHeight(Region.USE_PREF_SIZE);
+        return pinnedScrollPane;
+    }
+
     // the outermost visible popup node: the scroll shell when capped, else the content itself
     protected Region getDisplayContainer() {
         return capShell != null ? capShell : getRootContainer();
@@ -778,6 +803,19 @@ public abstract class Overlay<T extends Overlay<T>> {
         // budget the whole stage against the viewport: subclass styling (e.g. grid-pane's background)
         // can paint well outside the standard card inset, so no invisible-margin grace is assumed
         Region rootContainer = getRootContainer();
+        if (pinnedScrollPane != null) {
+            double fittedWidth = Math.min(width, maxWidth);
+            rootContainer.setPrefWidth(fittedWidth);
+            double bodyWidth = fittedWidth - rootContainer.getInsets().getLeft() - rootContainer.getInsets().getRight();
+            double fixedHeight = rootContainer.prefHeight(fittedWidth) - pinnedScrollPane.prefHeight(bodyWidth);
+            double available = maxHeight - fixedHeight;
+            double natural = pinnedScrollPane.getContent().prefHeight(Math.max(0, bodyWidth));
+            // pick the bar policy explicitly: under AS_NEEDED a transient bar narrows the rows, which re-wrap taller and keep it
+            boolean scrolls = natural > available && available >= 80;
+            pinnedScrollPane.setVbarPolicy(scrolls ? ScrollBarPolicy.ALWAYS : ScrollBarPolicy.NEVER);
+            pinnedScrollPane.setMinHeight(scrolls ? 0 : Region.USE_PREF_SIZE);
+            pinnedScrollPane.setPrefHeight(scrolls ? available : Region.USE_COMPUTED_SIZE);
+        }
         double stageWidth = rootContainer.prefWidth(-1);
         double stageHeight = rootContainer.prefHeight(stageWidth);
         if (stageWidth <= maxWidth + 2 * CAP_MARGIN && stageHeight <= maxHeight + 2 * CAP_MARGIN) return;
@@ -787,6 +825,14 @@ public abstract class Overlay<T extends Overlay<T>> {
         scrollRoot.setNodeOrientation(NodeOrientation.LEFT_TO_RIGHT); // keep the scroll bar at the styled right edge; content keeps its own orientation
         scrollRoot.setFitToWidth(true);
         scrollRoot.setFocusTraversable(false);
+
+        // round the viewport to the card corners (.popup-scroll-shell radius) so scrolled content backgrounds cannot square them
+        Rectangle clip = new Rectangle();
+        clip.setArcWidth(16);
+        clip.setArcHeight(16);
+        clip.widthProperty().bind(scrollRoot.widthProperty());
+        clip.heightProperty().bind(scrollRoot.heightProperty());
+        scrollRoot.setClip(clip);
 
         // the shell paints the card with the bar inside it; the popup-bg and dropshadow styles move
         // along to keep their text styling, while the shell style flattens their insets and shadow
@@ -864,6 +910,10 @@ public abstract class Overlay<T extends Overlay<T>> {
         if (!isDisplayed) return;
         Region rootContainer = getRootContainer();
         double demand = rootContainer.prefHeight(rootContainer.prefWidth(-1));
+        if (pinnedScrollPane != null) {
+            Region content = (Region) pinnedScrollPane.getContent();
+            demand += content.prefHeight(pinnedScrollPane.getViewportBounds().getWidth());
+        }
         if (Math.abs(demand - lastContentDemand) < 0.5) return;
         lastContentDemand = demand;
         refitToContent();
@@ -1226,7 +1276,7 @@ public abstract class Overlay<T extends Overlay<T>> {
             for (int i = 0; i < messageHyperlinks.size(); i++) {
                 Label label = new Label(String.format("[%d]", i + 1));
                 Hyperlink link = new Hyperlink(messageHyperlinks.get(i));
-                link.setOnAction(event -> GUIUtil.openWebPageNoPopup(link.getText()));
+                link.setOnAction(event -> GUIUtil.openWebPage(link.getText(), false));
                 footerBox.getChildren().addAll(new HBox(label, link));
             }
         }
@@ -1380,7 +1430,7 @@ public abstract class Overlay<T extends Overlay<T>> {
     // referenced in order from within the message via [1], [2] etc.
     // e.g. [HYPERLINK:https://haveno.exchange/wiki]
     private void preProcessMessage(String message) {
-        Pattern pattern = Pattern.compile("\\[HYPERLINK:(.*?)\\]");
+        Pattern pattern = Pattern.compile("\\[HYPERLINK:(https?://[^\\s\\]]+)\\]");
         Matcher matcher = pattern.matcher(message);
         String work = message;
         while (matcher.find()) {  // extract hyperlinks & store in array

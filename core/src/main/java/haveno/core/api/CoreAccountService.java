@@ -27,6 +27,7 @@ import haveno.common.crypto.KeyRing;
 import haveno.common.crypto.KeyStorage;
 import haveno.common.file.FileUtil;
 import haveno.common.persistence.PersistenceManager;
+import haveno.common.util.Utilities;
 import haveno.common.util.ZipUtils;
 import haveno.core.xmr.wallet.XmrWalletService;
 import haveno.network.p2p.network.TorMode;
@@ -34,13 +35,15 @@ import java.io.File;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.time.LocalDate;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -80,20 +83,9 @@ public class CoreAccountService {
     private final Map<PasswordChangeTarget, BiConsumer<String, String>> passwordChangeHandlers = new EnumMap<>(PasswordChangeTarget.class);
     private boolean persistedDataRead;
     private volatile boolean isShutDownStarted;
-    private CompletableFuture<Void> passwordChangeCompletion = CompletableFuture.completedFuture(null);
+    private CompletableFuture<Void> accountOperationCompletion = CompletableFuture.completedFuture(null);
     private List<AccountServiceListener> listeners = new ArrayList<AccountServiceListener>();
     private List<String> passwordChangeRetainedBackups = List.of();
-
-    // seed and restore height or date to import when the main wallet is first created, held in memory only
-    @Getter
-    @Nullable
-    private String walletImportSeed;
-    @Getter
-    @Nullable
-    private Long walletImportRestoreHeight;
-    @Getter
-    @Nullable
-    private LocalDate walletImportRestoreDate;
 
     private final ReentrantLock accountLock = new ReentrantLock(); // account operations must not interleave, e.g. an open or restore during a delete
     private volatile boolean restartPending; // set by delete and restore, after which this instance serves no further account operations
@@ -146,20 +138,27 @@ public class CoreAccountService {
         }
     }
 
-    /** Set the seed and restore height or date to import when the main wallet is first created. */
-    public void setWalletImportDetails(@Nullable String seed, @Nullable Long restoreHeight, @Nullable LocalDate restoreDate) {
-        this.walletImportSeed = seed;
-        this.walletImportRestoreHeight = restoreHeight;
-        this.walletImportRestoreDate = restoreDate;
+    public void createAccount(String password) {
+        createAccount(password, null);
     }
 
-    public void createAccount(String password) {
+    /** Create the account, first creating its main wallet when given, so a failed wallet creation leaves no account. */
+    public void createAccount(String password, @Nullable Runnable createWallet) {
         lockAccount();
         try {
             if (accountExists()) throw new IllegalStateException("Cannot create account if account already exists");
             if ("".equals(password)) password = null;
+            this.password = password; // wallets are encrypted with the account password
+            try {
+                synchronized (listeners) {
+                    for (AccountServiceListener listener : new ArrayList<>(listeners)) listener.onAccountCreating();
+                }
+                if (createWallet != null) createWallet.run();
+            } catch (Throwable e) {
+                this.password = null;
+                throw e;
+            }
             keyRing.generateKeys(password);
-            this.password = password;
             synchronized (listeners) {
                 for (AccountServiceListener listener : new ArrayList<>(listeners)) listener.onAccountCreated();
             }
@@ -202,7 +201,7 @@ public class CoreAccountService {
                 }
                 handlers = new ArrayList<>(passwordChangeHandlers.values());
                 completion = new CompletableFuture<>();
-                passwordChangeCompletion = completion;
+                accountOperationCompletion = completion;
             }
             if ("".equals(oldPassword)) oldPassword = null; // normalize to null
             if ("".equals(newPassword)) newPassword = null;
@@ -262,7 +261,7 @@ public class CoreAccountService {
             return passwordChangeRetainedBackups;
         } finally {
             accountLock.unlock();
-            // shutdown may proceed after success or failure, once all password-change work has finished
+            // shutdown may proceed after success or failure, once all account work has finished
             if (completion != null) completion.complete(null);
         }
     }
@@ -290,7 +289,7 @@ public class CoreAccountService {
 
     public synchronized CompletableFuture<Void> onShutDownStarted() {
         isShutDownStarted = true;
-        return passwordChangeCompletion;
+        return accountOperationCompletion;
     }
 
     public void verifyPassword(String password) throws IncorrectPasswordException {
@@ -395,12 +394,39 @@ public class CoreAccountService {
         }, "BackupAccount").start();
     }
 
+    public void withWalletRestore(Runnable restore, Runnable onShutdown) {
+        lockAccount();
+        CompletableFuture<Void> completion = null;
+        try {
+            checkAccountOpen();
+            synchronized (this) {
+                if (isShutDownStarted || !persistedDataRead) {
+                    throw new IllegalStateException("Wait until account services finish initializing and are not shutting down");
+                }
+                completion = new CompletableFuture<>();
+                accountOperationCompletion = completion;
+            }
+            restore.run();
+            restartPending = true;
+            synchronized (listeners) {
+                for (AccountServiceListener listener : new ArrayList<>(listeners)) listener.onWalletRestored(onShutdown);
+            }
+        } finally {
+            accountLock.unlock();
+            if (completion != null) completion.complete(null);
+        }
+    }
+
     public void restoreAccount(InputStream inputStream, int bufferSize, Runnable onShutdown) throws Exception {
         lockAccount();
         try {
             if (accountExists()) throw new IllegalStateException("Cannot restore account if there is an existing account");
             File dataDir = new File(config.appDataDir.getPath());
-            ZipUtils.unzipToDir(dataDir, inputStream, bufferSize, CoreAccountService::isTorRuntimeEntry);
+            ZipUtils.unzipToDir(dataDir, inputStream, bufferSize, entryName -> {
+                boolean skip = isNonAccountEntry(entryName);
+                if (skip) log.info("Skipping installation file during account restore: {}", entryName);
+                return skip;
+            });
             restartPending = true;
             synchronized (listeners) {
                 for (AccountServiceListener listener : new ArrayList<>(listeners)) listener.onAccountRestored(onShutdown);
@@ -413,6 +439,34 @@ public class CoreAccountService {
     // tor runtime files of any network, which a tor started before login may be using, and the api hidden service keys which identify this installation
     private static boolean isTorRuntimeEntry(String entryName) {
         return entryName.matches("(?i)[^/]+/tor/(?!hiddenservice/).*") || entryName.matches("(?i)[^/]+/tor/hiddenservice/" + TorMode.API_HIDDEN_SERVICE_NAME + "/.*"); // case-insensitive for case-insensitive filesystems
+    }
+
+    private boolean isNonAccountEntry(String entryName) {
+        // filesystems fold or ignore characters outside printable ASCII in ways lowercasing cannot predict, so names
+        // beside the installation files at the data dir root must be ASCII
+        if (!entryName.split("/", 2)[0].chars().allMatch(c -> c >= ' ' && c < 0x7f)) return true;
+        // Windows aliases path components with leading spaces or trailing dots and spaces
+        if (Utilities.isWindows() && Arrays.stream(entryName.split("/"))
+                .anyMatch(name -> name.startsWith(" ") || name.endsWith(" ") || name.endsWith("."))) return true;
+        if (isTorRuntimeEntry(entryName)) return true;
+
+        // preserve custom installation configuration as well as the default configuration
+        File restoredFile = new File(config.appDataDir, entryName);
+        String restoredPath = restoredFile.toPath().toAbsolutePath().normalize().toString().toLowerCase(Locale.ROOT);
+        for (File file : Arrays.asList(config.configFile, config.torrcFile,
+                new File(config.appDataDir, "haveno.properties"), new File(config.appDataDir, "monero-wallet-rpc"),
+                new File(config.appDataDir, "monero-wallet-rpc.exe"), new File(config.appDataDir, "monerod"), new File(config.appDataDir, "monerod.exe"))) {
+            if (file == null) continue;
+            String runtimePath = file.toPath().toAbsolutePath().normalize().toString().toLowerCase(Locale.ROOT);
+            if (restoredPath.equals(runtimePath) || restoredPath.startsWith(runtimePath + File.separator)) return true;
+            try {
+                // existing files can also be reached through short names or filesystem links
+                if (restoredFile.exists() && file.exists() && Files.isSameFile(restoredFile.toPath(), file.toPath())) return true;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot resolve account restore entry " + entryName, e);
+            }
+        }
+        return false;
     }
 
     public void deleteAccount(Runnable onShutdown) {

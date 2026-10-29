@@ -66,6 +66,8 @@ import javafx.beans.binding.Bindings;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.property.ReadOnlyBooleanProperty;
 import javafx.beans.property.ReadOnlyBooleanWrapper;
+import javafx.beans.property.ReadOnlyLongProperty;
+import javafx.beans.property.ReadOnlyLongWrapper;
 import javafx.beans.value.ChangeListener;
 import javafx.collections.FXCollections;
 import javafx.collections.ListChangeListener;
@@ -117,6 +119,7 @@ public class NotificationCenter {
     private final Map<String, Notification> tradeNotifications = new HashMap<>();
     private final Set<String> notifiedTradeUpdates = new HashSet<>();
     private final ReadOnlyBooleanWrapper unreadPortfolio = new ReadOnlyBooleanWrapper();
+    private final ReadOnlyLongWrapper openTradeCount = new ReadOnlyLongWrapper();
     private final Set<ObservableList<ChatMessage>> focusedChats = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<ObservableList<ChatMessage>> observedChats = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<ObservableList<ChatMessage>, Notification> chatNotifications = new IdentityHashMap<>();
@@ -178,10 +181,12 @@ public class NotificationCenter {
                 UserThread.execute(() -> {
                     removed.forEach(this::removeTradeSubscriptions);
                     added.forEach(trade -> addTradeSubscriptions(trade, newTrades.contains(trade)));
+                    refreshOpenTradeCount();
                 });
             }
         });
         snapshot(tradeManager.getObservableList()).forEach(trade -> addTradeSubscriptions(trade, false));
+        refreshOpenTradeCount();
         preferences.getDontShowAgainMapAsObservable().addListener((MapChangeListener<String, Boolean>) change -> {
             String key = change.getKey();
             if (key.startsWith(NOTIFICATION_KEY_PREFIX)) {
@@ -219,6 +224,10 @@ public class NotificationCenter {
 
     public ReadOnlyBooleanProperty unreadPortfolioProperty() {
         return unreadPortfolio.getReadOnlyProperty();
+    }
+
+    public ReadOnlyLongProperty openTradeCountProperty() {
+        return openTradeCount.getReadOnlyProperty();
     }
 
     public BooleanBinding unseenTradeUpdateProperty(String tradeId) {
@@ -279,6 +288,10 @@ public class NotificationCenter {
 
     private static boolean isUnreadChat(ChatMessage message, boolean senderFlag) {
         return !message.isWasDisplayed() && !message.isSystemMessage() && message.isSenderIsTrader() == senderFlag;
+    }
+
+    private void refreshOpenTradeCount() {
+        openTradeCount.set(snapshot(tradeManager.getObservableList()).size());
     }
 
     private void refreshChatState() {

@@ -39,6 +39,7 @@ import haveno.common.setup.UncaughtExceptionHandler;
 import haveno.common.util.Utilities;
 import haveno.core.locale.Res;
 import haveno.core.offer.OpenOfferManager;
+import haveno.core.offer.OpenOffer;
 import haveno.core.support.dispute.arbitration.ArbitrationManager;
 import haveno.core.support.dispute.mediation.MediationManager;
 import haveno.core.support.dispute.refund.RefundManager;
@@ -51,6 +52,7 @@ import haveno.core.user.StartupSettings;
 import haveno.core.user.User;
 import haveno.core.xmr.wallet.WalletsManager;
 import haveno.core.xmr.wallet.XmrWalletService;
+import haveno.desktop.main.overlays.windows.ShutdownConfirmationWindow;
 import haveno.desktop.common.view.CachingViewLoader;
 import haveno.desktop.common.view.View;
 import haveno.desktop.common.view.ViewLoader;
@@ -158,6 +160,9 @@ public class HavenoApp extends Application implements UncaughtExceptionHandler {
 
         GUIUtil.warmCurrencyIconCache(); // decode currency logos in the background before any pulldown needs them
         GUIUtil.syncCursorAcrossWindows(); // keep the pointer cursor correct when it crosses windows and popups
+        GUIUtil.dismissContextMenusOnShadowPress();
+        GUIUtil.keepScrollGesturesAttached(); // keep trackpad scrolling and inertia going when list cells rebuild
+        GUIUtil.repaintOnRestore(stage);
 
         appLaunchedHandler.accept(this);
     }
@@ -199,20 +204,30 @@ public class HavenoApp extends Application implements UncaughtExceptionHandler {
     }
 
     public void showLoginFailure(Throwable failure, Runnable onShutdown) {
-        showStartupFailure(Res.get("password.startup.failed",
-                Objects.requireNonNullElse(failure.getMessage(), failure.toString())), onShutdown);
+        showStartupFailure(Res.get("password.startup.failed", getMessage(failure)), onShutdown, true);
     }
 
-    private void showStartupFailure(String text, Runnable onShutdown) {
+    public void showStartupFailure(Throwable failure, Runnable onShutdown) {
+        showStartupFailure(Res.get("startup.failed", getMessage(failure)), onShutdown, false);
+    }
+
+    private static String getMessage(Throwable failure) {
+        return Objects.requireNonNullElse(failure.getMessage(), failure.toString());
+    }
+
+    private void showStartupFailure(String text, Runnable onShutdown, boolean offerPasswordRecovery) {
         Label message = new AutoTooltipLabel(text);
         message.setWrapText(true);
         message.setMaxWidth(StartupWizard.PAGE_WIDTH);
         Button quitButton = new AutoTooltipButton(Res.get("shared.shutDown"));
         quitButton.setOnAction(event -> onShutdown.run());
-        Hyperlink recovery = new Hyperlink(Res.get("password.recovery.link"));
-        recovery.setWrapText(true);
-        recovery.setOnAction(event -> openPasswordRecovery(error -> message.setText(text + "\n\n" + error)));
-        VBox content = new VBox(20, message, quitButton, recovery);
+        VBox content = new VBox(20, message, quitButton);
+        if (offerPasswordRecovery) {
+            Hyperlink recovery = new Hyperlink(Res.get("password.recovery.link"));
+            recovery.setWrapText(true);
+            recovery.setOnAction(event -> openPasswordRecovery(error -> message.setText(text + "\n\n" + error)));
+            content.getChildren().add(recovery);
+        }
         content.setMaxWidth(StartupWizard.PAGE_WIDTH);
         startupShell = getOrCreateShell();
         startupShell.setContent(content);
@@ -757,13 +772,13 @@ public class HavenoApp extends Application implements UncaughtExceptionHandler {
         }
 
         // check for open offers
-        if (injector.getInstance(OpenOfferManager.class).hasAvailableOpenOffers()) {
+        long availableOfferCount = injector.getInstance(OpenOfferManager.class).getOpenOffers().stream()
+                .filter(OpenOffer::isAvailable).count();
+        if (availableOfferCount > 0) {
             String key = "showOpenOfferWarnPopupAtShutDown";
             if (injector.getInstance(Preferences.class).showAgain(key) && !DevEnv.isDevMode()) {
-                new Popup().warning(Res.get("popup.info.shutDownWithOpenOffers"))
-                        .actionButtonText(Res.get("shared.shutDown"))
+                new ShutdownConfirmationWindow(availableOfferCount)
                         .onAction(() -> resp.complete(true))
-                        .closeButtonText(Res.get("shared.cancel"))
                         .onClose(() -> resp.complete(false))
                         .dontShowAgainId(key)
                         .show();

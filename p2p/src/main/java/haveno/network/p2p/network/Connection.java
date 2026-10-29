@@ -179,6 +179,7 @@ public class Connection implements HasCapabilities, Runnable, MessageListener {
     private Optional<NodeAddress> peersNodeAddressOptional = Optional.empty();
     @Getter
     private volatile boolean stopped;
+    private volatile boolean sentNodeAddress;
 
     @Getter
     private final ObjectProperty<NodeAddress> peersNodeAddressProperty = new SimpleObjectProperty<>();
@@ -251,6 +252,7 @@ public class Connection implements HasCapabilities, Runnable, MessageListener {
             envelopeLimitsGlobalOverrides = new HashMap<>();
             envelopeLimitsGlobalOverrides.put(GetPeersRequest.class.getSimpleName(), new LeakyBucket(0.5, 5, 0));
             envelopeLimitsGlobalOverrides.put(Ping.class.getSimpleName(), new LeakyBucket(2, 5, 0));
+            envelopeLimitsGlobalOverrides.put("GetInventoryRequest", new LeakyBucket(1, 10, 0));
             envelopeLimitsGlobalOverrides.put(RefreshOfferMessage.class.getSimpleName(), null); // unlimited
 
             // merge with cli overrides: format "EnvelopeName:Rate,Burst,Strikes;..."
@@ -278,6 +280,7 @@ public class Connection implements HasCapabilities, Runnable, MessageListener {
         envelopeLimitsConnectionOverrides = new HashMap<>();
         envelopeLimitsConnectionOverrides.put(GetPeersRequest.class.getSimpleName(), new LeakyBucket(0.01666667, 2, 0));
         envelopeLimitsConnectionOverrides.put(Ping.class.getSimpleName(), new LeakyBucket(0.0333333, 2, 0));
+        envelopeLimitsConnectionOverrides.put("GetInventoryRequest", new LeakyBucket(1.0 / 30, 2, 0));
         envelopeLimitsConnectionOverrides.put(RefreshOfferMessage.class.getSimpleName(), null); // unlimited
 
         // merge with cli overrides: format "EnvelopeName:Rate,Burst,Strikes;..."
@@ -392,6 +395,7 @@ public class Connection implements HasCapabilities, Runnable, MessageListener {
 
             if (!stopped) {
                 protoOutputStream.writeEnvelope(networkEnvelope, proto);
+                if (networkEnvelope instanceof SendersNodeAddressMessage) sentNodeAddress = true;
                 ThreadUtils.execute(() -> messageListeners.forEach(e -> e.onMessageSent(networkEnvelope, this)), THREAD_ID);
                 ThreadUtils.execute(() -> connectionStatistics.addSendMsgMetrics(System.currentTimeMillis() - ts, networkEnvelopeSize), THREAD_ID);
             }
@@ -663,6 +667,11 @@ public class Connection implements HasCapabilities, Runnable, MessageListener {
 
     public boolean hasPeersNodeAddress() {
         return peersNodeAddressOptional.isPresent();
+    }
+
+    // Inbound peers dialed our address; outbound peers learn it from an earlier write on the same connection.
+    public boolean isPeerReadyForBroadcast() {
+        return this instanceof InboundConnection || sentNodeAddress;
     }
 
     public long getLastReadTimestamp() {

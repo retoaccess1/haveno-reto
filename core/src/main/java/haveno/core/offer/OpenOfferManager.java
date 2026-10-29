@@ -180,7 +180,7 @@ public class OpenOfferManager implements PeerManager.Listener, DecryptedDirectMe
     private final Map<String, PlaceOfferProtocol> placeOfferProtocols = new HashMap<String, PlaceOfferProtocol>();
     private boolean stopped;
     private final ExecutorService signOfferRequestExecutor = Utilities.getThreadPoolExecutor("SignOfferRequests", 1, 1, 16, 60);
-    private final Set<PublicKey> pendingSignOfferRequests = ConcurrentHashMap.newKeySet();
+    private final Set<Tuple2<PublicKey, String>> pendingSignOfferRequests = ConcurrentHashMap.newKeySet();
     private Timer periodicRepublishOffersTimer, periodicRefreshOffersTimer, retryRepublishOffersTimer;
     @Getter
     private final ObservableList<Tuple2<OpenOffer, String>> invalidOffers = FXCollections.observableArrayList();
@@ -932,29 +932,40 @@ public class OpenOfferManager implements PeerManager.Listener, DecryptedDirectMe
                 synchronized (processOffersLock) {
                     synchronized (openOffers.getList()) {
 
-                        // add edited open offer
-                        editedOpenOffer = new OpenOffer(editedOffer, triggerPrice, openOffer);
-                        if (originalState == OpenOffer.State.DEACTIVATED && openOffer.isDeactivatedByTrigger()) {
-                            if (hasConflictingClone(editedOpenOffer)) {
-                                editedOpenOffer.setState(OpenOffer.State.DEACTIVATED);
-                            } else {
-                                editedOpenOffer.setState(OpenOffer.State.AVAILABLE);
-                            }
+                        // reject stale edits before copying funds that may have been released
+                        if (getOpenOffer(openOffer.getId()).orElse(null) != openOffer ||
+                                openOffer.isCanceled() || openOffer.getState() == OpenOffer.State.CLOSED) {
+                            editedOpenOffer = null;
                         } else {
-                            if (originalState == OpenOffer.State.AVAILABLE && hasConflictingClone(editedOpenOffer)) {
-                                editedOpenOffer.setState(OpenOffer.State.DEACTIVATED);
+                            // add edited open offer
+                            editedOpenOffer = new OpenOffer(editedOffer, triggerPrice, openOffer);
+                            if (originalState == OpenOffer.State.DEACTIVATED && openOffer.isDeactivatedByTrigger()) {
+                                if (hasConflictingClone(editedOpenOffer)) {
+                                    editedOpenOffer.setState(OpenOffer.State.DEACTIVATED);
+                                } else {
+                                    editedOpenOffer.setState(OpenOffer.State.AVAILABLE);
+                                }
                             } else {
-                                editedOpenOffer.setState(originalState);
+                                if (originalState == OpenOffer.State.AVAILABLE && hasConflictingClone(editedOpenOffer)) {
+                                    editedOpenOffer.setState(OpenOffer.State.DEACTIVATED);
+                                } else {
+                                    editedOpenOffer.setState(originalState);
+                                }
                             }
-                        }
-                        applyTriggerState(editedOpenOffer); // apply trigger state before adding so it's not immediately removed
-                        doAddOpenOffer(editedOpenOffer);
+                            applyTriggerState(editedOpenOffer); // apply trigger state before adding so it's not immediately removed
 
-                        // remove original open offer
-                        openOffer.getOffer().setState(Offer.State.REMOVED);
-                        openOffer.setState(OpenOffer.State.CANCELED);
-                        doRemoveOpenOffer(openOffer);
+                            // remove original open offer before adding the edited offer, which the list rejects as a duplicate if equal
+                            openOffer.getOffer().setState(Offer.State.REMOVED);
+                            openOffer.setState(OpenOffer.State.CANCELED);
+                            doRemoveOpenOffer(openOffer);
+                            doAddOpenOffer(editedOpenOffer);
+                        }
                     }
+                }
+
+                if (editedOpenOffer == null) {
+                    errorMessageHandler.handleErrorMessage("The offer with ID " + openOffer.getId() + " was canceled, closed, or replaced while editing.");
+                    return;
                 }
 
                 // check for valid arbitrator signature after editing
@@ -1142,15 +1153,6 @@ public class OpenOfferManager implements PeerManager.Listener, DecryptedDirectMe
             }
         }
         return unallocatedBalance;
-    }
-
-    public boolean hasAvailableOpenOffers() {
-        for (OpenOffer openOffer : getOpenOffers()) {
-            if (openOffer.getState() == OpenOffer.State.AVAILABLE) {
-                return true;
-            }
-        }
-        return false;
     }
 
     public List<OpenOffer> getOpenOffers() {
@@ -1882,17 +1884,19 @@ public class OpenOfferManager implements PeerManager.Listener, DecryptedDirectMe
         }
 
         // overload must time out: older makers treat every nack as a permanently invalid offer
-        if (!pendingSignOfferRequests.add(signatureKey)) return;
+        // coalesce redelivered requests only, since one maker may sign several offers concurrently
+        Tuple2<PublicKey, String> pendingRequest = new Tuple2<>(signatureKey, request.getUid());
+        if (!pendingSignOfferRequests.add(pendingRequest)) return;
         try {
             signOfferRequestExecutor.execute(() -> {
                 try {
                     if (!signOfferRequestExecutor.isShutdown()) handleSignOfferRequest(request, peer);
                 } finally {
-                    pendingSignOfferRequests.remove(signatureKey);
+                    pendingSignOfferRequests.remove(pendingRequest);
                 }
             });
         } catch (RejectedExecutionException e) {
-            pendingSignOfferRequests.remove(signatureKey);
+            pendingSignOfferRequests.remove(pendingRequest);
             log.debug("Ignoring SignOfferRequest because signing is busy or shutting down");
         }
     }
@@ -2097,6 +2101,22 @@ public class OpenOfferManager implements PeerManager.Listener, DecryptedDirectMe
                 errorMessage = "Wrong penalty fee percent for offer " + request.offerId + ". Expected " + HavenoUtils.PENALTY_FEE_PCT + " but got " + offer.getPenaltyFeePct();
                 log.warn(errorMessage);
                 sendAckMessage(request.getClass(), peer, request.getPubKeyRing(), request.getOfferId(), request.getUid(), false, errorMessage);
+                return;
+            }
+
+            // bind the key images in the signed payload to the reserve transaction claim
+            if (request.getOfferPayload().getReserveTxKeyImages() == null || request.getReserveTxKeyImages() == null
+                    || !new HashSet<>(request.getOfferPayload().getReserveTxKeyImages()).equals(new HashSet<>(request.getReserveTxKeyImages()))) {
+                errorMessage = "Offer key images do not match the reserve transaction claim for offer " + request.offerId;
+                log.warn(errorMessage);
+                return;
+            }
+
+            // do not sign a claim to another maker's published offer id
+            if (offerBookService.getOffers().stream().anyMatch(existing -> existing.getId().equals(offer.getId())
+                    && !existing.getPubKeyRing().equals(offer.getPubKeyRing()))) {
+                errorMessage = "Offer id is already owned by another maker: " + request.offerId;
+                log.warn(errorMessage);
                 return;
             }
 

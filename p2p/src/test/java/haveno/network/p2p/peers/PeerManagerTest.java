@@ -45,6 +45,8 @@ import haveno.network.p2p.peers.keepalive.messages.Ping;
 import haveno.network.p2p.peers.keepalive.messages.Pong;
 import haveno.network.p2p.peers.peerexchange.Peer;
 import haveno.network.p2p.peers.peerexchange.PeerExchangeManager;
+import haveno.network.p2p.peers.peerexchange.messages.GetPeersRequest;
+import haveno.network.p2p.peers.peerexchange.messages.GetPeersResponse;
 import haveno.network.p2p.seed.SeedNodeRepository;
 import haveno.network.p2p.storage.P2PDataStorage;
 import haveno.network.p2p.storage.messages.BroadcastMessage;
@@ -96,6 +98,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 public class PeerManagerTest {
@@ -117,6 +120,7 @@ public class PeerManagerTest {
         AtomicReference<ListeningExecutorService> executor = new AtomicReference<>();
         when(networkNode.getConfirmedConnections()).thenReturn(Set.of(connection));
         when(connection.getPeersNodeAddressOptional()).thenReturn(Optional.empty());
+        when(connection.isPeerReadyForBroadcast()).thenReturn(true);
         when(connection.testCapability(any())).thenReturn(true);
         when(networkNode.sendMessage(eq(connection), eq(earlierMessage), any(ListeningExecutorService.class)))
                 .thenReturn(earlierSend);
@@ -151,6 +155,88 @@ public class PeerManagerTest {
             assertTrue(sends.isEmpty());
         } finally {
             broadcaster.shutDown(() -> { });
+        }
+    }
+
+    @Test
+    public void testTargetedDataRequestsAreDeduplicatedAndReleased() {
+        try (DataRequestFixture fixture = new DataRequestFixture()) {
+            NodeAddress arbitrator = new NodeAddress("arbitrator:9999");
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            fixture.manager.requestUpdateDataFrom(fixture.networkNode.getNodeAddress());
+            assertEquals(1, fixture.requests.size());
+            assertTrue(fixture.requests.get(0) instanceof PreliminaryGetDataRequest);
+            fixture.respond(0, true);
+            assertEquals(1, fixture.requests.size());
+            verifyNoInteractions(fixture.listener);
+
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(2, fixture.requests.size());
+            fixture.fail(1);
+            assertFalse(fixture.isRetryPending());
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(3, fixture.requests.size());
+            fixture.manager.shutDown();
+            fixture.respond(2, false);
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(3, fixture.requests.size());
+            verifyNoInteractions(fixture.listener);
+        }
+    }
+
+    @Test
+    public void testTargetedDataRequestsDoNotSuppressSyncRecovery() {
+        try (DataRequestFixture fixture = new DataRequestFixture()) {
+            fixture.start();
+            fixture.manager.requestUpdateDataFrom(new NodeAddress("arbitrator:9999"));
+            fixture.fail(0);
+            fixture.fail(1);
+            assertTrue(fixture.isRetryPending());
+            fixture.respond(2, false);
+            assertTrue(fixture.isRetryPending());
+            verify(fixture.listener, never()).onDataReceived();
+            verify(fixture.listener, never()).onUpdatedDataReceived();
+        }
+    }
+
+    @Test
+    public void testTargetedDataRequestReplacesStaleHandler() throws ReflectiveOperationException {
+        try (DataRequestFixture fixture = new DataRequestFixture()) {
+            NodeAddress arbitrator = new NodeAddress("arbitrator:9999");
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            MessageListener handler = fixture.messageListeners.get(fixture.messageListeners.size() - 1);
+            Field creationTs = handler.getClass().getDeclaredField("creationTs");
+            creationTs.setAccessible(true);
+            creationTs.setLong(handler, System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(5));
+
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(2, fixture.requests.size());
+            assertFalse(fixture.messageListeners.contains(handler));
+            fixture.respond(0, false);
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(2, fixture.requests.size());
+            verifyNoInteractions(fixture.listener);
+        }
+    }
+
+    @Test
+    public void testTargetedDataRequestDoesNotSurviveDisconnect() {
+        try (DataRequestFixture fixture = new DataRequestFixture()) {
+            NodeAddress arbitrator = new NodeAddress("arbitrator:9999");
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            Connection connection = mock(Connection.class);
+            when(connection.getPeersNodeAddressOptional()).thenReturn(Optional.of(arbitrator));
+            fixture.manager.onDisconnect(CloseConnectionReason.RESET, connection);
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(2, fixture.requests.size());
+            fixture.respond(0, false);
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(2, fixture.requests.size());
+            fixture.respond(1, false);
+            fixture.manager.requestUpdateDataFrom(arbitrator);
+            assertEquals(3, fixture.requests.size());
+            verifyNoInteractions(fixture.listener);
         }
     }
 
@@ -514,6 +600,60 @@ public class PeerManagerTest {
         reportFailingPeer(manager, address);
         manager.onDisconnect(CloseConnectionReason.RESET, outboundConnection(address, 0));
         assertTrue(manager.getLivePeers(null).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testPeerExchangeResponseMatchesPeerBeforeOrAfterSendCompletion(boolean completeSendFirst) {
+        NetworkNode networkNode = mock(NetworkNode.class);
+        PeerManager peerManager = mock(PeerManager.class);
+        NodeAddress address = new NodeAddress("peer.onion:9999");
+        Connection connection = mock(Connection.class);
+        when(connection.getPeersNodeAddressOptional()).thenReturn(Optional.of(address));
+        when(networkNode.getNodeAddress()).thenReturn(new NodeAddress("self.onion:9999"));
+        when(peerManager.hasSufficientConnections()).thenReturn(true);
+        SettableFuture<Connection> sendFuture = SettableFuture.create();
+        when(networkNode.sendMessage(eq(address), any(GetPeersRequest.class))).thenReturn(sendFuture);
+        try (MockedStatic<ThreadUtils> threadUtils = mockStatic(ThreadUtils.class);
+             MockedStatic<UserThread> userThread = mockStatic(UserThread.class)) {
+            Timer timeoutTimer = mock(Timer.class);
+            userThread.when(() -> UserThread.runAfter(any(Runnable.class), anyLong(), any(TimeUnit.class)))
+                    .thenReturn(timeoutTimer);
+            PeerExchangeManager exchange = new PeerExchangeManager(networkNode, mock(SeedNodeRepository.class), peerManager);
+            try {
+                exchange.requestReportedPeersFromSeedNodes(address);
+                ArgumentCaptor<Runnable> delayedSend = ArgumentCaptor.forClass(Runnable.class);
+                threadUtils.verify(() -> ThreadUtils.runAfterRandomDelay(delayedSend.capture(), anyLong(), anyLong(), any(TimeUnit.class)));
+                delayedSend.getValue().run();
+                ArgumentCaptor<GetPeersRequest> request = ArgumentCaptor.forClass(GetPeersRequest.class);
+                verify(networkNode).sendMessage(eq(address), request.capture());
+                ArgumentCaptor<MessageListener> listeners = ArgumentCaptor.forClass(MessageListener.class);
+                verify(networkNode, times(2)).addMessageListener(listeners.capture());
+                MessageListener handler = listeners.getValue();
+                if (completeSendFirst) sendFuture.set(connection);
+
+                GetPeersResponse response = new GetPeersResponse(request.getValue().getNonce(), Set.of());
+                Connection otherConnection = mock(Connection.class);
+                when(otherConnection.getPeersNodeAddressOptional()).thenReturn(Optional.of(new NodeAddress("other.onion:9999")));
+                handler.onMessage(response, otherConnection);
+                when(otherConnection.getPeersNodeAddressOptional()).thenReturn(Optional.empty());
+                handler.onMessage(response, otherConnection);
+                handler.onMessage(new GetPeersResponse(request.getValue().getNonce() + 1, Set.of()), connection);
+                verify(peerManager, never()).addToReportedPeers(any(), any(), any());
+                verify(networkNode, never()).removeMessageListener(handler);
+
+                handler.onMessage(response, connection);
+                verify(peerManager).addToReportedPeers(response.getReportedPeers(), connection, response.getSupportedCapabilities());
+                verify(networkNode).removeMessageListener(handler);
+                verify(timeoutTimer).stop();
+                if (!completeSendFirst) sendFuture.set(connection);
+                handler.onMessage(response, connection);
+                verify(peerManager, times(1)).addToReportedPeers(any(), any(), any());
+                verify(networkNode, times(1)).addMessageListener(handler);
+            } finally {
+                exchange.shutDown();
+            }
+        }
     }
 
     @Test

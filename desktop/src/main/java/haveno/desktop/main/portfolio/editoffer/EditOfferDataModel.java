@@ -38,13 +38,10 @@ import haveno.core.offer.OpenOfferManager;
 import haveno.core.payment.PaymentAccount;
 import haveno.core.proto.persistable.CorePersistenceProtoResolver;
 import haveno.core.provider.price.PriceFeedService;
-import haveno.core.trade.statistics.TradeStatisticsManager;
 import haveno.core.user.Preferences;
 import haveno.core.user.User;
 import haveno.core.util.FormattingUtils;
 import haveno.core.util.coin.CoinFormatter;
-import haveno.core.util.coin.CoinUtil;
-import haveno.core.xmr.wallet.Restrictions;
 import haveno.core.xmr.wallet.XmrWalletService;
 import haveno.desktop.Navigation;
 import haveno.desktop.main.offer.MutableOfferDataModel;
@@ -78,7 +75,6 @@ class EditOfferDataModel extends MutableOfferDataModel {
                        AccountAgeWitnessService accountAgeWitnessService,
                        @Named(FormattingUtils.BTC_FORMATTER_KEY) CoinFormatter btcFormatter,
                        CorePersistenceProtoResolver corePersistenceProtoResolver,
-                       TradeStatisticsManager tradeStatisticsManager,
                        Navigation navigation,
                        CoreOffersService coreOffersService) {
 
@@ -92,7 +88,6 @@ class EditOfferDataModel extends MutableOfferDataModel {
                 priceFeedService,
                 accountAgeWitnessService,
                 btcFormatter,
-                tradeStatisticsManager,
                 navigation);
         this.corePersistenceProtoResolver = corePersistenceProtoResolver;
         this.coreOffersService = coreOffersService;
@@ -135,17 +130,7 @@ class EditOfferDataModel extends MutableOfferDataModel {
                 paymentAccount.setSelectedTradeCurrency(selectedTradeCurrency);
         }
         
-        // TODO: update for XMR to use percent as double?
-
-        // If the security deposit got bounded because it was below the coin amount limit, it can be bigger
-        // by percentage than the restriction. We can't determine the percentage originally entered at offer
-        // creation, so just use the default value as it doesn't matter anyway.
-        double securityDepositPercent = CoinUtil.getAsPercentPerXmr(offer.getMaxSellerSecurityDeposit(), offer.getAmount());
-        if (securityDepositPercent > Restrictions.getMaxSecurityDepositPct()
-                && offer.getMaxSellerSecurityDeposit().equals(Restrictions.getMinSecurityDeposit()))
-            securityDepositPct.set(Restrictions.getDefaultSecurityDepositPct());
-        else
-            securityDepositPct.set(securityDepositPercent);
+        securityDepositPct.set(offer.getSellerSecurityDepositPct());
 
         allowAmountUpdate = false;
 
@@ -183,7 +168,7 @@ class EditOfferDataModel extends MutableOfferDataModel {
         setTriggerPrice(openOffer.getTriggerPrice());
         setPrivateOffer(offer.isPrivateOffer());
         setBuyerAsTakerWithoutDeposit(offer.hasBuyerAsTakerWithoutDeposit());
-        setSecurityDepositPct(getSecurityAsPercent(offer));
+        setSecurityDepositPct(offer.getSellerSecurityDepositPct());
         setExtraInfo(offer.getOfferExtraInfo());
     }
 

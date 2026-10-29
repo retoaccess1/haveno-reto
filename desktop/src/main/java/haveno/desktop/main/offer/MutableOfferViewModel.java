@@ -925,6 +925,14 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     // revalidate volume only if input was entered, so an untouched field is not flagged prematurely
     private void triggerFocusOutOnVolumeTextField() {
         if (volume.get() == null || volume.get().isEmpty()) return;
+
+        // replace rejected input with the volume derived from amount and price
+        Volume modelVolume = dataModel.getVolume().get();
+        if (modelVolume != null && !isVolumeInputValid(volume.get()).isValid) {
+            ignoreVolumeStringListener = true;
+            volume.set(VolumeUtil.formatVolume(modelVolume));
+            ignoreVolumeStringListener = false;
+        }
         onFocusOutVolumeTextField(true, false);
     }
 
@@ -1229,6 +1237,8 @@ public abstract class MutableOfferViewModel<M extends MutableOfferDataModel> ext
     }
 
     private void setSecurityDepositToModel() {
+        // the locked field shows a fixed XMR amount, so keep the percent unless the offer takes no deposit
+        if (isMinSecurityDeposit.get() && !dataModel.buyerAsTakerWithoutDeposit.get()) return;
         if (securityDeposit.get() != null && !securityDeposit.get().isEmpty() && !isMinSecurityDeposit.get()) {
             dataModel.setSecurityDepositPct(ParsingUtils.parsePercentStringToDouble(securityDeposit.get()));
         } else {

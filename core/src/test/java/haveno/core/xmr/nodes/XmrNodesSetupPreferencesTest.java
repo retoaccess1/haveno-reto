@@ -34,7 +34,8 @@ public class XmrNodesSetupPreferencesTest {
     @Test
     public void testSelectPreferredNodesWhenPublicOption() {
         Preferences delegate = mock(Preferences.class);
-        when(delegate.getMoneroNodesOptionOrdinal()).thenReturn(PUBLIC.ordinal());
+        when(delegate.getEffectiveNetworkSettings()).thenReturn(
+                new Preferences.NetworkSettings(PUBLIC, Preferences.UseTorForXmr.ON, ""));
 
         XmrNodesSetupPreferences preferences = new XmrNodesSetupPreferences(delegate);
         List<XmrNode> nodes = preferences.selectPreferredNodes(mock(XmrNodes.class));
@@ -45,12 +46,12 @@ public class XmrNodesSetupPreferencesTest {
     @Test
     public void testSelectPreferredNodesWhenCustomOption() {
         Preferences delegate = mock(Preferences.class);
-        when(delegate.getMoneroNodesOptionOrdinal()).thenReturn(CUSTOM.ordinal());
-        when(delegate.getMoneroNodes()).thenReturn("aaa.onion,bbb.onion");
+        when(delegate.getEffectiveNetworkSettings()).thenReturn(
+                new Preferences.NetworkSettings(CUSTOM, Preferences.UseTorForXmr.ON, "ccc.onion,aaa.onion,bbb.onion,http://aaa.onion"));
 
         XmrNodesSetupPreferences preferences = new XmrNodesSetupPreferences(delegate);
         List<XmrNode> nodes = preferences.selectPreferredNodes(mock(XmrNodes.class));
 
-        assertEquals(2, nodes.size());
+        assertEquals(List.of("ccc.onion", "aaa.onion", "bbb.onion"), nodes.stream().map(XmrNode::getOnionAddress).toList());
     }
 }

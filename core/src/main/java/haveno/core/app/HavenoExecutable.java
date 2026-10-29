@@ -62,6 +62,7 @@ import haveno.core.setup.CoreSetup;
 import haveno.core.support.dispute.arbitration.arbitrator.ArbitratorManager;
 import haveno.core.trade.TradeManager;
 import haveno.core.trade.statistics.TradeStatisticsManager;
+import haveno.core.xmr.setup.MoneroWalletRpcManager;
 import haveno.core.xmr.setup.WalletsSetup;
 import haveno.core.xmr.wallet.BtcWalletService;
 import haveno.core.xmr.wallet.XmrWalletService;
@@ -71,6 +72,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.Nullable;
 import java.io.Console;
+import java.io.File;
 import java.util.HashSet;
 import java.util.ArrayList;
 import java.util.List;
@@ -108,6 +110,8 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
     private Thread keepRunningThread;
     private final Object keepRunningLock = new Object();
     private AtomicInteger keepRunningResult = new AtomicInteger(EXIT_SUCCESS);
+    private final CompletableFuture<Void> loginCompleted = new CompletableFuture<>();
+    protected volatile boolean isStartupFailed;
     private Runnable shutdownCompletedHandler;
 
     public HavenoExecutable(String fullName, String scriptName, String appName, String version) {
@@ -190,28 +194,82 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
         accountService.addListener(new AccountServiceListener() {
             @Override public void onAccountDeleted(Runnable onShutdown) { shutDownNoPersist(onShutdown, true); }
             @Override public void onAccountRestored(Runnable onShutdown) { shutDownNoPersist(onShutdown, true); }
+            @Override public void onWalletRestored(Runnable onShutdown) { restart(onShutdown); }
         });
 
+        // check for existing wallet processes off the user thread before login can start services or validate a seed
+        checkForRunningWalletProcessesAsync(this::login);
+    }
+
+    protected void checkForRunningWalletProcesses() {
+        MoneroWalletRpcManager.checkForRunningProcesses(new File(XmrWalletService.getMoneroWalletRpcPath()), config.walletDir);
+    }
+
+    // check off the user thread, then continue on it unless the check failed or a shutdown or restart intervened
+    private void checkForRunningWalletProcessesAsync(Runnable onPassed) {
+        new Thread(() -> {
+            Throwable failure = null;
+            try {
+                checkForRunningWalletProcesses();
+            } catch (Throwable e) {
+                failure = e;
+            }
+            Throwable checkFailure = failure;
+            UserThread.execute(() -> {
+                if (isShutDownStarted || keepRunningResult.get() == EXIT_RESTART) return;
+                if (checkFailure != null) {
+                    onStartupFailed(checkFailure);
+                    return;
+                }
+                try {
+                    onPassed.run();
+                } catch (RuntimeException e) {
+                    onStartupFailed(e); // e.g. a service failed to construct
+                }
+            });
+        }, "Wallet-process-check").start();
+    }
+
+    private void login() {
         // Attempt to login, subclasses should implement interactive login and or rpc login.
-        CompletableFuture<Boolean> loginFuture = loginAccount();
+        CompletableFuture<Boolean> loginFuture;
+        try {
+            loginFuture = loginAccount();
+        } catch (RuntimeException e) {
+            loginCompleted.complete(null);
+            onStartupFailed(e); // e.g. the api port is in use
+            return;
+        }
         loginFuture.whenComplete((result, throwable) -> {
+            loginCompleted.complete(null);
             if (isShutDownStarted || keepRunningResult.get() == EXIT_RESTART) return;
             if (throwable != null) {
                 log.error("Error logging in to account", throwable);
+                isStartupFailed = true;
                 shutDownNoPersist(null, false);
                 return;
             }
             try {
                 if (!isReadOnly && loginFuture.get()) {
-                    readAllPersisted(this::startApplicationUnlessRestarting);
+                    // another instance may have started during a long login, so check again before reading data and starting services
+                    checkForRunningWalletProcessesAsync(() -> readAllPersisted(this::startApplicationUnlessRestarting));
                 } else {
                     log.warn("Running application in readonly mode");
                     startApplicationUnlessRestarting();
                 }
             } catch (InterruptedException | ExecutionException e) {
                 log.error("An error occurred: {}\n", e.getMessage(), e);
+            } catch (RuntimeException e) {
+                onStartupFailed(e); // the future would swallow it
             }
         });
+    }
+
+    // startup failed, so shut down without persisting; subclasses may show the failure first
+    protected void onStartupFailed(Throwable e) {
+        isStartupFailed = true;
+        log.error("Error starting application", e);
+        shutDownNoPersist(null, false);
     }
 
     // a restore or delete during login requests a restart, so the application must not start against the changed data dir
@@ -231,16 +289,21 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
     protected void shutDownNoPersist(Runnable onShutdown, boolean restart) {
         this.isReadOnly = true;
         if (restart) {
-            shutdownCompletedHandler = onShutdown;
-            synchronized (keepRunningLock) {
-                keepRunningResult.set(EXIT_RESTART);
-                if (keepRunningThread != null) keepRunningThread.interrupt(); // else keepRunning() returns the pending restart
-            }
+            restart(onShutdown);
         } else {
             gracefulShutDown(() -> {
                 log.info("Shutdown without persisting");
                 if (onShutdown != null) onShutdown.run();
             });
+        }
+    }
+
+    private void restart(Runnable onShutdown) {
+        if (isShutDownStarted) return; // an exit already in progress takes precedence over restarting
+        shutdownCompletedHandler = onShutdown;
+        synchronized (keepRunningLock) {
+            keepRunningResult.set(EXIT_RESTART);
+            if (keepRunningThread != null) keepRunningThread.interrupt(); // else keepRunning() returns the pending restart
         }
     }
 
@@ -349,7 +412,7 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
     @Override
     public void gracefulShutDown(ResultHandler onShutdown, boolean systemExit) {
         if (systemExit) CommonSetup.startShutdownWatchdog();
-        CompletableFuture<Void> passwordChange = accountService == null ? CompletableFuture.completedFuture(null)
+        CompletableFuture<Void> accountOperation = accountService == null ? CompletableFuture.completedFuture(null)
                 : accountService.onShutDownStarted();
         log.info("Starting graceful shut down of {}", getClass().getSimpleName());
 
@@ -369,17 +432,17 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
 
         // repeated requests join the shutdown in progress and get notified on completion
         if (!beginGracefulShutDown(resultHandler)) {
-            if (exitCompletedShutdown) CommonSetup.exitAfter(EXIT_SUCCESS, 100, TimeUnit.MILLISECONDS);
+            if (exitCompletedShutdown) CommonSetup.exitAfter(exitStatus(EXIT_SUCCESS), 100, TimeUnit.MILLISECONDS);
             return;
         }
 
-        if (passwordChange.isDone()) {
+        if (accountOperation.isDone()) {
             shutDownServices();
         } else {
-            // keep wallets running until the change finishes, without blocking the user thread
-            log.info("Waiting for password change before shutting down services");
-            passwordChange.thenRunAsync(this::shutDownServices).exceptionally(error -> {
-                log.error("Failed to shut down services after password change", error);
+            // keep wallets running until the account operation finishes, without blocking the user thread
+            log.info("Waiting for account operation before shutting down services");
+            accountOperation.thenRunAsync(this::shutDownServices).exceptionally(error -> {
+                log.error("Failed to shut down services after account operation", error);
                 return null;
             });
         }
@@ -504,7 +567,7 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
         try {
             notifyGracefulShutDownComplete();
         } finally {
-            CommonSetup.exitAfter(status, delay, timeUnit);
+            CommonSetup.exitAfter(exitStatus(status), delay, timeUnit);
         }
     }
 
@@ -515,13 +578,18 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
                 log.info("Graceful shutdown flushed persistence. Exiting now.");
                 notifyGracefulShutDownComplete();
                 if (isSystemExitRequested())
-                    CommonSetup.exitAfter(exitCode, 100, TimeUnit.MILLISECONDS);
+                    CommonSetup.exitAfter(exitStatus(exitCode), 100, TimeUnit.MILLISECONDS);
             });
         } else {
             notifyGracefulShutDownComplete();
             if (isSystemExitRequested())
-                CommonSetup.exitAfter(exitCode, 100, TimeUnit.MILLISECONDS);
+                CommonSetup.exitAfter(exitStatus(exitCode), 100, TimeUnit.MILLISECONDS);
         }
+    }
+
+    // a refused or failed startup exits with a failure status even after a clean shutdown, so a supervisor can retry it
+    private int exitStatus(int status) {
+        return isStartupFailed ? EXIT_FAILURE : status;
     }
 
     // read after notifying completion so exit requests which joined the shutdown are honored
@@ -551,6 +619,11 @@ public abstract class HavenoExecutable implements GracefulShutDownHandler, Haven
     protected int keepRunning() {
         Thread thread = new Thread(() -> {
             ConsoleInput reader = new ConsoleInput(Integer.MAX_VALUE, Integer.MAX_VALUE, TimeUnit.MILLISECONDS);
+            try {
+                loginCompleted.get(); // an interactive login reads the console until then
+            } catch (InterruptedException | ExecutionException e) {
+                return;
+            }
             while (true) {
                 Console console = System.console();
                 try {

@@ -62,6 +62,7 @@ import java.util.Comparator;
 import javafx.beans.binding.Bindings;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.beans.value.ChangeListener;
+import javafx.collections.ListChangeListener;
 import javafx.collections.transformation.FilteredList;
 import javafx.collections.transformation.SortedList;
 import javafx.event.ActionEvent;
@@ -109,6 +110,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         TRADE_FEE(Res.get("shared.tradeFee")),
         BUYER_SEC(Res.get("shared.buyerSecurityDeposit")),
         SELLER_SEC(Res.get("shared.sellerSecurityDeposit")),
+        PAYMENT_METHOD(Res.get("shared.paymentMethod")),
         OFFER_TYPE(Res.get("shared.offerType")),
         STATUS(Res.get("shared.state"));
 
@@ -130,7 +132,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
     TableView<ClosedTradesListItem> tableView;
     @FXML
     TableColumn<ClosedTradesListItem, ClosedTradesListItem> priceColumn, deviationColumn, amountColumn, volumeColumn,
-            tradeFeeColumn, buyerSecurityDepositColumn, sellerSecurityDepositColumn,
+            tradeFeeColumn, buyerSecurityDepositColumn, sellerSecurityDepositColumn, paymentMethodColumn,
             marketColumn, directionColumn, dateColumn, tradeIdColumn, stateColumn, removeTradeColumn,
             duplicateColumn, avatarColumn, chatColumn;
     @FXML
@@ -150,6 +152,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
     private final PrivateNotificationManager privateNotificationManager;
     private SortedList<ClosedTradesListItem> sortedList;
     private FilteredList<ClosedTradesListItem> filteredList;
+    private final ListChangeListener<ClosedTradesListItem> numItemsListener = c -> updateNumItems();
     private ChangeListener<Number> widthListener;
     private final TraderChatManager traderChatManager;
     private final TradeManager tradeManager;
@@ -198,6 +201,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         amountColumn.setGraphic(new AutoTooltipLabel(ColumnNames.AMOUNT.toString()));
         volumeColumn.setGraphic(new AutoTooltipLabel(ColumnNames.VOLUME.toString()));
         marketColumn.setGraphic(new AutoTooltipLabel(ColumnNames.MARKET.toString()));
+        paymentMethodColumn.setGraphic(new AutoTooltipLabel(ColumnNames.PAYMENT_METHOD.toString()));
         directionColumn.setGraphic(new AutoTooltipLabel(ColumnNames.OFFER_TYPE.toString()));
         dateColumn.setGraphic(new AutoTooltipLabel(ColumnNames.DATE.toString()));
         tradeIdColumn.setGraphic(new AutoTooltipLabel(ColumnNames.TRADE_ID.toString()));
@@ -220,6 +224,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         setVolumeColumnCellFactory();
         setDateColumnCellFactory();
         setMarketColumnCellFactory();
+        setPaymentMethodColumnCellFactory();
         setStateColumnCellFactory();
         setRemoveTradeColumnCellFactory();
         setDuplicateColumnCellFactory();
@@ -230,6 +235,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         dateColumn.setComparator(Comparator.comparing(ClosedTradesListItem::getDate));
         directionColumn.setComparator(Comparator.comparing(o -> o.getTradable().getOffer().getDirection()));
         marketColumn.setComparator(Comparator.comparing(ClosedTradesListItem::getMarketLabel));
+        paymentMethodColumn.setComparator(Comparator.comparing(ClosedTradesListItem::getPaymentMethod));
         priceColumn.setComparator(Comparator.comparing(ClosedTradesListItem::getPrice, Comparator.nullsFirst(Comparator.naturalOrder())));
         deviationColumn.setComparator(Comparator.comparing(o ->
                         o.getTradable().getOffer().isUseMarketBasedPrice() ? o.getTradable().getOffer().getMarketPriceMarginPct() : 1,
@@ -305,7 +311,8 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
         filterBox.setPromptText(Res.get("shared.filter"));
         filterBox.activate();
 
-        numItems.setText(Res.get("shared.numItemsLabel", sortedList.size()));
+        updateNumItems();
+        sortedList.addListener(numItemsListener);
         exportButton.setOnAction(event -> {
             Function<ClosedTradesListItem, String[]> headerConverter = item -> {
                 String[] columns = new String[ColumnNames.values().length];
@@ -332,6 +339,7 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
                 }
                 columns[ColumnNames.BUYER_SEC.ordinal()] = item.getBuyerSecurityDepositAsString();
                 columns[ColumnNames.SELLER_SEC.ordinal()] = item.getSellerSecurityDepositAsString();
+                columns[ColumnNames.PAYMENT_METHOD.ordinal()] = item.getPaymentMethod();
                 columns[ColumnNames.OFFER_TYPE.ordinal()] = item.getDirectionLabel();
                 columns[ColumnNames.STATUS.ordinal()] = item.getState();
                 return columns;
@@ -351,12 +359,17 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
     protected void deactivate() {
         if (chatPopupStage != null) chatPopupStage.hide();
         sortedList.comparatorProperty().unbind();
+        sortedList.removeListener(numItemsListener);
         removeTradeColumn.visibleProperty().unbind();
         exportButton.setOnAction(null);
         summaryButton.setOnAction(null);
 
         filterBox.deactivate();
         root.widthProperty().removeListener(widthListener);
+    }
+
+    private void updateNumItems() {
+        numItems.setText(Res.get("shared.numItemsLabel", sortedList.size()));
     }
 
     private static <T extends Comparable<T>> Comparator<ClosedTradesListItem> nullsFirstComparing(Function<ClosedTradesListItem, T> keyExtractor) {
@@ -374,8 +387,8 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
     }
 
     private void onWidthChange(double width) {
-        buyerSecurityDepositColumn.setVisible(width > 1400);
-        sellerSecurityDepositColumn.setVisible(width > 1500);
+        buyerSecurityDepositColumn.setVisible(width > 1550);
+        sellerSecurityDepositColumn.setVisible(width > 1650);
     }
 
     private void showDetails(Tradable tradable) {
@@ -512,6 +525,28 @@ public class ClosedTradesView extends ActivatableViewAndModel<VBox, ClosedTrades
                                 super.updateItem(item, empty);
                                 if (item != null && !empty) {
                                     setGraphic(new AutoTooltipLabel(item.getMarketLabel()));
+                                } else {
+                                    setGraphic(null);
+                                }
+                            }
+                        };
+                    }
+                });
+    }
+
+    private void setPaymentMethodColumnCellFactory() {
+        paymentMethodColumn.setCellValueFactory((item) -> new ReadOnlyObjectWrapper<>(item.getValue()));
+        paymentMethodColumn.setCellFactory(
+                new Callback<>() {
+                    @Override
+                    public TableCell<ClosedTradesListItem, ClosedTradesListItem> call(
+                            TableColumn<ClosedTradesListItem, ClosedTradesListItem> column) {
+                        return new TableCell<>() {
+                            @Override
+                            public void updateItem(final ClosedTradesListItem item, boolean empty) {
+                                super.updateItem(item, empty);
+                                if (item != null && !empty) {
+                                    setGraphic(new AutoTooltipLabel(item.getPaymentMethod()));
                                 } else {
                                     setGraphic(null);
                                 }
