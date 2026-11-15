@@ -165,6 +165,7 @@ class GrpcOffersService extends OffersImplBase {
                     req.getPaymentAccountId(),
                     req.getIsPrivateOffer(),
                     req.getBuyerAsTakerWithoutDeposit(),
+                    req.getRequireSignedTaker(),
                     req.getExtraInfo(),
                     req.getSourceOfferId(),
                     offer -> {
@@ -278,12 +279,12 @@ class GrpcOffersService extends OffersImplBase {
         return getCustomRateMeteringInterceptor(coreApi.getConfig().appDataDir, this.getClass())
                 .or(() -> Optional.of(CallRateMeteringInterceptor.valueOf(
                         new HashMap<>() {{
-                            put(getGetOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isTestnet() ? 75 : 3, SECONDS));
-                            put(getGetMyOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isTestnet() ? 75 : 3, SECONDS));
-                            put(getGetOffersMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isTestnet() ? 75 : 3, SECONDS));
-                            put(getGetMyOffersMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isTestnet() ? 75 : 3, Config.baseCurrencyNetwork().isTestnet() ? SECONDS : MINUTES));
-                            put(getPostOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isTestnet() ? 75 : 3, Config.baseCurrencyNetwork().isTestnet() ? SECONDS : MINUTES));
-                            put(getCancelOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isTestnet() ? 75 : 3, Config.baseCurrencyNetwork().isTestnet() ? SECONDS : MINUTES));
+                            put(getGetOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isLocal() ? 75 : 3, SECONDS));
+                            put(getGetMyOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isLocal() ? 75 : 3, SECONDS));
+                            put(getGetOffersMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isLocal() ? 75 : 3, SECONDS));
+                            put(getGetMyOffersMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isLocal() ? 75 : 3, Config.baseCurrencyNetwork().isLocal() ? SECONDS : MINUTES));
+                            put(getPostOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isLocal() ? 75 : 3, Config.baseCurrencyNetwork().isLocal() ? SECONDS : MINUTES));
+                            put(getCancelOfferMethod().getFullMethodName(), new GrpcCallRateMeter(Config.baseCurrencyNetwork().isLocal() ? 75 : 3, Config.baseCurrencyNetwork().isLocal() ? SECONDS : MINUTES));
                         }}
                 )));
     }

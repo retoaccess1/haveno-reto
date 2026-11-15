@@ -55,11 +55,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 class TradesChartsViewModel extends ActivatableViewModel {
     static final int MAX_TICKS = 90;
     private static final int TAB_INDEX = 2;
+    private static final List<String> SHOW_ALL_FLAGS = List.of(GUIUtil.SHOW_ALL_FLAG, GUIUtil.SHOW_FIAT_FLAG, GUIUtil.SHOW_CRYPTO_FLAG);
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Enum
@@ -83,7 +85,8 @@ class TradesChartsViewModel extends ActivatableViewModel {
     final ObjectProperty<TradeCurrency> selectedTradeCurrencyProperty = new SimpleObjectProperty<>();
     final BooleanProperty showAllTradeCurrenciesProperty = new SimpleBooleanProperty(false);
     private final CurrencyList currencyListItems;
-    private final CurrencyListItem showAllCurrencyListItem = new CurrencyListItem(new CryptoCurrency(GUIUtil.SHOW_ALL_FLAG, ""), -1);
+    // the show all entry in use while showAllTradeCurrenciesProperty is set: every currency or one asset class
+    private String showAllCode = GUIUtil.SHOW_ALL_FLAG;
     final ObservableList<TradeStatistics3> tradeStatisticsByCurrency = FXCollections.observableArrayList();
     final ObservableList<XYChart.Data<Number, Number>> priceItems = FXCollections.observableArrayList();
     final ObservableList<XYChart.Data<Number, Number>> volumeItems = FXCollections.observableArrayList();
@@ -93,7 +96,6 @@ class TradesChartsViewModel extends ActivatableViewModel {
     TickUnit tickUnit;
     private int selectedTabIndex;
     final Map<TickUnit, Map<Long, Long>> usdAveragePriceMapsPerTickUnit = new HashMap<>();
-    private boolean fillTradeCurrenciesOnActivateCalled;
     private volatile boolean deactivateCalled;
     // Async refilter, chart and USD-map results apply only if the generation taken at start is still
     // current, so a superseded result is dropped. Counters are only touched on the user thread.
@@ -121,6 +123,7 @@ class TradesChartsViewModel extends ActivatableViewModel {
 
         String tradeChartsScreenCurrencyCode = preferences.getTradeChartsScreenCurrencyCode();
         showAllTradeCurrenciesProperty.set(isShowAllEntry(tradeChartsScreenCurrencyCode));
+        if (showAllTradeCurrenciesProperty.get()) showAllCode = tradeChartsScreenCurrencyCode;
 
         TradeCurrency tradeCurrency = CurrencyUtil.getTradeCurrency(tradeChartsScreenCurrencyCode)
                 .orElse(GlobalSettings.getDefaultTradeCurrency());
@@ -139,10 +142,7 @@ class TradesChartsViewModel extends ActivatableViewModel {
         synchronized (tradeStatisticsManager.getObservableTradeStatisticsList()) {
             tradeStatisticsManager.getObservableTradeStatisticsList().addListener(listChangeListener);
         }
-        if (!fillTradeCurrenciesOnActivateCalled) {
-            fillTradeCurrencies();
-            fillTradeCurrenciesOnActivateCalled = true;
-        }
+        fillTradeCurrencies();
         syncPriceFeedCurrency();
         setMarketPriceFeedCurrency();
 
@@ -201,7 +201,7 @@ class TradesChartsViewModel extends ActivatableViewModel {
 
         // Run the two recomputations in parallel for better performance.
         applyAsyncUsdAveragePriceMapsPerTickUnit(task1Done);
-        applyAsyncTradeStatisticsForCurrency(getCurrencyCode(), task2Done);
+        applyAsyncTradeStatisticsForCurrency(task2Done);
     }
 
     private void applyAsyncUsdAveragePriceMapsPerTickUnit(CompletableFuture<Boolean> completeFuture) {
@@ -231,18 +231,15 @@ class TradesChartsViewModel extends ActivatableViewModel {
                 });
     }
 
-    private CompletableFuture<Boolean> applyAsyncTradeStatisticsForCurrency(String currencyCode) {
-        return applyAsyncTradeStatisticsForCurrency(currencyCode, null);
+    private CompletableFuture<Boolean> applyAsyncTradeStatisticsForCurrency() {
+        return applyAsyncTradeStatisticsForCurrency(null);
     }
 
-    private CompletableFuture<Boolean> applyAsyncTradeStatisticsForCurrency(String currencyCode,
-                                                                            @Nullable CompletableFuture<Boolean> completeFuture) {
+    private CompletableFuture<Boolean> applyAsyncTradeStatisticsForCurrency(@Nullable CompletableFuture<Boolean> completeFuture) {
         CompletableFuture<Boolean> future = new CompletableFuture<>();
         long ts = System.currentTimeMillis();
         int generation = ++refilterGeneration;
-        ChartCalculations.getTradeStatisticsForCurrency(tradeStatisticsManager.getObservableTradeStatisticsList(),
-                currencyCode,
-                showAllTradeCurrenciesProperty.get())
+        ChartCalculations.getTradeStatisticsForCurrency(tradeStatisticsManager.getObservableTradeStatisticsList(), getCurrencyFilter())
                 .whenComplete((list, throwable) -> {
                     if (deactivateCalled) {
                         return;
@@ -324,6 +321,7 @@ class TradesChartsViewModel extends ActivatableViewModel {
             boolean showAllEntry = isShowAllEntry(code);
             showAllTradeCurrenciesProperty.set(showAllEntry);
             if (showAllEntry) {
+                showAllCode = code;
                 priceFeedService.setCurrencyCode(GlobalSettings.getDefaultTradeCurrency().getCode());
             } else {
                 selectedTradeCurrencyProperty.set(tradeCurrency);
@@ -332,7 +330,7 @@ class TradesChartsViewModel extends ActivatableViewModel {
             }
             preferences.setTradeChartsScreenCurrencyCode(code);
 
-            applyAsyncTradeStatisticsForCurrency(getCurrencyCode())
+            applyAsyncTradeStatisticsForCurrency()
                     .whenComplete((result, throwable) -> {
                         if (deactivateCalled) {
                             return;
@@ -372,7 +370,8 @@ class TradesChartsViewModel extends ActivatableViewModel {
     }
 
     public Optional<CurrencyListItem> getSelectedCurrencyListItem() {
-        return currencyListItems.getObservableList().stream().filter(e -> e.tradeCurrency.equals(selectedTradeCurrencyProperty.get())).findAny();
+        String code = showAllTradeCurrenciesProperty.get() ? showAllCode : getCurrencyCode();
+        return currencyListItems.getObservableList().stream().filter(e -> e.tradeCurrency.getCode().equals(code)).findAny();
     }
 
     long getTimeFromTickIndex(long tick) {
@@ -387,12 +386,22 @@ class TradesChartsViewModel extends ActivatableViewModel {
     private void fillTradeCurrencies() {
         // Don't use a set as we need all entries
         List<TradeCurrency> tradeCurrencyList;
+        List<CurrencyListItem> showAllItems;
         synchronized (tradeStatisticsManager.getObservableTradeStatisticsList()) {
-            tradeCurrencyList = tradeStatisticsManager.getObservableTradeStatisticsList().stream()
+            List<TradeStatistics3> tradeStatistics = tradeStatisticsManager.getObservableTradeStatisticsList();
+            tradeCurrencyList = tradeStatistics.stream()
                     .flatMap(e -> CurrencyUtil.getTradeCurrency(e.getCurrency()).stream())
                     .collect(Collectors.toList());
+            showAllItems = SHOW_ALL_FLAGS.stream().map(flag -> getShowAllItem(flag, tradeStatistics)).collect(Collectors.toList());
         }
-        currencyListItems.updateWithCurrencies(tradeCurrencyList, showAllCurrencyListItem);
+        currencyListItems.updateWithCurrencies(tradeCurrencyList, showAllItems);
+    }
+
+    // a show all entry carrying the count of the trades it covers
+    private static CurrencyListItem getShowAllItem(String flag, List<TradeStatistics3> tradeStatistics) {
+        Predicate<String> filter = getShowAllFilter(flag);
+        int numTrades = (int) tradeStatistics.stream().filter(e -> filter.test(e.getCurrency())).count();
+        return new CurrencyListItem(new CryptoCurrency(flag, ""), numTrades);
     }
 
     private void setMarketPriceFeedCurrency() {
@@ -409,8 +418,20 @@ class TradesChartsViewModel extends ActivatableViewModel {
             priceFeedService.setCurrencyCode(selectedTradeCurrencyProperty.get().getCode());
     }
 
+    // trades to show: those of the selected currency, or of every currency the show all entry covers
+    private Predicate<String> getCurrencyFilter() {
+        return showAllTradeCurrenciesProperty.get() ? getShowAllFilter(showAllCode) : Predicate.isEqual(getCurrencyCode());
+    }
+
+    // currencies a show all entry covers
+    private static Predicate<String> getShowAllFilter(String flag) {
+        if (flag.equals(GUIUtil.SHOW_FIAT_FLAG)) return CurrencyUtil::isFiatCurrency;
+        if (flag.equals(GUIUtil.SHOW_CRYPTO_FLAG)) return CurrencyUtil::isCryptoCurrency;
+        return code -> true;
+    }
+
     private boolean isShowAllEntry(@Nullable String id) {
-        return id != null && id.equals(GUIUtil.SHOW_ALL_FLAG);
+        return GUIUtil.isShowAllFlag(id);
     }
 
     private boolean isEditEntry(@Nullable String id) {

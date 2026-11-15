@@ -26,6 +26,7 @@ import common.utils.JsonUtils;
 import haveno.common.ThreadUtils;
 import haveno.common.Timer;
 import haveno.common.UserThread;
+import haveno.common.config.BaseCurrencyNetwork;
 import haveno.common.config.Config;
 import haveno.common.file.FileUtil;
 import haveno.common.util.Utilities;
@@ -688,7 +689,7 @@ public class XmrWalletService extends XmrWalletBase {
 
     private MoneroWalletConfig getWalletConfig(String walletName) {
         MoneroWalletConfig config = new MoneroWalletConfig().setPath(getWalletPath(walletName)).setPassword(getWalletPassword(walletName));
-        if (isNativeLibraryApplied()) config.setNetworkType(getMoneroNetworkType());
+        if (isNativeLibraryApplied()) config.setNetworkType(getMoneroNetworkType()).setRegtest(Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_LOCAL);
         return config;
     }
 
@@ -816,7 +817,7 @@ public class XmrWalletService extends XmrWalletBase {
             String redactedPath = Utilities.redactSensitiveInfo(path);
             if (!new File(path).delete()) throw new RuntimeException("Failed to delete wallet cache file: " + redactedPath);
             if (!new File(path + KEYS_FILE_POSTFIX).delete()) throw new RuntimeException("Failed to delete wallet keys file: " + redactedPath + KEYS_FILE_POSTFIX);
-            if (!new File(path + ADDRESS_FILE_POSTFIX).delete() && !Config.baseCurrencyNetwork().isMainnet()) throw new RuntimeException("Failed to delete wallet address file: " + redactedPath + ADDRESS_FILE_POSTFIX); // mainnet does not have address file by default
+            if (!new File(path + ADDRESS_FILE_POSTFIX).delete() && MONERO_NETWORK_TYPE != MoneroNetworkType.MAINNET) throw new RuntimeException("Failed to delete wallet address file: " + redactedPath + ADDRESS_FILE_POSTFIX); // mainnet does not have address file by default
         } finally {
             walletLifecycleLock.readLock().unlock();
         }
@@ -1888,7 +1889,7 @@ public class XmrWalletService extends XmrWalletBase {
     public static MoneroNetworkType getMoneroNetworkType() {
         switch (Config.baseCurrencyNetwork()) {
         case XMR_LOCAL:
-            return MoneroNetworkType.TESTNET;
+            return MoneroNetworkType.MAINNET; // regtest uses mainnet address encoding
         case XMR_STAGENET:
             return MoneroNetworkType.STAGENET;
         case XMR_MAINNET:
@@ -2119,6 +2120,7 @@ public class XmrWalletService extends XmrWalletBase {
     private MoneroWalletFull openWalletFull(MoneroWalletConfig config, boolean applyProxyUri) {
         awaitPendingWalletClose(config.getPath());
         MoneroWalletFull walletFull = null;
+        Throwable openFailure = null;
         try {
 
             // configure wallet connection
@@ -2127,15 +2129,16 @@ public class XmrWalletService extends XmrWalletBase {
 
             // try opening wallet
             config.setNetworkType(getMoneroNetworkType());
-            config.setServer(connection);
             log.debug("Opening full wallet '{}' with monerod={}, proxyUri={}", Utilities.redactSensitiveInfo(config.getPath()), connection.getUri(), connection.getProxyUri());
             try {
                 walletFull = MoneroWalletFull.openWallet(config);
             } catch (Throwable e) {
                 // preserve the original cache; a split password can look like corrupt serialized data
                 UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                openFailure = e;
                 throw e;
             }
+            walletFull.setDaemonConnection(connection, config.isTrustedDaemon());
             if (walletFull.getDaemonConnection() != null) walletFull.getDaemonConnection().setPrintStackTrace(PRINT_RPC_STACK_TRACE);
             log.debug("Done opening full wallet " + Utilities.redactSensitiveInfo(config.getPath()));
             return walletFull;
@@ -2148,6 +2151,7 @@ public class XmrWalletService extends XmrWalletBase {
             log.warn(errorMsg + "\n", e);
             if (walletFull != null) forceCloseWallet(walletFull, config.getPath());
             if (e instanceof Error) throw (Error) e;
+            if (e == openFailure && !failedBeforeReadingFiles(e)) throw new WalletUnavailableException(unreadableWalletMessage(Utilities.redactSensitiveInfo(config.getPath()), e), e);
             throw new WalletUnavailableException(errorMsg + ". Wallet files were preserved; use password recovery if a change was interrupted", e);
         }
     }
@@ -2194,6 +2198,7 @@ public class XmrWalletService extends XmrWalletBase {
 
     private MoneroWalletRpc openWalletRpc(MoneroWalletConfig config, Integer port, boolean applyProxyUri, boolean trustDaemon) {
         MoneroWalletRpc walletRpc = null;
+        Throwable openFailure = null;
         try {
 
             // get daemon connection from service
@@ -2219,6 +2224,7 @@ public class XmrWalletService extends XmrWalletBase {
             } catch (Throwable e) {
                 // preserve the original cache; a split password can look like corrupt serialized data
                 UserThread.execute(() -> passwordRecoveryRequired.set(true));
+                openFailure = e;
                 throw e;
             }
             setDaemonConnection(walletRpc, connection, trustDaemon);
@@ -2233,8 +2239,22 @@ public class XmrWalletService extends XmrWalletBase {
                 UserThread.execute(() -> passwordRecoveryRequired.set(true));
                 throw new WalletUnavailableException("Could not open wallet '" + config.getPath() + "': invalid password. Close Haveno and run the recovery tool with the passwords used during the failed change; see docs/password-recovery.md", e);
             }
+            // a structured open_wallet error means the server rejected the wallet files; transport failures carry no method
+            if (e == openFailure && e instanceof MoneroRpcError && ((MoneroRpcError) e).getRpcMethod() != null && !failedBeforeReadingFiles(e)) {
+                throw new WalletUnavailableException(unreadableWalletMessage(config.getPath(), e), e);
+            }
             throw new WalletUnavailableException("Could not open wallet '" + config.getPath() + "'. Please close Haveno, stop all monero-wallet-rpc processes in your task manager, and restart Haveno.\n\nError message: " + e.getMessage(), e);
         }
+    }
+
+    // wallet2 reports a keys file held by another wallet process or a failed daemon setup before reading the files
+    private static boolean failedBeforeReadingFiles(Throwable e) {
+        String message = e.getMessage();
+        return message != null && (message.contains("opened by another wallet program") || message.contains("failed to initialize the wallet"));
+    }
+
+    private static String unreadableWalletMessage(String walletName, Throwable e) {
+        return "Could not open wallet '" + walletName + "': the wallet files are unreadable or use a different password. Close Haveno and run the recovery tool with every password used, or restore the wallet files from a backup; see docs/password-recovery.md\n\nError message: " + e.getMessage();
     }
 
     public ReadOnlyBooleanProperty passwordRecoveryRequiredProperty() {
@@ -2280,8 +2300,8 @@ public class XmrWalletService extends XmrWalletBase {
             cmd.add("--" + MONERO_NETWORK_TYPE.toString().toLowerCase());
         }
 
-        // testnet may use custom hard fork heights
-        if (MONERO_NETWORK_TYPE == MoneroNetworkType.TESTNET) {
+        // regtest activates the latest hard fork at height 1
+        if (Config.baseCurrencyNetwork() == BaseCurrencyNetwork.XMR_LOCAL) {
             cmd.add("--allow-mismatched-daemon-version");
         }
 
@@ -2782,7 +2802,7 @@ public class XmrWalletService extends XmrWalletBase {
             // skip polling if trades are reserving main wallet (disable if testnet or too long since last poll)
             List<Trade> tradesReservingMainWallet = HavenoUtils.tradeManager.getTradesReservingMainWallet();
             boolean lastPollWithinTolerance = System.currentTimeMillis() - lastPollTxsTimestamp <= POLL_TXS_TOLERANCE_MS;
-            if (!tradesReservingMainWallet.isEmpty() && lastPollWithinTolerance && !Config.baseCurrencyNetwork().isTestnet()) {
+            if (!tradesReservingMainWallet.isEmpty() && lastPollWithinTolerance && !Config.baseCurrencyNetwork().isLocal()) {
                 List<String> tradeIds = tradesReservingMainWallet.stream().map(Trade::getShortId).collect(Collectors.toList());
                 log.info("Skipping main wallet poll because trades are reserving main wallet: " + tradeIds);
                 return;
@@ -2882,7 +2902,7 @@ public class XmrWalletService extends XmrWalletBase {
         }
 
         // log wallet balances
-        if (getMoneroNetworkType() != MoneroNetworkType.MAINNET) {
+        if (!Config.baseCurrencyNetwork().isMainnet()) {
             BigInteger balance = getBalance();
             BigInteger unlockedBalance = getAvailableBalance();
             log.info("Monero wallet unlocked balance={}, pending balance={}, total balance={}", unlockedBalance, balance.subtract(unlockedBalance), balance);

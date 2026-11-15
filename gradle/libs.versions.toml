@@ -14,7 +14,7 @@ grpc = "1.81.0"
 gson = "2.14.0"
 guava = "33.6.0-jre"
 guice = "7.0.0"
-monero-java = "0.8.64"
+monero-java = "0.8.65"
 httpclient5 = "5.6.4"
 httpcore5 = "5.4.3"
 hamcrest = "3.0"
@@ -34,8 +34,8 @@ commons-lang3 = "3.20.0"
 logback = "1.5.38"
 lombok = "1.18.46"
 mockito = "5.23.0"
-# Tor browser version 15.0.25 and tor binary version: 0.4.9.14
-netlayer = "f08c1d6f14"
+# Tor browser version 16.0 and tor binary version: 0.4.9.15
+netlayer = "34265d119d"
 protobuf = "4.35.0"
 pushy = "0.15.4"
 slf4j = "2.0.18"
@@ -44,7 +44,7 @@ zxing = "3.5.4"
 checkstyle = "13.4.2"
 jacoco = "0.8.14"
 java = "21"
-haveno-desktop = "1.12.0-SNAPSHOT"
+haveno-desktop = "1.13.0-SNAPSHOT"
 
 # JavaFX, protoc and protoc-gen-grpc-java have no [libraries] entries: they need per-platform
 # classifiers or raw coordinate strings, so build.gradle reads their versions straight from [versions].

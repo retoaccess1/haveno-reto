@@ -134,6 +134,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
@@ -155,21 +156,21 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
     @Getter
     public final Object lock = new Object();
     private static final String MONERO_TRADE_WALLET_PREFIX = "xmr_trade_";
-    private static final long SHUTDOWN_TIMEOUT_MS = Config.baseCurrencyNetwork().isTestnet() ? 20000 : 60000;
-    private static final long SYNC_EVERY_NUM_BLOCKS = Config.baseCurrencyNetwork().isTestnet() ? 40 : 360; // ~1/2 day
+    private static final long SHUTDOWN_TIMEOUT_MS = Config.baseCurrencyNetwork().isLocal() ? 20000 : 60000;
+    private static final long SYNC_EVERY_NUM_BLOCKS = Config.baseCurrencyNetwork().isLocal() ? 40 : 360; // ~1/2 day
     private static final long DELETE_AFTER_NUM_BLOCKS = 2; // if deposit requested but not published
     private static final long EXTENDED_RPC_TIMEOUT_MS = 600000; // 10 minutes
     private static final boolean TRUST_DAEMON = true; // rescanning spent outputs requires a trusted daemon and only discloses the trade's deposit key images
     private static final long DELETE_AFTER_MS = TradeProtocol.TRADE_STEP_TIMEOUT_SECONDS * 1000L;
     private static final int NUM_CONFIRMATIONS_FOR_SCHEDULED_IMPORT = 5;
     public static final int NUM_BLOCKS_DEPOSITS_FINALIZED = 30; // ~1 hour before deposits are considered finalized
-    public static final int NUM_BLOCKS_PAYOUT_FINALIZED = Config.baseCurrencyNetwork().isTestnet() ? 60 : 720; // ~1 day before payout is considered finalized, after which the multisig wallet is retained but no longer opened or synced
-    public static final int NUM_BLOCKS_PAYOUT_DELETED = Config.baseCurrencyNetwork().isTestnet() ? 420 : 5040; // ~7 days before the retained multisig wallet is deleted (must be finalized first)
+    public static final int NUM_BLOCKS_PAYOUT_FINALIZED = Config.baseCurrencyNetwork().isLocal() ? 60 : 720; // ~1 day before payout is considered finalized, after which the multisig wallet is retained but no longer opened or synced
+    public static final int NUM_BLOCKS_PAYOUT_DELETED = Config.baseCurrencyNetwork().isLocal() ? 420 : 5040; // ~7 days before the retained multisig wallet is deleted (must be finalized first)
     private static final BigInteger MAX_PAYOUT_TX_CHANGE = BigInteger.valueOf(100000); // max atomic units left in multisig after payout
     public static final long DEFER_PUBLISH_MS = 25000; // 25 seconds
     public static final long POLL_WALLET_NORMALLY_DEFAULT_PERIOD_MS = 120000; // 2 minutes
     private static final long KEEP_ALIVE_PERIOD_MINS = 28; // connection to monerod times out after 30 mins of inactivity
-    private static final long TRADER_IDLE_SYNC_PERIOD_MS = Config.baseCurrencyNetwork().isTestnet() ? 75000 : KEEP_ALIVE_PERIOD_MINS * 60 * 1000;
+    private static final long TRADER_IDLE_SYNC_PERIOD_MS = Config.baseCurrencyNetwork().isLocal() ? 75000 : KEEP_ALIVE_PERIOD_MINS * 60 * 1000;
     private static final long MAX_REPROCESS_DELAY_SECONDS = 7200; // max delay to reprocess messages (once per 2 hours)
     private static final long REVERT_AFTER_NUM_CONFIRMATIONS = 3;
     private static final Object IDLE_BLOCK_POLLER_LOCK = new Object(); // global lock to serialize idle trade polling
@@ -187,7 +188,7 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
     public static final String PROTOCOL_VERSION = "protocolVersion"; // key for extraDataMap in trade statistics
     public BooleanProperty wasWalletPolledProperty = new SimpleBooleanProperty(false);
     public BooleanProperty wasWalletSyncedAndPolledProperty = new SimpleBooleanProperty(false);
-    private static final long MISSING_TXS_DELAY_MS = Config.baseCurrencyNetwork().isTestnet() ? 5000 : 30000;
+    private static final long MISSING_TXS_DELAY_MS = Config.baseCurrencyNetwork().isLocal() ? 5000 : 30000;
     private static final long DIRECT_SYNC_TIMEOUT_MS = 60000; // direct sync only refreshes after catching up, so fail fast
     private Long firstDepositTxMissingHeight; // height when we first saw missing deposit txs (to wait for a confirmation before reverting state)
     private Long firstPayoutTxMissingHeight; // height when we first saw missing payout tx (to wait for a confirmation before reverting state)
@@ -2607,6 +2608,18 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
         return getDisputes().get(getDisputes().size() - 1).getDisputeResultProperty().get();
     }
 
+    // amount an arbitrator's ruling paid the buyer beyond their security deposit, or null if no ruling paid out the trade
+    @Nullable
+    public BigInteger getArbitratedBuyerGain() {
+        if (!isPayoutPublished() || isPaymentReceived()) return null; // confirmed payments take precedence, as in setPayoutTx
+        DisputeResult ruling = getDisputes().stream() // an arbitrator's mirrored ticket can lack the ruling
+                .map(dispute -> dispute.getDisputeResultProperty().get())
+                .filter(result -> result != null && result.getWinner() != null) // tickets can close without a ruling
+                .max(Comparator.comparing(DisputeResult::getCloseDate))
+                .orElse(null);
+        return ruling == null ? null : ruling.getBuyerPayoutAmountBeforeCost().subtract(getBuyer().getSecurityDeposit());
+    }
+
     @Nullable
     public MoneroTx getPayoutTx() {
         if (payoutTx == null && payoutTxId != null) {
@@ -3265,7 +3278,9 @@ public abstract class Trade extends XmrWalletBase implements Tradable, Model, Xm
     }
     
     private boolean tradeAmountTransferred() {
-        return isPayoutPublished() && (isPaymentReceived() || (getDisputeResult() != null && getDisputeResult().getWinner() == DisputeResult.Winner.SELLER));
+        if (isPayoutPublished() && isPaymentReceived()) return true;
+        BigInteger arbitratedBuyerGain = getArbitratedBuyerGain();
+        return arbitratedBuyerGain != null && arbitratedBuyerGain.compareTo(getAmount()) >= 0;
     }
 
     private void doPublishTradeStatistics() {

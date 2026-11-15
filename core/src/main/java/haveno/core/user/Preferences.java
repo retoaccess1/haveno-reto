@@ -144,6 +144,8 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
     private final BooleanProperty useStandbyModeProperty = new SimpleBooleanProperty(prefPayload.isUseStandbyMode());
     @Getter
     private final BooleanProperty useSoundForNotificationsProperty = new SimpleBooleanProperty(prefPayload.isUseSoundForNotifications());
+    @Getter
+    private final IntegerProperty repeatNotificationSoundSecondsProperty = new SimpleIntegerProperty(prefPayload.getRepeatNotificationSoundSeconds());
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Constructor
@@ -187,6 +189,11 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
 
         useSoundForNotificationsProperty.addListener((ov) -> {
             prefPayload.setUseSoundForNotifications(useSoundForNotificationsProperty.get());
+            requestPersistence();
+        });
+
+        repeatNotificationSoundSecondsProperty.addListener((ov) -> {
+            prefPayload.setRepeatNotificationSoundSeconds(repeatNotificationSoundSecondsProperty.get());
             requestPersistence();
         });
 
@@ -296,6 +303,7 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         useAnimationsProperty.set(prefPayload.isUseAnimations());
         useStandbyModeProperty.set(prefPayload.isUseStandbyMode());
         useSoundForNotificationsProperty.set(prefPayload.isUseSoundForNotifications());
+        repeatNotificationSoundSecondsProperty.set(prefPayload.getRepeatNotificationSoundSeconds());
 
         // read the css theme from the unencrypted store, migrating from the encrypted payload on first run
         Integer cssThemeFromSettings = readCssThemeFromSettings();
@@ -395,6 +403,10 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
 
     public synchronized void setEffectiveMoneroNodesOption(MoneroNodesOption option) {
         applyNodeSettings(option, getEffectiveNetworkSettings().customNodes());
+    }
+
+    public synchronized void setCustomNodes(String customNodes) {
+        applyNodeSettings(getEffectiveNetworkSettings().nodes(), customNodes);
     }
 
     public synchronized void applyNodeSettings(MoneroNodesOption nodes, String customNodes) {
@@ -944,6 +956,10 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         this.useSoundForNotificationsProperty.set(useSoundForNotifications);
     }
 
+    public void setRepeatNotificationSoundSeconds(int repeatNotificationSoundSeconds) {
+        this.repeatNotificationSoundSecondsProperty.set(repeatNotificationSoundSeconds);
+    }
+
     public void setTakeOfferSelectedPaymentAccountId(String value) {
         prefPayload.setTakeOfferSelectedPaymentAccountId(value);
         requestPersistence();
@@ -1240,6 +1256,8 @@ public final class Preferences implements PersistedDataHost, BridgeAddressProvid
         void setUseStandbyMode(boolean useStandbyMode);
 
         void setUseSoundForNotifications(boolean useSoundForNotifications);
+
+        void setRepeatNotificationSoundSeconds(int repeatNotificationSoundSeconds);
 
         void setTakeOfferSelectedPaymentAccountId(String value);
 

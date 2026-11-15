@@ -363,6 +363,10 @@ public class CoreApi {
         notificationService.addListener(listener);
     }
 
+    public void removeNotificationListener(NotificationListener listener) {
+        notificationService.removeListener(listener);
+    }
+
     public void sendNotification(NotificationMessage notification) {
         notificationService.sendNotification(notification);
     }
@@ -442,6 +446,7 @@ public class CoreApi {
                             String paymentAccountId,
                             boolean isPrivateOffer,
                             boolean buyerAsTakerWithoutDeposit,
+                            boolean requireSignedTaker,
                             String extraInfo,
                             String sourceOfferId,
                             Consumer<Offer> resultHandler,
@@ -459,6 +464,7 @@ public class CoreApi {
                 paymentAccountId,
                 isPrivateOffer,
                 buyerAsTakerWithoutDeposit,
+                requireSignedTaker,
                 extraInfo,
                 sourceOfferId,
                 resultHandler,

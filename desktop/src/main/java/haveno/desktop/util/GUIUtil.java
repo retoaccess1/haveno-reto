@@ -29,7 +29,9 @@ import com.google.zxing.qrcode.QRCodeWriter;
 
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIcon;
 import de.jensd.fx.glyphs.materialdesignicons.MaterialDesignIconView;
+import haveno.common.BackgroundTimer;
 import haveno.common.ThreadUtils;
+import haveno.common.Timer;
 import haveno.common.UserThread;
 import haveno.common.config.Config;
 import haveno.common.file.FileUtil;
@@ -157,6 +159,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -174,7 +177,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -186,6 +193,8 @@ import static haveno.desktop.util.FormBuilder.addTopLabelComboBoxComboBox;
 @Slf4j
 public class GUIUtil {
     public final static String SHOW_ALL_FLAG = "list.currency.showAll"; // Used for accessing the i18n resource
+    public final static String SHOW_FIAT_FLAG = "list.currency.showFiat";
+    public final static String SHOW_CRYPTO_FLAG = "list.currency.showCrypto";
     public final static String EDIT_FLAG = "list.currency.editList"; // Used for accessing the i18n resource
 
     public final static String OPEN_WEB_PAGE_KEY = "warnOpenURLWhenTorEnabled";
@@ -416,27 +425,39 @@ public class GUIUtil {
 
                     String code = item.tradeCurrency.getCode();
 
-                    boolean isCrypto = CurrencyUtil.isCryptoCurrency(code);
-
                     HBox box = new HBox();
                     box.setSpacing(20);
                     box.setAlignment(Pos.CENTER_LEFT);
                     Label label1 = new AutoTooltipLabel(getCurrencyType(code));
                     label1.getStyleClass().add("currency-label-small");
-                    Label label2 = new AutoTooltipLabel(isCrypto ? item.tradeCurrency.getNameAndCode() : code);
+                    Label label2 = new AutoTooltipLabel(item.tradeCurrency.getNameAndCode());
                     label2.getStyleClass().add("currency-label");
-                    Label label3 = new AutoTooltipLabel(isCrypto ? "" : item.tradeCurrency.getName());
-                    if (!isCrypto) label3.getStyleClass().add("currency-label");
-                    Label label4 = new AutoTooltipLabel();
+                    Label label3 = new AutoTooltipLabel();
 
-                    boolean showOfferCount = false;
-                    String announced; // name-first for screen readers; the visible row leads with the code
+                    boolean showOfferCount = item.numTrades > 0;
+                    if (showOfferCount) {
+                        HBox.setMargin(label3, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
+                        label3.getStyleClass().add("offer-label");
+                        label3.setText(item.numTrades + " " + (item.numTrades == 1 ? postFixSingle : postFixMulti));
+                    }
+                    String announcedCount = showOfferCount ? ", " + label3.getText() : "";
+                    String announced; // the code is spelled out for screen readers
 
                     switch (code) {
                         case GUIUtil.SHOW_ALL_FLAG:
                             label1.setText(Res.get("shared.all"));
                             label2.setText(Res.get("list.currency.showAll"));
-                            announced = Res.get("list.currency.showAll");
+                            announced = Res.get("list.currency.showAll") + announcedCount;
+                            break;
+                        case GUIUtil.SHOW_FIAT_FLAG:
+                            label1.setText(Res.get("shared.fiat"));
+                            label2.setText(Res.get("list.currency.showFiat"));
+                            announced = Res.get("list.currency.showFiat") + announcedCount;
+                            break;
+                        case GUIUtil.SHOW_CRYPTO_FLAG:
+                            label1.setText(Res.get("shared.crypto"));
+                            label2.setText(Res.get("list.currency.showCrypto"));
+                            announced = Res.get("list.currency.showCrypto") + announcedCount;
                             break;
                         case GUIUtil.EDIT_FLAG:
                             label1.setText(Res.get("shared.edit"));
@@ -452,21 +473,12 @@ public class GUIUtil {
                                 label1.setGraphic(currencyIcon);
                             }
 
-                            if (item.numTrades > 0) {
-                                Label offersTarget = isCrypto ? label3 : label4;
-                                HBox.setMargin(offersTarget, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
-                                offersTarget.getStyleClass().add("offer-label");
-                                offersTarget.setText(item.numTrades + " " + (item.numTrades == 1 ? postFixSingle : postFixMulti));
-                                showOfferCount = true;
-                            }
-                            announced = item.tradeCurrency.getName() + ", " + Accessibility.spellOut(code)
-                                    + (showOfferCount ? ", " + (isCrypto ? label3 : label4).getText() : "");
+                            announced = item.tradeCurrency.getName() + ", " + Accessibility.spellOut(code) + announcedCount;
                     }
 
                     // append the offer pill only when present so the row ends at real content
                     box.getChildren().addAll(label1, label2);
-                    if (!isCrypto) box.getChildren().add(label3);
-                    if (showOfferCount) box.getChildren().add(isCrypto ? label3 : label4);
+                    if (showOfferCount) box.getChildren().add(label3);
 
                     setGraphic(box);
                     setAccessibleRowText(this, box, announced);
@@ -540,7 +552,6 @@ public class GUIUtil {
                 if (item != null && !empty) {
 
                     String code = item.getCode();
-                    boolean isCrypto = CurrencyUtil.isCryptoCurrency(code);
 
                     HBox box = new HBox();
                     box.setSpacing(20);
@@ -548,20 +559,18 @@ public class GUIUtil {
 
                     Label label1 = new AutoTooltipLabel(getCurrencyType(code));
                     label1.getStyleClass().add("currency-label-small");
-                    Label label2 = new AutoTooltipLabel(isCrypto ? item.getNameAndCode() : code);
+                    Label label2 = new AutoTooltipLabel(item.getNameAndCode());
                     label2.getStyleClass().add("currency-label");
-                    Label label3 = new AutoTooltipLabel(isCrypto ? "" : item.getName());
-                    if (!isCrypto) label3.getStyleClass().add("currency-label");
-                    Label label4 = new AutoTooltipLabel();
+                    Label label3 = new AutoTooltipLabel();
 
                     Optional<Integer> offerCountOptional = Optional.ofNullable(offerCounts.get(code));
-                    String announced; // name-first for screen readers; the visible row leads with the code
+                    String announced; // the code is spelled out for screen readers
 
                     switch (code) {
                         case GUIUtil.SHOW_ALL_FLAG:
                             label1.setText(Res.get("shared.all"));
-                            label2.setText(Res.get("list.currency.showAll"));
-                            announced = Res.get("list.currency.showAll");
+                            label2.setText(Res.get("offerbook.anyCurrency"));
+                            announced = Res.get("offerbook.anyCurrency");
                             break;
                         case GUIUtil.EDIT_FLAG:
                             label1.setText(Res.get("shared.edit"));
@@ -577,20 +586,18 @@ public class GUIUtil {
                                 label1.setGraphic(currencyIcon);
                             }
 
-                            Label offersTarget = isCrypto ? label3 : label4;
                             offerCountOptional.ifPresent(numOffers -> {
-                                HBox.setMargin(offersTarget, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
-                                offersTarget.getStyleClass().add("offer-label");
-                                offersTarget.setText(numOffers + " " + (numOffers == 1 ? postFixSingle : postFixMulti));
+                                HBox.setMargin(label3, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
+                                label3.getStyleClass().add("offer-label");
+                                label3.setText(numOffers + " " + (numOffers == 1 ? postFixSingle : postFixMulti));
                             });
                             announced = item.getName() + ", " + Accessibility.spellOut(code)
-                                    + (offerCountOptional.isPresent() ? ", " + offersTarget.getText() : "");
+                                    + (offerCountOptional.isPresent() ? ", " + label3.getText() : "");
                     }
 
                     // append the offer pill only when present so the row ends at real content
                     box.getChildren().addAll(label1, label2);
-                    if (!isCrypto) box.getChildren().add(label3);
-                    if (offerCountOptional.isPresent()) box.getChildren().add(isCrypto ? label3 : label4);
+                    if (offerCountOptional.isPresent()) box.getChildren().add(label3);
 
                     setGraphic(box);
                     setAccessibleRowText(this, box, announced);
@@ -700,7 +707,7 @@ public class GUIUtil {
                     box.getChildren().addAll(paymentMethod, offerCount);
 
                     if (id.equals(GUIUtil.SHOW_ALL_FLAG)) {
-                        paymentMethod.setText(Res.get("list.currency.showAll"));
+                        paymentMethod.setText(Res.get("offerbook.anyPaymentMethod"));
                     } else {
                         Optional.ofNullable(offerCounts.get(id)).ifPresent(numOffers -> {
                             HBox.setMargin(offerCount, new Insets(0, 0, 0, NUM_OFFERS_TRANSLATE_X));
@@ -1425,6 +1432,62 @@ public class GUIUtil {
         });
     }
 
+    private static final long RENDER_DEVICE_LOST_NANOS = TimeUnit.SECONDS.toNanos(10);
+    private static long renderDeviceLostSince; // nanoTime of the first failed check, 0 while the device is ready, render thread only
+
+    // JavaFX resets a lost D3D device only once Windows reports it resettable, so a device left lost after a system resume
+    // never paints again; reinitialize as JavaFX does for a removed device. Needs the com.sun.prism and tk.quantum opens.
+    public static void recoverLostRenderDevice() {
+        if (!Utilities.isWindows()) return;
+        try {
+            Class<?> graphicsPipeline = Class.forName("com.sun.prism.GraphicsPipeline");
+            Object pipeline = graphicsPipeline.getMethod("getPipeline").invoke(null);
+            if (pipeline == null || !pipeline.getClass().getName().equals("com.sun.prism.d3d.D3DPipeline")) return;
+            Method getDefaultResourceFactory = graphicsPipeline.getMethod("getDefaultResourceFactory");
+            Method isDeviceReady = Class.forName("com.sun.prism.ResourceFactory").getMethod("isDeviceReady");
+            Method reinitialize = pipeline.getClass().getDeclaredMethod("reinitialize");
+            reinitialize.setAccessible(true);
+            Method getRenderer = Class.forName("com.sun.javafx.tk.quantum.QuantumRenderer").getDeclaredMethod("getInstance");
+            getRenderer.setAccessible(true);
+            Executor renderer = (Executor) getRenderer.invoke(null);
+            Field renderLockField = Class.forName("com.sun.javafx.tk.quantum.ViewPainter").getDeclaredField("renderLock");
+            renderLockField.setAccessible(true);
+            ReentrantLock renderLock = (ReentrantLock) renderLockField.get(null);
+
+            Timer timer = new BackgroundTimer();
+            Runnable check = () -> {
+                renderLock.lock(); // held by the painters and by JavaFX's own reinitialize
+                try {
+                    Object factory = getDefaultResourceFactory.invoke(null);
+                    long now = System.nanoTime();
+                    if (factory != null && (boolean) isDeviceReady.invoke(factory)) {
+                        renderDeviceLostSince = 0;
+                    } else if (renderDeviceLostSince == 0) {
+                        renderDeviceLostSince = now;
+                    } else if (now - renderDeviceLostSince >= RENDER_DEVICE_LOST_NANOS) { // elapsed time, so queued checks cannot fire early
+                        renderDeviceLostSince = 0;
+                        log.warn("Reinitializing the D3D render pipeline after its device stayed lost");
+                        reinitialize.invoke(pipeline);
+                    }
+                } catch (Exception e) {
+                    timer.stop();
+                    log.warn("Cannot check the D3D render device, a window may stay unpainted after resume", e);
+                } finally {
+                    renderLock.unlock();
+                }
+            };
+            timer.runPeriodically(java.time.Duration.ofSeconds(5), () -> {
+                try {
+                    renderer.execute(check);
+                } catch (RejectedExecutionException e) {
+                    timer.stop(); // renderer shut down
+                }
+            });
+        } catch (Exception e) {
+            log.warn("Cannot watch the D3D render device, a window may stay unpainted after resume", e);
+        }
+    }
+
     private static final String CURSOR_REFRESH = "haveno.cursorRefresh";
     private static final String SHADOW_DISMISS = "haveno.shadowDismiss";
     private static Field mouseHandlerField, currCursorField, currCursorFrameField;
@@ -1767,6 +1830,8 @@ public class GUIUtil {
             try {
                 for (CryptoCurrency currency : CurrencyUtil.getAllSortedCryptoCurrencies()) {
                     getCurrencyImage(currency.getCode(), currencyIconBoxPx(CURRENCY_GRAPHIC_ROW_SIZE, scale), currencyIconMarginPx(scale));
+                    getCurrencyImage(currency.getCode(), currencyIconBoxPx(CURRENCY_GRAPHIC_FIELD_SIZE, scale), currencyIconMarginPx(scale));
+                    getCurrencyImage(currency.getCode(), currencyIconBoxPx(CURRENCY_GRAPHIC_PILL_SIZE, scale), currencyIconMarginPx(scale));
                     getCurrencyImage(currency.getCode(), Math.ceil(CURRENCY_LOGO_DEFAULT_SIZE * scale));
                 }
             } catch (Exception e) {
@@ -1920,6 +1985,8 @@ public class GUIUtil {
     }
 
     public static final double CURRENCY_GRAPHIC_ROW_SIZE = 25; // currency logo size (px) in list rows; adjust to resize
+    private static final double CURRENCY_GRAPHIC_FIELD_SIZE = 20; // currency logo size (px) in a collapsed field, within its content height
+    private static final double CURRENCY_GRAPHIC_PILL_SIZE = 18; // the same in a filter pill, which is shorter than a field
     private static final double CURRENCY_LABEL_SMALL_WIDTH = 45; // .currency-label-small -fx-pref-width
     private static final double CURRENCY_ICON_MARGIN = 1; // transparent margin (logical px) bled just outside list logos
 
@@ -1927,6 +1994,30 @@ public class GUIUtil {
         if (currencyCode == null) return null;
         if (CurrencyUtil.isFiatCurrency(currencyCode)) return getFiatCurrencyBadge(currencyCode, size);
         return getCurrencyIcon(currencyCode, size);
+    }
+
+    // the show all entries: every trade currency, or every currency of one asset class
+    public static boolean isShowAllFlag(String code) {
+        return SHOW_ALL_FLAG.equals(code) || SHOW_FIAT_FLAG.equals(code) || SHOW_CRYPTO_FLAG.equals(code);
+    }
+
+    // logo for the currency a collapsed field shows; none for the show all and edit list entries
+    public static Node getCurrencyFieldGraphic(TradeCurrency currency) {
+        return getCurrencyFieldGraphic(currency, CURRENCY_GRAPHIC_FIELD_SIZE);
+    }
+
+    public static Node getCurrencyPillGraphic(TradeCurrency currency) {
+        return getCurrencyFieldGraphic(currency, CURRENCY_GRAPHIC_PILL_SIZE);
+    }
+
+    public static Node getCurrencyPillGraphic(CurrencyListItem item) {
+        return getCurrencyPillGraphic(item.tradeCurrency);
+    }
+
+    private static Node getCurrencyFieldGraphic(TradeCurrency currency, double size) {
+        String code = currency.getCode();
+        if (isShowAllFlag(code) || code.equals(EDIT_FLAG)) return null;
+        return getCurrencyGraphic(code, size);
     }
 
     private static Node getFiatCurrencyBadge(String currencyCode, double size) {

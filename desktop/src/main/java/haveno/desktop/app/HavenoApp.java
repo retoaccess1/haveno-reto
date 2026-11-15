@@ -65,12 +65,14 @@ import haveno.desktop.main.overlays.windows.FilterWindow;
 import haveno.desktop.main.overlays.windows.SendAlertMessageWindow;
 import haveno.desktop.main.overlays.windows.ShowWalletDataWindow;
 import haveno.desktop.main.overlays.windows.TacContent;
+import haveno.desktop.main.overlays.windows.WalletPasswordWindow;
 import haveno.desktop.util.CssTheme;
 import haveno.desktop.util.DisplayUtils;
 import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.ImageUtil;
 import haveno.desktop.util.Transitions;
 import java.io.File;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -163,6 +165,7 @@ public class HavenoApp extends Application implements UncaughtExceptionHandler {
         GUIUtil.dismissContextMenusOnShadowPress();
         GUIUtil.keepScrollGesturesAttached(); // keep trackpad scrolling and inertia going when list cells rebuild
         GUIUtil.repaintOnRestore(stage);
+        GUIUtil.recoverLostRenderDevice();
 
         appLaunchedHandler.accept(this);
     }
@@ -570,14 +573,16 @@ public class HavenoApp extends Application implements UncaughtExceptionHandler {
             if (!confirmed || openingPasswordRecovery || shutDownRequested) return;
             openingPasswordRecovery = true;
             scene.getRoot().setDisable(true);
-            PasswordRecoveryLauncher.start(injector.getInstance(Config.class).walletDir.toPath().getParent())
+            Path networkDir = injector.getInstance(Config.class).walletDir.toPath().getParent();
+            PasswordRecoveryLauncher.start(networkDir)
                     .whenComplete((result, error) -> UserThread.execute(() -> {
                         if (error == null) {
                             stop();
                         } else {
                             openingPasswordRecovery = false;
                             scene.getRoot().setDisable(false);
-                            showError.accept(Res.get("password.recovery.launchFailed"));
+                            showError.accept(Res.get("password.recovery.launchFailed") + "\n\n"
+                                    + Res.get("password.recovery.launchFailed.manual", getMessage(error), PasswordRecoveryLauncher.manualCommand(networkDir)));
                         }
                     }));
         });
@@ -725,7 +730,7 @@ public class HavenoApp extends Application implements UncaughtExceptionHandler {
                 } else if (Utilities.isAltOrCtrlPressed(KeyCode.J, keyEvent)) {
                     WalletsManager walletsManager = injector.getInstance(WalletsManager.class);
                     if (walletsManager.areWalletsAvailable())
-                        new ShowWalletDataWindow(walletsManager).show();
+                        new ShowWalletDataWindow(walletsManager, injector.getInstance(WalletPasswordWindow.class)).show();
                     else
                         new Popup().warning(Res.get("popup.warning.walletNotInitialized")).show();
                 } else if (DevEnv.isDevMode()) {

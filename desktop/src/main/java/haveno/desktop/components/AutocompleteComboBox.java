@@ -21,9 +21,12 @@ import com.jfoenix.controls.JFXComboBox;
 import com.jfoenix.skins.JFXComboBoxListViewSkin;
 import haveno.common.UserThread;
 import haveno.common.util.Utilities;
+import haveno.desktop.util.Accessibility;
+import javafx.beans.InvalidationListener;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import javafx.event.ActionEvent;
 import javafx.event.Event;
 import javafx.event.EventHandler;
 import javafx.geometry.Bounds;
@@ -34,12 +37,15 @@ import javafx.scene.Node;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ScrollBar;
+import javafx.scene.control.TextField;
+import javafx.scene.control.skin.TextInputControlSkin;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.Region;
+import javafx.scene.text.Text;
 import javafx.stage.PopupWindow;
 import javafx.stage.Screen;
 import javafx.util.Callback;
@@ -57,7 +63,8 @@ import java.util.stream.Collectors;
  * A searchable, editable combo box: typing filters the dropdown like an autocomplete.
  *
  * Clients populate it with {@link #setAutocompleteItems} instead of {@code setItems}, and observe
- * confirmed changes (a click or [ENTER], not every keystroke) via {@link #setOnChangeConfirmed}.
+ * confirmed changes (a click, [ENTER], or leaving the field with text that names an item)
+ * via {@link #setOnChangeConfirmed}, rather than on every keystroke.
  *
  * @param <T> type of the item; may be a plain String
  */
@@ -65,6 +72,9 @@ import java.util.stream.Collectors;
 public class AutocompleteComboBox<T> extends JFXComboBox<T> {
 
     private static final int MAX_VISIBLE_ROWS = 10;
+    private static final double EDITOR_GRAPHIC_GAP = 8; // space between the editor graphic and its text
+    private static final double FIT_SLACK = 2; // keeps the caret and the last glyph of a fitted value unclipped
+    private static final double FIT_SEARCH_MAX_WIDTH = 180; // most width a typed query widens a fitted control to
 
     private final JFXComboBoxListViewSkin<T> skin;
     private final ListView<T> popupList; // the dropdown's ListView, exposed by the skin
@@ -74,8 +84,17 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
     private List<? extends T> searchPool;            // wider pool searched once the user types (optional)
     private List<T> shownItems = new ArrayList<>();  // items currently in the popup
     private Function<String, Predicate<T>> queryFilter; // custom query-to-item matcher (optional)
+    private Function<T, Node> editorGraphicFactory;  // graphic before the editor text, e.g. a logo (optional)
+    private Node editorGraphic;                      // shown graphic, an unmanaged child laid out in the editor's padding
+    private T editorGraphicFor;                      // value the shown graphic was made for
+    private final String editorStyle;                // the skin's inline editor style, kept under the graphic padding
+    private double fitMinWidth = -1;                 // least width when sized to the chosen value; negative sizes to the popup
+    private double fittedWidth;                      // width fitting the chosen value, or the widest text of a search underway
 
     private T committedValue;                        // last confirmed value, restored on an empty dismissal
+    private T valueBeforeSearch;                     // value to return to when a search is canceled with [ESC]
+    private boolean canceling;                       // set while [ESC] closes the popup, so the close is not a confirmation
+    private EventHandler<Event> changeConfirmedHandler; // run when a value change is confirmed
     private boolean selectingAll;                    // guards the trailing key event after ctrl/cmd+A
 
     // Measuring the popup width runs the cell factory over every row and lags each open, so it is
@@ -103,6 +122,7 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
         @SuppressWarnings("unchecked")
         ListView<T> content = (ListView<T>) skin.getPopupContent();
         popupList = content;
+        editorStyle = getEditor().getStyle();
 
         setAutocompleteItems(items);
         cellFactoryProperty().addListener((obs, old, factory) -> unpinWidth());
@@ -115,7 +135,11 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
         openPopupOnEditorClick();
         filterAsUserTypes();
         trackCommittedValue();
+        cancelSearchOnEscape();
         selectArrowedItemText();
+        showEditorGraphic();
+        stopCaretOnShownValue();
+        refitOnChange();
     }
 
     // Report non-editable to accessibility on mac: the editable combo maps to an AXComboBox, which
@@ -124,6 +148,40 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
     public Object queryAccessibleAttribute(AccessibleAttribute attribute, Object... parameters) {
         if (attribute == AccessibleAttribute.EDITABLE && Utilities.isOSX()) return false;
         return super.queryAccessibleAttribute(attribute, parameters);
+    }
+
+    // In fit mode the control is as wide as the chosen value needs. A search starts at that width and only widens,
+    // as far as its text needs, so nothing moves on opening the popup and a value pressed or arrowed to is never cut.
+    @Override
+    protected double computePrefWidth(double height) {
+        if (fitMinWidth < 0) return super.computePrefWidth(height);
+        T value = getValue();
+        TextField editor = getEditor();
+        boolean showsValue = value != null && asString(value).equals(editor.getText());
+        boolean searching = isShowing() || editor.isFocused() && !showsValue; // the popup closes while a query matches nothing
+        if (searching || showsValue) {
+            Text text = new Text(editor.getText());
+            text.setFont(editor.getFont());
+            Node arrow = lookup(".arrow-button");
+            double width = snapSizeX(snappedLeftInset() + editor.getPadding().getLeft() + text.getLayoutBounds().getWidth() + FIT_SLACK
+                    + (arrow == null ? 0 : arrow.prefWidth(-1)) + snappedRightInset());
+            if (!showsValue) width = Math.min(width, FIT_SEARCH_MAX_WIDTH); // a longer query scrolls
+            fittedWidth = searching ? Math.max(fittedWidth, width) : width;
+        } else if (value == null && committedValue == null) {
+            fittedWidth = 0; // nothing chosen and nothing to restore, so a finished search leaves only the floor
+        }
+        return Math.max(fitMinWidth, fittedWidth); // the floor alone until a value has been measured
+    }
+
+    // Place the editor graphic in the left padding the editor reserves for it.
+    @Override
+    protected void layoutChildren() {
+        super.layoutChildren();
+        if (editorGraphic == null) return;
+        TextField editor = getEditor();
+        editorGraphic.autosize();
+        editorGraphic.relocate(snapPositionX(editor.getLayoutX()),
+                snapPositionY(editor.getLayoutY() + (editor.getHeight() - editorGraphic.getLayoutBounds().getHeight()) / 2));
     }
 
     // --- public API ---
@@ -148,18 +206,34 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
         this.queryFilter = queryFilter;
     }
 
+    /** Size the control to the chosen value's text, at least minWidth wide, rather than to the popup. */
+    public void setFitToValue(double minWidth) {
+        fitMinWidth = minWidth;
+        requestLayout();
+    }
+
+    /** Show a graphic before the editor text while it shows a value; the factory may return null for none. */
+    public void setEditorGraphic(Function<T, Node> factory) {
+        editorGraphicFactory = factory;
+        editorGraphicFor = null; // rebuild for the shown value
+        updateEditorGraphic();
+    }
+
     /**
-     * Run the handler when a value change is <i>confirmed</i> - a dropdown click or [ENTER] - unlike
-     * onAction, which fires on every unconfirmed change and so does not suit a searchable combo.
+     * Run the handler when a value change is <i>confirmed</i> - a dropdown click, [ENTER], or leaving the field
+     * with text that names an item - unlike onAction, which fires on every unconfirmed change and so does not
+     * suit a searchable combo.
      */
     public final void setOnChangeConfirmed(EventHandler<Event> handler) {
+        changeConfirmedHandler = handler;
         setOnHidden(e -> {
+            if (canceling) return;
             String text = getEditor().getText();
 
             // Confirmed when the editor text resolves to the selected item.
             T selected = getSelectionModel().getSelectedItem();
             if (selected != null && selected.equals(getConverter().fromString(text))) {
-                handler.handle(e);
+                confirmChange(handler, e);
                 getParent().requestFocus();
                 return;
             }
@@ -167,13 +241,19 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
             // An empty editor also confirms (a cleared filter). A click on the editor keeps it blank for
             // typing; any other dismissal restores the committed value.
             if (text.isEmpty()) {
-                handler.handle(e);
+                confirmChange(handler, e);
                 if (!getEditor().isHover()) {
                     getParent().requestFocus();
-                    restoreCommittedValue();
+                    UserThread.execute(this::restoreCommittedValue);
                 }
             }
         });
+    }
+
+    // Run the handler; the value it leaves is the one a canceled search returns to.
+    private void confirmChange(EventHandler<Event> handler, Event event) {
+        handler.handle(event);
+        if (getValue() != null) valueBeforeSearch = getValue();
     }
 
     // --- focus and click behavior ---
@@ -184,6 +264,7 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
     private void clearEditorOnFocusGained() {
         getEditor().focusedProperty().addListener((obs, hadFocus, hasFocus) -> {
             if (hadFocus || !hasFocus) return;
+            valueBeforeSearch = committedValue;
             if (isUnfiltered()) {
                 resetSelection();
                 getEditor().setText("");
@@ -277,16 +358,97 @@ public class AutocompleteComboBox<T> extends JFXComboBox<T> {
             if (value != null) committedValue = value;
         });
         getEditor().focusedProperty().addListener((obs, wasFocused, focused) -> {
-            if (!focused && !getItems().contains(getConverter().fromString(getEditor().getText())))
+            if (focused) return;
+            if (!getItems().contains(getConverter().fromString(getEditor().getText())))
                 restoreCommittedValue();
+            confirmTypedValue(); // before the next field starts its search
         });
     }
 
+    // Leaving the editor commits text that names an item, as [ENTER] does. Confirm that item unless the handler
+    // already ran for it, so the view is told about every listed value the control ends up showing.
+    private void confirmTypedValue() {
+        T value = getValue();
+        if (changeConfirmedHandler == null || value == null || getEditor().isFocused()) return;
+        if (asString(value).equals(asString(valueBeforeSearch))) return; // the same choice, even if its item was rebuilt meanwhile
+        if (items.contains(value) || searchPool != null && searchPool.contains(value))
+            confirmChange(changeConfirmedHandler, new ActionEvent());
+    }
+
+    // [ESC] cancels a search: close the list without confirming, show the value from before the search and leave the editor.
+    // An open popup gets the key before this control and would close as a confirmation, so its list is filtered too.
+    private void cancelSearchOnEscape() {
+        EventHandler<KeyEvent> cancel = e -> {
+            if (e.getCode() != KeyCode.ESCAPE) return;
+            e.consume();
+            canceling = true;
+            hide();
+            canceling = false;
+            removeFilter(); // the full list, so the restored text resolves to its item when focus leaves
+            committedValue = valueBeforeSearch;
+            getSelectionModel().select(valueBeforeSearch);
+            getEditor().setText(asString(valueBeforeSearch));
+            getParent().requestFocus();
+        };
+        addEventFilter(KeyEvent.KEY_PRESSED, cancel);
+        popupList.addEventFilter(KeyEvent.KEY_PRESSED, cancel);
+    }
+
     private void restoreCommittedValue() {
-        UserThread.execute(() -> {
-            getSelectionModel().select(committedValue);
-            getEditor().setText(asString(committedValue));
-        });
+        getSelectionModel().select(committedValue);
+        getEditor().setText(asString(committedValue));
+    }
+
+    // --- editor graphic ---
+
+    private void showEditorGraphic() {
+        valueProperty().addListener((obs, old, value) -> updateEditorGraphic());
+        getEditor().textProperty().addListener((obs, old, text) -> updateEditorGraphic());
+    }
+
+    // Show the graphic only while the editor shows the value's text, so typing a search starts from a bare field.
+    private void updateEditorGraphic() {
+        T value = getValue();
+        T shown = editorGraphicFactory != null && value != null && asString(value).equals(getEditor().getText()) ? value : null;
+        if (shown == null ? editorGraphic == null : shown.equals(editorGraphicFor)) return;
+        getChildren().remove(editorGraphic);
+        editorGraphicFor = shown;
+        editorGraphic = shown == null ? null : editorGraphicFactory.apply(shown);
+        if (editorGraphic != null) {
+            editorGraphic.setManaged(false);
+            editorGraphic.setMouseTransparent(true); // clicks reach the editor beneath
+            Accessibility.mute(editorGraphic); // the editor text already names the value
+            getChildren().add(editorGraphic);
+        }
+        // inline important outranks the stylesheet's important zero editor padding
+        getEditor().setStyle(editorGraphic == null ? editorStyle
+                : editorStyle + "-fx-padding: 0 0 0 " + (editorGraphic.prefWidth(-1) + EDITOR_GRAPHIC_GAP) + " !important;");
+        requestLayout(); // an unmanaged child does not request it, and a same width swap leaves the style unchanged
+    }
+
+    // The caret invites typing a query, so stop it when the editor shows a chosen value, as after a row press;
+    // editing or a fresh focus restarts it.
+    private void stopCaretOnShownValue() {
+        InvalidationListener stopCaret = obs -> {
+            T value = getValue();
+            if (value != null && asString(value).equals(getEditor().getText()) && getEditor().getSkin() instanceof TextInputControlSkin<?> editorSkin)
+                editorSkin.setCaretAnimating(false);
+        };
+        valueProperty().addListener(stopCaret); // the skin leaves matching text untouched, so the text alone can miss a selection
+        getEditor().textProperty().addListener(stopCaret);
+    }
+
+    // A fitted control is measured from what the editor shows, so measure again when that may have changed.
+    private void refitOnChange() {
+        InvalidationListener refit = obs -> {
+            if (fitMinWidth >= 0) requestLayout();
+        };
+        valueProperty().addListener(refit);
+        getEditor().textProperty().addListener(refit);
+        getEditor().focusedProperty().addListener(refit);
+        showingProperty().addListener(refit);
+        // the skin repositions an open popup when this control resizes; a change listener runs after it and keeps the popup's side
+        widthProperty().addListener((obs, old, width) -> realignOpenPopup());
     }
 
     // --- popup plumbing ---

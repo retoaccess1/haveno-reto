@@ -149,6 +149,7 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
     private ToggleButton reserveExactAmountSlider;
     private ToggleButton isPrivateOfferSlider;
     private ToggleButton buyerAsTakerWithoutDepositSlider;
+    private ToggleButton requireSignedTakerSlider;
     protected InputTextArea extraInfoTextArea;
     private FundsTextField totalToPayTextField;
     private Label amountDescriptionLabel, priceCurrencyLabel, priceDescriptionLabel, volumeDescriptionLabel,
@@ -279,7 +280,9 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
 
             isPrivateOfferSlider.setSelected(model.dataModel.getIsPrivateOffer().get());
             buyerAsTakerWithoutDepositSlider.setSelected(model.dataModel.getBuyerAsTakerWithoutDeposit().get());
+            requireSignedTakerSlider.setSelected(model.dataModel.getRequireSignedTaker().get());
             updatePrivateOfferControls();
+            updateRequireSignedTakerControl();
 
             triggerPriceInputTextField.setText(model.triggerPrice.get());
             extraInfoTextArea.setText(model.dataModel.extraInfo.get());
@@ -359,6 +362,7 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         isPrivateOfferSlider.setVisible(HavenoUtils.isGeneralPrivateOffersEnabled());
         isPrivateOfferSlider.setManaged(HavenoUtils.isGeneralPrivateOffersEnabled());
         updatePrivateOfferControls();
+        updateRequireSignedTakerControl();
 
         placeOfferButton.updateText(placeOfferButtonLabel);
         updatePriceToggle();
@@ -611,12 +615,14 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         currencyComboBox.setOnAction(currencyComboBoxSelectionHandler);
 
         updatePriceToggle();
+        updateRequireSignedTakerControl();
     }
 
     private void onCurrencyComboBoxSelected() {
         TradeCurrency currency = currencyComboBox.getSelectionModel().getSelectedItem();
         model.onCurrencySelected(currency);
         updatePlaceOfferButton();
+        updateRequireSignedTakerControl();
     }
 
     // TODO: this should be called automatically on model.onCurrencySelected() ?
@@ -703,6 +709,15 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         placeOfferBox.managedProperty().bind(model.getDataModel().getIsXmrWalletFunded().and(model.showPayFundsScreenDisplayed));
         placeOfferButton.disableProperty().bind(model.isPlaceOfferButtonDisabled);
         cancelButton2.disableProperty().bind(model.cancelButtonDisabled);
+        // shown once the wallet can cover the offer, naming the available balance that switching off may lock, rounded up to 0.01 XMR
+        reserveExactAmountSlider.textProperty().bind(createStringBinding(() -> {
+            BigInteger balance = model.getDataModel().getWalletAvailableBalance().get();
+            BigInteger step = BigInteger.TEN.pow(10);
+            if (balance != null) balance = balance.add(step).subtract(BigInteger.ONE).divide(step).multiply(step);
+            return Res.get("shared.reserveExactAmount", HavenoUtils.formatXmr(balance, true));
+        }, model.getDataModel().getWalletAvailableBalance()));
+        reserveExactAmountSlider.visibleProperty().bind(model.getDataModel().getIsWalletAvailableBalanceSufficient().and(model.showPayFundsScreenDisplayed));
+        reserveExactAmountSlider.managedProperty().bind(reserveExactAmountSlider.visibleProperty());
 
         // trading account
         paymentAccountsComboBox.managedProperty().bind(paymentAccountsComboBox.visibleProperty());
@@ -759,6 +774,9 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         placeOfferBox.managedProperty().unbind();
         placeOfferButton.disableProperty().unbind();
         cancelButton2.disableProperty().unbind();
+        reserveExactAmountSlider.textProperty().unbind();
+        reserveExactAmountSlider.visibleProperty().unbind();
+        reserveExactAmountSlider.managedProperty().unbind();
 
         // trading account
         paymentTitledGroupBg.managedProperty().unbind();
@@ -980,6 +998,13 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         }
     }
 
+    // the signed taker option applies only to sell offers with chargeback risk, while the options group is shown
+    private void updateRequireSignedTakerControl() {
+        boolean show = setDepositTitledGroupBg.isVisible() && model.getDataModel().canRequireSignedTaker();
+        requireSignedTakerSlider.setVisible(show);
+        requireSignedTakerSlider.setManaged(show);
+    }
+
     private void updateSecurityDepositLabels() {
         if (model.isMinSecurityDeposit.get()) {
             // show XMR
@@ -1196,7 +1221,7 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         GridPane.setColumnIndex(securityDepositAndFeeBox, 0);
         GridPane.setHalignment(securityDepositAndFeeBox, HPos.LEFT);
         // bottom margin leaves room for the deposit field's error label
-        GridPane.setMargin(securityDepositAndFeeBox, new Insets(Layout.SEPARATED_FIRST_ROW_AND_GROUP_DISTANCE, 0, 16, 0));
+        GridPane.setMargin(securityDepositAndFeeBox, new Insets(Layout.SEPARATED_FIRST_ROW_AND_GROUP_DISTANCE, 0, 8, 0));
         gridPane.getChildren().add(securityDepositAndFeeBox);
 
         VBox tradeFeeFieldsBox = getTradeFeeFieldsBox();
@@ -1204,58 +1229,25 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         securityDepositAndFeeBox.getChildren().addAll(getSecurityDepositBox(), tradeFeeFieldsBox);
 
         // toggle to passphrase-protect any offer
-        isPrivateOfferSlider = FormBuilder.addSlideToggleButton(gridPane, ++gridRow, Res.get("createOffer.isPrivateOffer"));
+        isPrivateOfferSlider = FormBuilder.addSlideToggleButtonWithInfo(gridPane, ++gridRow,
+                Res.get("createOffer.isPrivateOffer"), Res.get("createOffer.isPrivateOffer.info"));
         isPrivateOfferSlider.setOnAction(event -> {
-
-            // popup info box
-            String key = "popup.info.isPrivateOffer";
-            if (isPrivateOfferSlider.isSelected() && DontShowAgainLookup.showAgain(key)) {
-                new Popup().headLine(Res.get(key + ".headline"))
-                        .information(Res.get(key))
-                        .closeButtonText(Res.get("shared.cancel"))
-                        .actionButtonText(Res.get("shared.ok"))
-                        .onAction(() -> {
-                            model.dataModel.setPrivateOffer(true);
-                            updatePrivateOfferControls();
-                        })
-                        .onClose(() -> {
-                            isPrivateOfferSlider.setSelected(false);
-                            model.dataModel.setPrivateOffer(false);
-                            updatePrivateOfferControls();
-                        })
-                        .dontShowAgainId(key)
-                        .show();
-            } else {
-                model.dataModel.setPrivateOffer(isPrivateOfferSlider.isSelected());
-                updatePrivateOfferControls();
-            }
+            model.dataModel.setPrivateOffer(isPrivateOfferSlider.isSelected());
+            updatePrivateOfferControls();
         });
-        GridPane.setHalignment(isPrivateOfferSlider, HPos.LEFT);
 
         // toggle to waive the buyer deposit (no-deposit offer); only for sell offers.
         // enabling it also enables the private toggle, since a no-deposit offer requires a passphrase.
-        buyerAsTakerWithoutDepositSlider = FormBuilder.addSlideToggleButton(gridPane, ++gridRow, Res.get("createOffer.buyerAsTakerWithoutDeposit"));
-        buyerAsTakerWithoutDepositSlider.setOnAction(event -> {
+        buyerAsTakerWithoutDepositSlider = FormBuilder.addSlideToggleButtonWithInfo(gridPane, ++gridRow,
+                Res.get("createOffer.buyerAsTakerWithoutDeposit"), Res.get("createOffer.buyerAsTakerWithoutDeposit.info"));
+        buyerAsTakerWithoutDepositSlider.setOnAction(event ->
+                applyBuyerAsTakerWithoutDeposit(buyerAsTakerWithoutDepositSlider.isSelected()));
 
-            // popup info box
-            String key = "popup.info.buyerAsTakerWithoutDeposit";
-            if (buyerAsTakerWithoutDepositSlider.isSelected() && DontShowAgainLookup.showAgain(key)) {
-                new Popup().headLine(Res.get(key + ".headline"))
-                        .information(Res.get(key))
-                        .closeButtonText(Res.get("shared.cancel"))
-                        .actionButtonText(Res.get("shared.ok"))
-                        .onAction(() -> applyBuyerAsTakerWithoutDeposit(true))
-                        .onClose(() -> {
-                            buyerAsTakerWithoutDepositSlider.setSelected(false);
-                            applyBuyerAsTakerWithoutDeposit(false);
-                        })
-                        .dontShowAgainId(key)
-                        .show();
-            } else {
-                applyBuyerAsTakerWithoutDeposit(buyerAsTakerWithoutDepositSlider.isSelected());
-            }
-        });
-        GridPane.setHalignment(buyerAsTakerWithoutDepositSlider, HPos.LEFT);
+        // toggle to only allow takers with a signed payment account; only for sell offers with chargeback risk
+        requireSignedTakerSlider = FormBuilder.addSlideToggleButtonWithInfo(gridPane, ++gridRow,
+                Res.get("createOffer.requireSignedTaker"), Res.get("createOffer.requireSignedTaker.info"));
+        requireSignedTakerSlider.setOnAction(event ->
+                model.dataModel.setRequireSignedTaker(requireSignedTakerSlider.isSelected()));
     }
 
     private void addExtraInfoGroup() {
@@ -1341,6 +1333,8 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         isPrivateOfferSlider.setManaged(false);
         buyerAsTakerWithoutDepositSlider.setVisible(false);
         buyerAsTakerWithoutDepositSlider.setManaged(false);
+        requireSignedTakerSlider.setVisible(false);
+        requireSignedTakerSlider.setManaged(false);
     }
 
     protected void hideExtraInfoGroup() {
@@ -1372,8 +1366,6 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         balanceTextField.setManaged(false);
         cancelButton2.setVisible(false);
         cancelButton2.setManaged(false);
-        reserveExactAmountSlider.setVisible(false);
-        reserveExactAmountSlider.setManaged(false);
     }
 
     protected void showFundingGroup() {
@@ -1389,8 +1381,6 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
         balanceTextField.setManaged(true);
         cancelButton2.setVisible(true);
         cancelButton2.setManaged(true);
-        reserveExactAmountSlider.setVisible(true);
-        reserveExactAmountSlider.setManaged(true);
     }
 
     private VBox getSecurityDepositBox() {
@@ -1420,8 +1410,8 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
     private void addFundingGroup() {
         // don't increase gridRow as we removed button when this gets visible
 
-        // the hidden sections leave 6 empty rows whose vgaps still space the grid, so pull the funding section up past them
-        hiddenSectionsGap = 6 * gridPane.getVgap();
+        // the hidden sections leave 7 empty rows whose vgaps still space the grid, so pull the funding section up past them
+        hiddenSectionsGap = 7 * gridPane.getVgap();
 
         payFundsTitledGroupBg = addTitledGroupBg(gridPane, gridRow, 3,
                 Res.get("createOffer.fundsBox.title"), Layout.SEPARATED_GROUP_DISTANCE - hiddenSectionsGap);
@@ -1468,9 +1458,10 @@ public abstract class MutableOfferView<M extends MutableOfferViewModel<?>> exten
             GridPane.setMargin(field, new Insets(margin.getTop(), 170, margin.getBottom(), margin.getLeft()));
         }
 
-        reserveExactAmountSlider = FormBuilder.addSlideToggleButton(gridPane, ++gridRow, Res.get("shared.reserveExactAmount"));
+        reserveExactAmountSlider = FormBuilder.addSlideToggleButton(gridPane, ++gridRow, "");
         GridPane.setHalignment(reserveExactAmountSlider, HPos.LEFT);
         reserveExactAmountSlider.setVisible(false);
+        reserveExactAmountSlider.setManaged(false);
         reserveExactAmountSlider.setSelected(preferences.getSplitOfferOutput());
         reserveExactAmountSlider.setOnAction(event -> {
             boolean selected = reserveExactAmountSlider.isSelected();

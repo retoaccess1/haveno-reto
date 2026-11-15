@@ -153,7 +153,12 @@ public class ClosedTradableFormatter {
 
         if (isHavenoV1Trade(tradable)) {
             Trade trade = castToTrade(tradable);
-            if (trade.isCompleted() || trade.isPayoutPublished()) {
+            BigInteger arbitratedBuyerGain = trade.getArbitratedBuyerGain();
+            if (arbitratedBuyerGain != null) {
+                if (arbitratedBuyerGain.signum() <= 0) return Res.get("portfolio.closed.canceledByArbitration");
+                if (arbitratedBuyerGain.compareTo(trade.getAmount()) >= 0) return Res.get("portfolio.closed.completedByArbitration");
+                return Res.get("portfolio.closed.ticketClosed");
+            } else if (trade.isCompleted() || trade.isPayoutPublished()) {
                 return Res.get("portfolio.closed.completed");
             } else if (trade.getDisputeState() == DISPUTE_CLOSED) {
                 return Res.get("portfolio.closed.ticketClosed");
@@ -177,6 +182,7 @@ public class ClosedTradableFormatter {
                 case DEACTIVATED:
                     log.error("Invalid state {}", state);
                     return state.name();
+                case PENDING: // a canceled offer can retain its pending state
                 case CANCELED:
                     return Res.get("portfolio.closed.canceled");
                 default:

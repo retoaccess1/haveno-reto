@@ -32,7 +32,7 @@ public class Version {
     // 1st digit: Mandatory protocol or consensus changes from upstream.
     // 2nd digit: Non-mandatory updates, patches, or minor improvements from upstream.
     // 3rd digit: Network-specific builds. This is reserved for forks and is never set by upstream.
-    public static final String VERSION = "1.12.0";
+    public static final String VERSION = "1.13.0";
 
     // Increment when the user agreement changes, independently of the application version.
     public static final int TAC_VERSION = 2;
@@ -141,7 +141,7 @@ public class Version {
         return p2pMessageVersion;
     }
 
-    // The version for the crypto network (XMR_Mainnet = 0, XMR_LOCAL = 1, XMR_Regtest = 2, ...)
+    // The version for the crypto network (XMR_MAINNET = 0, XMR_STAGENET = 1, XMR_LOCAL = 2)
     private static int BASE_CURRENCY_NETWORK;
 
     public static void setBaseCryptoNetworkId(int baseCryptoNetworkId) {

@@ -79,9 +79,10 @@ class DuplicateOfferDataModel extends MutableOfferDataModel {
         if (account != null) {
             this.paymentAccount = account;
         }
+        // price first so the amounts round against the offer price instead of the raw market price
+        setPrice(offer.getPrice());
         setMinAmount(offer.getMinAmount());
         setAmount(offer.getAmount());
-        setPrice(offer.getPrice());
         setVolume(offer.getVolume());
         setUseMarketBasedPrice(offer.isUseMarketBasedPrice());
         if (offer.isUseMarketBasedPrice()) {
@@ -89,6 +90,7 @@ class DuplicateOfferDataModel extends MutableOfferDataModel {
         }
         setPrivateOffer(offer.isPrivateOffer());
         setBuyerAsTakerWithoutDeposit(offer.hasBuyerAsTakerWithoutDeposit());
+        setRequireSignedTaker(offer.requiresSignedTaker());
         setSecurityDepositPct(offer.getSellerSecurityDepositPct());
         setExtraInfo(offer.getOfferExtraInfo());
 

@@ -62,6 +62,7 @@ import haveno.core.support.dispute.refund.RefundManager;
 import haveno.core.support.messages.ChatMessage;
 import haveno.core.support.traderchat.TraderChatManager;
 import haveno.core.trade.Contract;
+import haveno.core.trade.HavenoUtils;
 import haveno.core.trade.Trade;
 import haveno.core.trade.TradeManager;
 import haveno.core.trade.BuyerTrade;
@@ -82,6 +83,7 @@ import haveno.desktop.common.view.View;
 import haveno.desktop.common.view.ViewPath;
 import haveno.desktop.main.MainView;
 import haveno.desktop.main.funds.transactions.TransactionsListItem;
+import haveno.desktop.main.settings.network.MoneroNetworkListItem;
 import haveno.desktop.main.settings.network.NetworkSettingsView;
 import haveno.desktop.main.overlays.windows.TorNetworkSettingsWindow;
 import haveno.desktop.main.overlays.notifications.Notification;
@@ -111,6 +113,7 @@ import haveno.proto.grpc.NotificationMessage;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -131,6 +134,7 @@ import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.ReadOnlyBooleanWrapper;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleDoubleProperty;
+import javafx.beans.property.SimpleIntegerProperty;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.beans.property.SimpleLongProperty;
 import javafx.collections.FXCollections;
@@ -151,6 +155,7 @@ import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.TextField;
+import javafx.scene.control.ToggleButton;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableRow;
@@ -178,6 +183,8 @@ import javafx.stage.Stage;
 import javafx.stage.Window;
 import javafx.stage.WindowEvent;
 import monero.common.MoneroRpcConnection;
+import monero.daemon.MoneroDaemonRpc;
+import monero.daemon.model.MoneroDaemonInfo;
 import monero.daemon.model.MoneroTx;
 import monero.wallet.model.MoneroTxWallet;
 import monero.wallet.model.MoneroWalletListener;
@@ -815,7 +822,10 @@ public class OverlayTest {
         private MockedStatic<GUIUtil> gui;
         private MockedStatic<ThreadUtils> tasks;
         private MockedStatic<UserThread> userThread;
+        private MockedConstruction<haveno.desktop.main.overlays.popups.Popup> popups;
         private Preferences preferences;
+        private XmrNodes nodes;
+        private XmrLocalNode localNode;
         private NetworkSettingsView view;
         private Map<String, Object> controls;
         private Runnable refresh;
@@ -838,8 +848,9 @@ public class OverlayTest {
                 refresh = invocation.getArgument(0);
                 return mock(Timer.class);
             });
+            popups = mockConstruction(haveno.desktop.main.overlays.popups.Popup.class, withSettings().defaultAnswer(RETURNS_SELF));
             Config config = new Config();
-            XmrNodes nodes = mock(XmrNodes.class);
+            nodes = mock(XmrNodes.class);
             var provided = new XmrNodes.XmrNode(MoneroNodesOption.PROVIDED, null, null, "provided.example", 18081, 1, null);
             var publicNode = new XmrNodes.XmrNode(MoneroNodesOption.PUBLIC, null, null, "public.example", 18081, 2, null);
             when(nodes.getProvidedXmrNodes()).thenReturn(List.of(provided));
@@ -856,16 +867,16 @@ public class OverlayTest {
             doAnswer(invocation -> {
                 preferences.applyNodeSettings(invocation.getArgument(0), invocation.getArgument(1));
                 return null;
-            }).when(connections).setNodeSettings(any(), any());
-            XmrLocalNode local = mock(XmrLocalNode.class);
-            when(local.shouldBeIgnored()).thenReturn(true);
+            }).when(connections).setNodeSettings(any(), any(), any());
+            localNode = mock(XmrLocalNode.class);
+            when(localNode.shouldBeIgnored()).thenReturn(true);
             FilterManager filters = mock(FilterManager.class);
             when(filters.filterProperty()).thenReturn(filter);
             when(filters.getFilter()).thenAnswer(invocation -> filter.get());
             P2PService p2p = mock(P2PService.class, RETURNS_DEEP_STUBS);
             when(p2p.getNetworkNode().getNodeAddress()).thenReturn(null);
             view = new NetworkSettingsView(config, p2p, connections, preferences, nodes, filters,
-                    mock(TorNetworkSettingsWindow.class), mock(ClockWatcher.class), mock(XmrWalletService.class), local);
+                    mock(TorNetworkSettingsWindow.class), mock(ClockWatcher.class), mock(XmrWalletService.class), localNode);
             FXMLLoader loader = new FXMLLoader(NetworkSettingsView.class.getResource("NetworkSettingsView.fxml"));
             loader.setControllerFactory(type -> view);
             loader.load();
@@ -876,6 +887,7 @@ public class OverlayTest {
         @AfterEach
         void tearDown() {
             if (view != null) view.deactivate();
+            if (popups != null) popups.close();
             if (userThread != null) userThread.close();
             if (tasks != null) tasks.close();
             if (gui != null) gui.close();
@@ -884,34 +896,247 @@ public class OverlayTest {
         }
 
         @Test
-        void queuedSourceChangesApplyOnlyTheLatestSelection() {
-            source().setValue(MoneroNodesOption.CUSTOM);
-            source().setValue(MoneroNodesOption.PROVIDED);
-            source().setValue(MoneroNodesOption.PUBLIC);
+        void tabsShowAListAndOnlyTheUseButtonSwitches() {
+            assertTrue(inUse(MoneroNodesOption.PUBLIC));
+            assertFalse(useButton().isVisible());
+            tab(MoneroNodesOption.CUSTOM).fire();
+            assertTrue(tab(MoneroNodesOption.CUSTOM).isSelected());
+            assertTrue(inUse(MoneroNodesOption.PUBLIC));
+            assertEquals(Res.get("settings.net.useCustom"), useButton().getText());
+            assertEquals(MoneroNodesOption.PUBLIC, preferences.getMoneroNodesOption());
+            assertTrue(nodeRow(new MoneroRpcConnection("http://" + customAddress)).isUnchecked());
+
+            doAnswer(invocation -> {
+                preferences.setCustomNodes(invocation.getArgument(0));
+                return null;
+            }).when(connections).setCustomNodes(anyString());
+            TextField input = (TextField) controls.get("addInput");
+            input.setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            assertEquals("", input.getText());
+            assertEquals(2, nodeTable().getItems().size());
+            assertTrue(input.isDisabled());
+            background.remove(0).run();
+            assertEquals(customAddress + ",another.example:18081", preferences.getNetworkSettings().customNodes());
+            assertEquals(MoneroNodesOption.PUBLIC, preferences.getMoneroNodesOption());
+            assertFalse(input.isDisabled());
+            verify(connections, never()).addCustomNode(anyString());
+            verify(connections, never()).probeConnection(any());
+
+            tab(MoneroNodesOption.PUBLIC).fire();
+            assertFalse(useButton().isVisible());
+            assertEquals(1, nodeTable().getItems().size());
+            tab(MoneroNodesOption.CUSTOM).fire();
+            assertEquals(2, nodeTable().getItems().size());
+            useButton().fire();
+            assertFalse(useButton().isVisible());
+            assertTrue(inUse(MoneroNodesOption.CUSTOM));
+            background.remove(0).run();
+            verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress + ",another.example:18081", null);
+            assertEquals(MoneroNodesOption.CUSTOM, preferences.getMoneroNodesOption());
+            assertTrue(background.isEmpty());
+        }
+
+        @Test
+        void rolledBackSwitchKeepsEditsOnTheRunningList() {
+            MoneroRpcConnection custom = new MoneroRpcConnection("http://" + customAddress);
+            preferences.applyNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
+            live.set(0, custom);
+            refresh.run();
+            doThrow(new IllegalStateException("Public nodes are blocked by filter")).when(connections).setNodeSettings(eq(MoneroNodesOption.PUBLIC), any(), any());
+            tab(MoneroNodesOption.PUBLIC).fire();
+            useButton().fire();
+            tab(MoneroNodesOption.CUSTOM).fire();
+            assertTrue(useButton().isVisible());
+            background.remove(0).run();
+            assertFalse(useButton().isVisible());
+            assertTrue(inUse(MoneroNodesOption.CUSTOM));
+
+            ((TextField) controls.get("addInput")).setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            background.remove(0).run();
+            verify(connections).addCustomNode("another.example:18081");
+            verify(connections, never()).setCustomNodes(anyString());
+        }
+
+        @Test
+        void queuedCustomSelectionKeepsTheSavedNodes() {
+            preferences.applyNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
+            live.set(0, new MoneroRpcConnection("http://" + customAddress));
+            refresh.run();
+            tab(MoneroNodesOption.PUBLIC).fire();
+            useButton().fire();
+            tab(MoneroNodesOption.CUSTOM).fire();
+            useButton().fire();
+            assertEquals(1, nodeTable().getItems().size());
+            ((TextField) controls.get("addInput")).setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            assertEquals(2, nodeTable().getItems().size());
+            background.remove(0).run();
+            background.remove(0).run();
+            verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress + ",another.example:18081", null);
+        }
+
+        @Test
+        void useOfAnotherSourceKeepsAQueuedCustomNodeEdit() {
+            tab(MoneroNodesOption.CUSTOM).fire();
+            useButton().fire();
+            ((TextField) controls.get("addInput")).setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            tab(MoneroNodesOption.PROVIDED).fire();
+            useButton().fire();
+            background.remove(0).run();
+            background.remove(0).run();
+            var order = inOrder(connections);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress, null);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.PROVIDED, customAddress + ",another.example:18081", null);
+            assertEquals(customAddress + ",another.example:18081", preferences.getNetworkSettings().customNodes());
+            assertTrue(background.isEmpty());
+        }
+
+        @Test
+        void filterBlockingPublicNodesKeepsAQueuedCustomNodeEdit() {
+            tab(MoneroNodesOption.CUSTOM).fire();
+            useButton().fire();
+            ((TextField) controls.get("addInput")).setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            tab(MoneroNodesOption.PUBLIC).fire();
+            useButton().fire();
+            Filter restriction = mock(Filter.class);
+            when(restriction.isPreventPublicXmrNetwork()).thenReturn(true);
+            preferences.setPublicMoneroNodesBlocked(true);
+            filter.set(restriction);
+            background.remove(0).run();
             assertEquals(1, background.size());
-            assertEquals(MoneroNodesOption.PUBLIC, source().getValue());
+            background.remove(0).run();
+            verify(connections, never()).setNodeSettings(eq(MoneroNodesOption.PUBLIC), any(), any());
+            verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress + ",another.example:18081", null);
+            assertTrue(inUse(MoneroNodesOption.CUSTOM));
+            assertTrue(background.isEmpty());
+        }
+
+        @Test
+        void savedNodesAndArrowKeysFollowTheTabs() {
+            tab(MoneroNodesOption.CUSTOM).fire();
+            ((TextField) controls.get("addInput")).setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            tab(MoneroNodesOption.PUBLIC).fire();
+            assertEquals(1, nodeTable().getItems().size());
+            tab(MoneroNodesOption.CUSTOM).fire();
+            assertEquals(2, nodeTable().getItems().size());
+            background.remove(0).run();
+
+            tab(MoneroNodesOption.PUBLIC).getToggleGroup().selectToggle(tab(MoneroNodesOption.PUBLIC));
+            assertEquals(1, nodeTable().getItems().size());
+            assertFalse(useButton().isVisible());
+            tab(MoneroNodesOption.CUSTOM).getToggleGroup().selectToggle(tab(MoneroNodesOption.CUSTOM));
+            assertTrue(useButton().isVisible());
+            refresh.run();
+            assertTrue(tab(MoneroNodesOption.CUSTOM).isSelected());
+            tab(MoneroNodesOption.CUSTOM).fire(); // clicking the selected tab keeps it selected
+            assertTrue(tab(MoneroNodesOption.CUSTOM).isSelected());
+            assertTrue(useButton().isVisible());
+        }
+
+        @Test
+        void confirmedSourceAndAddedNodesAreListedBeforeTheServiceListsThem() {
+            tab(MoneroNodesOption.CUSTOM).fire();
+            useButton().fire();
+            MoneroRpcConnection custom = new MoneroRpcConnection("http://" + customAddress);
+            assertEquals(1, nodeTable().getItems().size());
+            assertTrue(nodeRow(custom).isChecking());
+            assertTrue(((Node) controls.get("addRow")).isVisible());
+
+            TextField input = (TextField) controls.get("addInput");
+            assertFalse(input.isDisabled());
+            input.setText("another.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            MoneroRpcConnection another = new MoneroRpcConnection("http://another.example:18081");
+            assertTrue(nodeRow(another).isChecking());
+            assertEquals(1, background.size());
+            live.set(0, custom);
+            background.remove(0).run();
+            live.add(another);
+            background.remove(0).run();
+            var order = inOrder(connections);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress, null);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress + ",another.example:18081", null);
+            assertFalse(nodeRow(another).isChecking());
+
+            MoneroRpcConnection third = new MoneroRpcConnection("http://third.example:18081");
+            when(connections.addCustomNode("third.example:18081")).thenAnswer(invocation -> {
+                live.add(third);
+                return third;
+            });
+            input.setText("third.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            assertEquals("", input.getText());
+            assertTrue(nodeRow(third).isUnchecked());
+            verify(connections, never()).addCustomNode(anyString());
+            background.remove(0).run();
+            assertTrue(nodeRow(third).isUnchecked());
+            assertTrue(background.isEmpty());
+            verify(connections, never()).probeConnection(any());
+        }
+
+        @Test
+        void addedNodeIsCheckedOnlyWhileDisconnected() {
+            preferences.applyNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
+            when(connections.isConnected()).thenReturn(false);
+            refresh.run();
+            MoneroRpcConnection added = new MoneroRpcConnection("http://another.example:18081");
+            when(connections.addCustomNode("another.example:18081")).thenAnswer(invocation -> {
+                live.add(added);
+                return added;
+            });
+            doThrow(new IllegalStateException("Connection service is not running")).when(connections).addCustomNode("failed.example:18081");
+
+            ((TextField) controls.get("addInput")).setText("another.example:18081 failed.example:18081");
+            ((Button) controls.get("addButton")).fire();
+            assertTrue(nodeRow(added).isChecking());
+            assertTrue(nodeRow(new MoneroRpcConnection("http://failed.example:18081")).isChecking());
+            background.remove(0).run();
+            assertEquals(2, nodeTable().getItems().size());
+            assertTrue(nodeRow(added).isChecking());
+            background.remove(0).run();
+
+            verify(connections).probeConnection(added);
+            verify(connections).connectToNodeIfDisconnected(eq(added), any());
+            assertFalse(nodeRow(added).isChecking());
+            assertTrue(background.isEmpty());
+        }
+
+        @Test
+        void queuedSourceChangesApplyOnlyTheLatestSelection() {
+            for (MoneroNodesOption option : List.of(MoneroNodesOption.CUSTOM, MoneroNodesOption.PROVIDED, MoneroNodesOption.PUBLIC)) {
+                tab(option).fire();
+                useButton().fire();
+            }
+            assertEquals(1, background.size());
+            assertTrue(tab(MoneroNodesOption.PUBLIC).isSelected());
 
             background.remove(0).run();
             assertEquals(1, background.size());
             background.remove(0).run();
 
             var order = inOrder(connections);
-            order.verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress);
-            order.verify(connections).setNodeSettings(MoneroNodesOption.PUBLIC, customAddress);
-            verify(connections, never()).setNodeSettings(eq(MoneroNodesOption.PROVIDED), any());
+            order.verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress, null);
+            order.verify(connections).setNodeSettings(MoneroNodesOption.PUBLIC, customAddress, null);
+            verify(connections, never()).setNodeSettings(eq(MoneroNodesOption.PROVIDED), any(), any());
             assertEquals(MoneroNodesOption.PUBLIC, preferences.getMoneroNodesOption());
-            assertFalse(source().isDisabled());
+            assertTrue(inUse(MoneroNodesOption.PUBLIC));
         }
 
         @Test
         void emptyCustomSelectionAndTorChangesDoNotChangeTheRunningSettings() {
             preferences.applyNodeSettings(MoneroNodesOption.PUBLIC, "");
             refresh.run();
-            source().setValue(MoneroNodesOption.CUSTOM);
+            tab(MoneroNodesOption.CUSTOM).fire();
             assertEquals(MoneroNodesOption.PUBLIC, preferences.getMoneroNodesOption());
-            assertTrue(((TableView<?>) controls.get("moneroConnectionsTableView")).getItems().isEmpty());
-            source().setValue(MoneroNodesOption.PUBLIC);
-            assertEquals(1, ((TableView<?>) controls.get("moneroConnectionsTableView")).getItems().size());
+            assertTrue(nodeTable().getItems().isEmpty());
+            assertTrue(useButton().isDisabled());
+            tab(MoneroNodesOption.PUBLIC).fire();
+            assertEquals(1, nodeTable().getItems().size());
 
             @SuppressWarnings("unchecked")
             ComboBox<UseTorForXmr> tor = (ComboBox<UseTorForXmr>) controls.get("tor");
@@ -932,10 +1157,11 @@ public class OverlayTest {
             filter.set(restriction);
             refresh.run();
 
-            assertEquals(MoneroNodesOption.PROVIDED, source().getValue());
+            assertTrue(tab(MoneroNodesOption.PROVIDED).isSelected());
+            assertTrue(inUse(MoneroNodesOption.PROVIDED));
             assertTrue(((Node) controls.get("statusNote")).isVisible());
             assertEquals(Res.get("settings.net.filterPending"), ((Label) controls.get("statusTitle")).getText());
-            verify(connections, never()).setNodeSettings(any(), any());
+            verify(connections, never()).setNodeSettings(any(), any(), any());
 
             live.clear();
             refresh.run();
@@ -966,9 +1192,185 @@ public class OverlayTest {
             verify(connections, never()).probeConnection(any());
         }
 
+        @Test
+        void oldRemoteFailuresShowAsUncheckedWithoutRechecking() {
+            long now = System.currentTimeMillis();
+            live.get(0).setOnline(false);
+            live.get(0).setAttribute("lastChecked", now - 900000);
+            MoneroRpcConnection old = addNode("old.example", false, now - 900000);
+            MoneroRpcConnection recent = addNode("recent.example", false, now - 540000);
+            MoneroRpcConnection local = addNode("127.0.0.1", false, now - 900000);
+            MoneroRpcConnection peerless = addNode("peerless.example", false, now - 900000);
+            peerless.setAttribute("lastInfo", new MoneroDaemonInfo());
+            MoneroRpcConnection login = addNode("login.example", true, now - 900000);
+            login.setAuthenticated(false);
+            when(connections.isConnected()).thenReturn(false);
+
+            view.deactivate();
+            view.activate();
+
+            assertTrue(background.isEmpty());
+            verify(connections, never()).probeConnection(any());
+            assertTrue(nodeRow(old).isUnchecked());
+            assertEquals(Res.get("settings.net.notChecked"), nodeRow(old).getStatus());
+            assertFalse(nodeRow(recent).isUnchecked());
+            assertEquals(Res.get("settings.net.notReachable"), nodeRow(recent).getStatus());
+            assertEquals(Res.get("settings.net.notRunning"), nodeRow(local).getStatus());
+            assertEquals(Res.get("settings.net.noNodePeers"), nodeRow(peerless).getStatus());
+            assertEquals(Res.get("settings.net.requiresLogin"), nodeRow(login).getStatus());
+            assertEquals(Res.get("settings.net.notResponding"), nodeRow(live.get(0)).getStatus());
+
+            recent.setAttribute("lastChecked", now - 660000);
+            refresh.run();
+            assertTrue(nodeRow(recent).isUnchecked());
+            assertEquals(Res.get("settings.net.notChecked"), nodeRow(recent).getStatus());
+            assertTrue(background.isEmpty());
+        }
+
+        @Test
+        void otherNodesShowNoResponseTimeFromAnOldCheck() {
+            long now = System.currentTimeMillis();
+            live.get(0).setOnline(true);
+            live.get(0).setResponseTime(800L);
+            live.get(0).setAttribute("lastChecked", now - 900000);
+            MoneroRpcConnection old = addNode("old.example", true, now - 900000);
+            old.setResponseTime(14000L);
+            MoneroRpcConnection recent = addNode("recent.example", true, now - 540000);
+            recent.setResponseTime(9000L);
+            refresh.run();
+
+            assertEquals(800L, nodeRow(live.get(0)).getResponseTime());
+            assertNull(nodeRow(old).getResponseTime());
+            assertEquals(Res.get("settings.net.online"), nodeRow(old).getStatus());
+            assertEquals(9000L, nodeRow(recent).getResponseTime());
+
+            recent.setAttribute("lastChecked", now - 660000);
+            refresh.run();
+            assertNull(nodeRow(recent).getResponseTime());
+            assertEquals(Res.get("settings.net.online"), nodeRow(recent).getStatus());
+        }
+
+        @Test
+        void publicNodesListTheLocalNodeOnlyWhileItRuns() {
+            String localUri = "http://127.0.0.1:18081";
+            MoneroRpcConnection localState = new MoneroRpcConnection(localUri);
+            MoneroDaemonRpc daemon = mock(MoneroDaemonRpc.class);
+            when(daemon.getRpcConnection()).thenReturn(localState);
+            when(localNode.getDaemon()).thenReturn(daemon);
+            when(localNode.equalsUri(anyString())).thenAnswer(invocation -> List.of(localUri, "http://localhost:18081").contains(invocation.getArgument(0)));
+            List<XmrNodes.XmrNode> all = new ArrayList<>(nodes.getAllXmrNodes());
+            all.add(new XmrNodes.XmrNode(MoneroNodesOption.PUBLIC, null, null, "127.0.0.1", 18081, 1, "@local"));
+            when(nodes.getAllXmrNodes()).thenReturn(all);
+            MoneroRpcConnection local = addNode("127.0.0.1", false, System.currentTimeMillis());
+            refresh.run();
+            assertFalse(nodeTable().getItems().stream().anyMatch(item -> item.getConnection() == local));
+            assertEquals(1, nodeTable().getItems().size());
+
+            localState.setOnline(true);
+            refresh.run();
+            assertTrue(nodeTable().getItems().stream().anyMatch(item -> item.getConnection() == local));
+            assertEquals(2, nodeTable().getItems().size());
+
+            localState.setOnline(false);
+            live.set(0, new MoneroRpcConnection("http://" + customAddress));
+            preferences.applyNodeSettings(MoneroNodesOption.CUSTOM, customAddress + ",127.0.0.1:18081");
+            refresh.run();
+            assertTrue(nodeTable().getItems().stream().anyMatch(item -> item.getConnection() == local));
+            assertEquals(2, nodeTable().getItems().size());
+
+            live.set(0, new MoneroRpcConnection("http://localhost:18081")); // a local current node is not polled by the local node poller
+            tab(MoneroNodesOption.PUBLIC).fire();
+            assertTrue(nodeTable().getItems().stream().anyMatch(item -> item.getConnection() == local));
+            assertEquals(3, nodeTable().getItems().size());
+        }
+
+        @Test
+        void connectingFromAnotherListSwitchesToItStartingWithThatNode() throws Exception {
+            String customUri = "http://" + customAddress;
+            tab(MoneroNodesOption.CUSTOM).fire();
+            doThrow(new IllegalStateException("Node is unavailable or is not synchronized")).when(connections).setNodeSettings(any(), any(), anyString());
+
+            connectNow(0);
+            background.remove(0).run();
+
+            verify(connections).setNodeSettings(MoneroNodesOption.CUSTOM, customAddress, customUri);
+            verify(popups.constructed().getFirst()).warning(Res.get("settings.net.connectFailed", customAddress, Res.get("settings.net.nodeUnavailable")));
+            assertTrue(inUse(MoneroNodesOption.PUBLIC));
+            assertTrue(tab(MoneroNodesOption.PUBLIC).isSelected());
+
+            doAnswer(invocation -> {
+                preferences.applyNodeSettings(invocation.getArgument(0), invocation.getArgument(1));
+                live.set(0, new MoneroRpcConnection((String) invocation.getArgument(2)));
+                return null;
+            }).when(connections).setNodeSettings(any(), any(), anyString());
+            tab(MoneroNodesOption.CUSTOM).fire();
+            connectNow(0);
+            assertTrue(((TextField) controls.get("addInput")).isDisabled()); // an added node would queue a switch to the best node
+            background.remove(0).run();
+
+            assertFalse(((TextField) controls.get("addInput")).isDisabled());
+            assertTrue(inUse(MoneroNodesOption.CUSTOM));
+            assertTrue(nodeRow(live.get(0)).isConnected());
+            Label note = (Label) controls.get("selectionNote");
+            assertTrue(note.isVisible());
+            assertEquals(Res.get("settings.net.manualNode"), note.getText());
+            assertEquals(1, popups.constructed().size());
+        }
+
+        @Test
+        void connectingFromAnotherListChecksOnlyTheChosenNode() throws Exception {
+            preferences.applyNodeSettings(MoneroNodesOption.PUBLIC, customAddress + ",another.example:18081");
+            tab(MoneroNodesOption.CUSTOM).fire();
+            connectNow(0);
+
+            assertTrue(inUse(MoneroNodesOption.CUSTOM));
+            assertTrue(nodeRow(new MoneroRpcConnection("http://" + customAddress)).isChecking());
+            assertTrue(nodeRow(new MoneroRpcConnection("http://another.example:18081")).isUnchecked());
+
+            tab(MoneroNodesOption.PUBLIC).fire();
+            useButton().fire(); // a queued switch checks every node of its list
+            assertTrue(inUse(MoneroNodesOption.PUBLIC));
+            assertTrue(nodeRow(live.get(0)).isChecking());
+            background.remove(0).run();
+            background.remove(0).run();
+            verify(connections).setNodeSettings(MoneroNodesOption.PUBLIC, customAddress + ",another.example:18081", null);
+        }
+
+        // the node menu is a window, which needs the FX thread, so its connect action runs directly
+        private void connectNow(int index) throws Exception {
+            Method connect = NetworkSettingsView.class.getDeclaredMethod("connectNow", MoneroNetworkListItem.class);
+            connect.setAccessible(true);
+            connect.invoke(view, nodeTable().getItems().get(index));
+        }
+
+        private MoneroRpcConnection addNode(String host, Boolean online, Long checked) {
+            MoneroRpcConnection connection = new MoneroRpcConnection("http://" + host + ":18081");
+            connection.setOnline(online);
+            connection.setAttribute("lastChecked", checked);
+            live.add(connection);
+            return connection;
+        }
+
+        private MoneroNetworkListItem nodeRow(MoneroRpcConnection connection) {
+            return nodeTable().getItems().stream().filter(item -> item.getConnection().getUri().equals(connection.getUri())).findFirst().orElseThrow();
+        }
+
         @SuppressWarnings("unchecked")
-        private ComboBox<MoneroNodesOption> source() {
-            return (ComboBox<MoneroNodesOption>) controls.get("source");
+        private TableView<MoneroNetworkListItem> nodeTable() {
+            return (TableView<MoneroNetworkListItem>) controls.get("moneroConnectionsTableView");
+        }
+
+        private ToggleButton tab(MoneroNodesOption option) {
+            return ((HBox) controls.get("sourceTabs")).getChildren().stream().filter(node -> node.getUserData() == option)
+                    .map(node -> (ToggleButton) node).findFirst().orElseThrow();
+        }
+
+        private boolean inUse(MoneroNodesOption option) {
+            return tab(option).getGraphic() != null;
+        }
+
+        private Button useButton() {
+            return (Button) controls.get("useSourceButton");
         }
     }
 
@@ -3192,6 +3594,7 @@ public class OverlayTest {
             MediationManager mediationManager = mock(MediationManager.class);
             RefundManager refundManager = mock(RefundManager.class);
             when(preferences.getUseAnimationsProperty()).thenReturn(new SimpleBooleanProperty());
+            when(preferences.getRepeatNotificationSoundSecondsProperty()).thenReturn(new SimpleIntegerProperty());
             when(preferences.getDontShowAgainMapAsObservable()).thenReturn(seenUpdates);
             when(preferences.showAgain(anyString())).thenAnswer(invocation -> !Boolean.TRUE.equals(seenUpdates.get(invocation.getArgument(0))));
             doAnswer(invocation -> {
@@ -3212,6 +3615,91 @@ public class OverlayTest {
             if (backgroundTasks != null) backgroundTasks.close();
             if (mainView != null) mainView.close();
             UserThread.setExecutor(originalExecutor);
+        }
+
+        @Test
+        void repeatSoundTimerFollowsPreferenceChanges() {
+            try (MockedStatic<UserThread> scheduler = mockStatic(UserThread.class)) {
+                scheduler.when(() -> UserThread.execute(any(Runnable.class))).thenCallRealMethod();
+                notificationCenter.onAllServicesAndViewsInitialized();
+                scheduler.verify(() -> UserThread.runPeriodically(any(Runnable.class), anyLong()), never());
+                Timer previous = null;
+                for (int seconds : List.of(900, 3600, 10800, 43200)) {
+                    Timer timer = mock(Timer.class);
+                    scheduler.when(() -> UserThread.runPeriodically(any(Runnable.class), eq((long) seconds))).thenReturn(timer);
+                    preferences.getRepeatNotificationSoundSecondsProperty().set(seconds);
+                    scheduler.verify(() -> UserThread.runPeriodically(any(Runnable.class), eq((long) seconds)));
+                    if (previous != null) verify(previous).stop();
+                    verify(timer, never()).stop();
+                    previous = timer;
+                }
+                preferences.getRepeatNotificationSoundSecondsProperty().set(0);
+                verify(previous).stop();
+                scheduler.verify(() -> UserThread.runPeriodically(any(Runnable.class), anyLong()), times(4));
+            }
+        }
+
+        @Test
+        void repeatSoundRequiresUnseenActivityInAnOpenTraderTrade() {
+            preferences.getRepeatNotificationSoundSecondsProperty().set(900);
+            when(preferences.getRepeatNotificationSoundSeconds()).thenAnswer(invocation ->
+                    preferences.getRepeatNotificationSoundSecondsProperty().get());
+            Trade maker = addTrade(true);
+            Trade taker = addTrade(false);
+            Trade arbitrator = addTrade(true);
+            when(arbitrator.isArbitrator()).thenReturn(true);
+            arbitrator.getChatMessages().add(message(arbitrator, true));
+            setPhase(maker, Trade.Phase.DEPOSITS_PUBLISHED);
+            try (MockedStatic<UserThread> scheduler = mockStatic(UserThread.class);
+                 MockedStatic<HavenoUtils> sounds = mockStatic(HavenoUtils.class)) {
+                scheduler.when(() -> UserThread.execute(any(Runnable.class))).thenCallRealMethod();
+                scheduler.when(() -> UserThread.runPeriodically(any(Runnable.class), eq(900L))).thenReturn(mock(Timer.class));
+                notificationCenter.onAllServicesAndViewsInitialized();
+                ArgumentCaptor<Runnable> callback = ArgumentCaptor.forClass(Runnable.class);
+                scheduler.verify(() -> UserThread.runPeriodically(callback.capture(), eq(900L)));
+                Runnable tick = callback.getValue();
+                sounds.verifyNoInteractions();
+                tick.run();
+                tick.run();
+                sounds.verify(HavenoUtils::playChimeSound, times(2));
+                sounds.clearInvocations();
+
+                viewTrade(maker);
+                tick.run();
+                sounds.verifyNoInteractions();
+                for (Trade trade : List.of(maker, taker)) {
+                    ChatMessage system = message(trade, true);
+                    system.setSystemMessage(true);
+                    trade.getChatMessages().addAll(message(trade, false), system);
+                    tick.run();
+                    sounds.verifyNoInteractions();
+                    trade.getChatMessages().add(message(trade, true));
+                    tick.run();
+                    sounds.verify(HavenoUtils::playChimeSound);
+                    sounds.clearInvocations();
+                    notificationCenter.onChatFocusChanged(trade.getChatMessages(), true, tradeManager::requestPersistence);
+                    tick.run();
+                    notificationCenter.onChatFocusChanged(trade.getChatMessages(), false, tradeManager::requestPersistence);
+                    tick.run();
+                    sounds.verifyNoInteractions();
+                }
+
+                maker.getChatMessages().add(message(maker, true));
+                when(maker.isPayoutPublished()).thenReturn(true);
+                tick.run();
+                sounds.verifyNoInteractions();
+                taker.getChatMessages().add(message(taker, true));
+                trades.remove(taker);
+                tick.run();
+                sounds.verifyNoInteractions();
+                when(maker.isPayoutPublished()).thenReturn(false);
+                tick.run();
+                sounds.verify(HavenoUtils::playChimeSound);
+                sounds.clearInvocations();
+                preferences.getRepeatNotificationSoundSecondsProperty().set(0);
+                tick.run();
+                sounds.verifyNoInteractions();
+            }
         }
 
         @Test

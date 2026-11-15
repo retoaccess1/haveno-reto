@@ -19,7 +19,6 @@ package haveno.desktop.main.settings.preferences;
 
 import com.google.inject.Inject;
 import com.google.inject.name.Named;
-import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon;
 import haveno.common.UserThread;
 import haveno.common.app.DevEnv;
 import haveno.common.config.Config;
@@ -54,9 +53,7 @@ import haveno.desktop.common.view.ActivatableViewAndModel;
 import haveno.desktop.common.view.FxmlView;
 import haveno.desktop.components.AutoTooltipButton;
 import haveno.desktop.components.AutoTooltipLabel;
-import haveno.desktop.components.AutoTooltipSlideToggleButton;
 import haveno.desktop.components.AutocompleteComboBox;
-import haveno.desktop.components.InfoAutoTooltipLabel;
 import haveno.desktop.components.InputTextField;
 import haveno.desktop.components.PasswordTextField;
 import haveno.desktop.components.TitledGroupBg;
@@ -67,6 +64,7 @@ import static haveno.desktop.util.FormBuilder.addButton;
 import static haveno.desktop.util.FormBuilder.addComboBox;
 import static haveno.desktop.util.FormBuilder.addInputTextField;
 import static haveno.desktop.util.FormBuilder.addSlideToggleButton;
+import static haveno.desktop.util.FormBuilder.addSlideToggleButtonWithInfo;
 import static haveno.desktop.util.FormBuilder.addTextFieldWithEditButton;
 import static haveno.desktop.util.FormBuilder.addTitledGroupBg;
 import static haveno.desktop.util.FormBuilder.addTopLabelListView;
@@ -75,8 +73,10 @@ import haveno.desktop.util.GUIUtil;
 import haveno.desktop.util.ImageUtil;
 import haveno.desktop.util.Layout;
 import java.io.File;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -84,6 +84,7 @@ import java.util.stream.Collectors;
 import javafx.beans.value.ChangeListener;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import javafx.collections.transformation.SortedList;
 import javafx.geometry.HPos;
 import javafx.geometry.Insets;
 import javafx.geometry.Orientation;
@@ -91,7 +92,6 @@ import javafx.geometry.Pos;
 import javafx.geometry.VPos;
 import javafx.scene.control.Button;
 import javafx.scene.control.ComboBox;
-import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
@@ -109,10 +109,15 @@ import org.apache.commons.lang3.StringUtils;
 
 @FxmlView
 public class PreferencesView extends ActivatableViewAndModel<GridPane, PreferencesViewModel> {
+    // fiat, then crypto, then precious metals, each group by name
+    private static final Comparator<TradeCurrency> PREFERRED_CURRENCY_ORDER = Comparator.comparingInt((TradeCurrency currency) ->
+            CurrencyUtil.isFiatCurrency(currency.getCode()) ? 0 : CurrencyUtil.isCryptoCurrency(currency.getCode()) ? 1 : 2)
+            .thenComparing(Comparator.naturalOrder());
     private final User user;
     private TextField xmrExplorerTextField;
     private ComboBox<String> userLanguageComboBox;
     private ComboBox<Country> userCountryComboBox;
+    private ComboBox<Integer> repeatNotificationSoundComboBox;
     private AutocompleteComboBox<TradeCurrency> preferredTradeCurrencyComboBox;
 
     private ToggleButton showOwnOffersInOfferBook, useAnimations, useDarkMode, useSoftwareRendering, sortMarketCurrenciesNumerically,
@@ -252,7 +257,7 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
         GridPane.setValignment(optionsGridPane, VPos.TOP);
         root.add(optionsGridPane, 0, 0);
 
-        int titledGroupBgRowSpan = displayStandbyModeFeature ? 9 : 8;
+        int titledGroupBgRowSpan = displayStandbyModeFeature ? 10 : 9;
         TitledGroupBg titledGroupBg = addTitledGroupBg(optionsGridPane, gridRow, titledGroupBgRowSpan, Res.get("setting.preferences.general"));
         GridPane.setColumnSpan(titledGroupBg, 1);
 
@@ -314,17 +319,30 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
                     Res.get("setting.preferences.avoidStandbyMode"), 8);
         }
 
+        useNativeXmrWallet = addSlideToggleButtonWithInfo(optionsGridPane, ++gridRow,
+                Res.get("setting.preferences.useNativeXmrWallet"), Res.get("setting.preferences.useNativeXmrWallet.info"));
+
         useSoundForNotifications = addSlideToggleButton(optionsGridPane, ++gridRow,
                 Res.get("setting.preferences.useSoundForNotifications"));
 
-        useNativeXmrWallet = new AutoTooltipSlideToggleButton();
-        useNativeXmrWallet.setText(Res.get("setting.preferences.useNativeXmrWallet"));
-        InfoAutoTooltipLabel useNativeXmrWalletInfo = new InfoAutoTooltipLabel("", FontAwesomeIcon.INFO_CIRCLE, ContentDisplay.RIGHT,
-                Res.get("setting.preferences.useNativeXmrWallet.info"), 420);
-        HBox useNativeXmrWalletBox = new HBox(6, useNativeXmrWallet, useNativeXmrWalletInfo);
-        useNativeXmrWalletBox.setAlignment(Pos.CENTER_LEFT);
-        GridPane.setRowIndex(useNativeXmrWalletBox, ++gridRow);
-        optionsGridPane.getChildren().add(useNativeXmrWalletBox);
+        repeatNotificationSoundComboBox = addComboBox(optionsGridPane, ++gridRow,
+                Res.get("setting.preferences.repeatNotificationSound"));
+        repeatNotificationSoundComboBox.setItems(FXCollections.observableArrayList(0, 900, 3600, 10800, 43200));
+        repeatNotificationSoundComboBox.setConverter(new StringConverter<>() {
+            @Override
+            public String toString(Integer seconds) {
+                if (seconds == null || seconds == 0) return Res.get("setting.preferences.repeatNotificationSound.off");
+                if (seconds < 3600) return Res.get("setting.preferences.repeatNotificationSound.everyMinutes", seconds / 60);
+                if (seconds == 3600) return Res.get("setting.preferences.repeatNotificationSound.everyHour");
+                return Res.get("setting.preferences.repeatNotificationSound.everyHours", seconds / 3600);
+            }
+
+            @Override
+            public Integer fromString(String string) {
+                return null;
+            }
+        });
+        repeatNotificationSoundComboBox.disableProperty().bind(useSoundForNotifications.selectedProperty().not());
     }
 
     private void resetPriceDeviation() {
@@ -410,6 +428,7 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
 
         preferredTradeCurrencyComboBox.setCellFactory(GUIUtil.getTradeCurrencyCellFactory("", "",
                 FXCollections.emptyObservableMap()));
+        preferredTradeCurrencyComboBox.setEditorGraphic(GUIUtil::getCurrencyFieldGraphic);
 
         Tuple3<Label, ListView<TraditionalCurrency>, VBox> traditionalTuple = addTopLabelListView(currenciesGridPane, displayCurrenciesGridRowIndex,
                 Res.get("setting.preferences.displayTraditional"));
@@ -606,14 +625,8 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
         useDarkMode = addSlideToggleButton(optionsGridPane, ++gridRow, Res.get("setting.preferences.useDarkMode"));
         sortMarketCurrenciesNumerically = addSlideToggleButton(optionsGridPane, ++gridRow, Res.get("setting.preferences.sortWithNumOffers"));
         hideNonAccountPaymentMethodsToggle = addSlideToggleButton(optionsGridPane, ++gridRow, Res.get("setting.preferences.onlyShowPaymentMethodsFromAccount"));
-        useSoftwareRendering = new AutoTooltipSlideToggleButton();
-        useSoftwareRendering.setText(Res.get("setting.preferences.useSoftwareRendering"));
-        InfoAutoTooltipLabel useSoftwareRenderingInfo = new InfoAutoTooltipLabel("", FontAwesomeIcon.INFO_CIRCLE, ContentDisplay.RIGHT,
-                Res.get("setting.preferences.useSoftwareRendering.info"), 420);
-        HBox useSoftwareRenderingBox = new HBox(6, useSoftwareRendering, useSoftwareRenderingInfo);
-        useSoftwareRenderingBox.setAlignment(Pos.CENTER_LEFT);
-        GridPane.setRowIndex(useSoftwareRenderingBox, ++gridRow);
-        optionsGridPane.getChildren().add(useSoftwareRenderingBox);
+        useSoftwareRendering = addSlideToggleButtonWithInfo(optionsGridPane, ++gridRow,
+                Res.get("setting.preferences.useSoftwareRendering"), Res.get("setting.preferences.useSoftwareRendering.info"));
         //denyApiTakerToggle = addSlideToggleButton(optionsGridPane, ++gridRow, Res.get("setting.preferences.denyApiTaker")); // TODO: re-enable?
         //notifyOnPreReleaseToggle = addSlideToggleButton(optionsGridPane, ++gridRow, Res.get("setting.preferences.notifyOnPreRelease"));
         resetDontShowAgainButton = addButton(optionsGridPane, ++gridRow, Res.get("setting.preferences.resetAllFlags"), 12);
@@ -635,7 +648,9 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
         autoConfRequiredConfirmationsTf.setValidator(new IntegerValidator(1, DevEnv.isDevMode() ? 100000000 : 1000));
 
         autoConfTradeLimitTf = addInputTextField(autoConfirmGridPane, ++localRowIndex, Res.get("setting.preferences.autoConfirmMaxTradeSize"));
-        autoConfTradeLimitTf.setValidator(new XmrValidator());
+        XmrValidator autoConfTradeLimitValidator = new XmrValidator();
+        autoConfTradeLimitValidator.setMaxValue(BigInteger.valueOf(Long.MAX_VALUE)); // the limit is stored as a long
+        autoConfTradeLimitTf.setValidator(autoConfTradeLimitValidator);
 
         autoConfServiceAddressTf = addInputTextField(autoConfirmGridPane, ++localRowIndex, Res.get("setting.preferences.autoConfirmServiceAddresses"));
         GridPane.setHgrow(autoConfServiceAddressTf, Priority.ALWAYS);
@@ -805,7 +820,7 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
     }
 
     private void activateDisplayCurrencies() {
-        preferredTradeCurrencyComboBox.setAutocompleteItems(tradeCurrencies);
+        preferredTradeCurrencyComboBox.setAutocompleteItems(new SortedList<>(tradeCurrencies, PREFERRED_CURRENCY_ORDER));
         preferredTradeCurrencyComboBox.getSelectionModel().select(preferences.getPreferredTradeCurrency());
         preferredTradeCurrencyComboBox.getEditor().setText(
                 preferredTradeCurrencyComboBox.getConverter().toString(preferences.getPreferredTradeCurrency()));
@@ -924,6 +939,9 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
         useSoundForNotifications.setSelected(preferences.isUseSoundForNotifications());
         useSoundForNotifications.setOnAction(e -> preferences.setUseSoundForNotifications(useSoundForNotifications.isSelected()));
 
+        repeatNotificationSoundComboBox.setValue(preferences.getRepeatNotificationSoundSeconds());
+        repeatNotificationSoundComboBox.setOnAction(e -> preferences.setRepeatNotificationSoundSeconds(repeatNotificationSoundComboBox.getValue()));
+
         useNativeXmrWallet.setSelected(preferences.isUseNativeXmrWallet());
         useNativeXmrWallet.setOnAction(e -> {
             boolean selected = useNativeXmrWallet.isSelected();
@@ -994,6 +1012,7 @@ public class PreferencesView extends ActivatableViewAndModel<GridPane, Preferenc
             avoidStandbyMode.setOnAction(null);
         }
         useSoundForNotifications.setOnAction(null);
+        repeatNotificationSoundComboBox.setOnAction(null);
         useNativeXmrWallet.setOnAction(null);
     }
 

@@ -22,6 +22,7 @@ import monero.common.MoneroRpcConnection;
 import monero.common.NetworkUtils;
 
 public class MoneroNetworkListItem {
+    private static final long STALE_CHECK_MS = 600000; // remote checks older than this show no response time, and failures show as unchecked
     private final MoneroRpcConnection connection;
     private final boolean current, checking, unchecked;
     private final Boolean connected;
@@ -41,8 +42,10 @@ public class MoneroNetworkListItem {
         this.checking = checking;
         this.owner = owner;
         boolean online = Boolean.TRUE.equals(connection.isConnected());
-        unchecked = !current && !checking && connection.isOnline() == null;
-        responseTime = online && (!current || isConnected()) ? connection.getResponseTime() : null;
+        boolean stale = !current && isStaleCheck();
+        unchecked = !current && !checking && (connection.isOnline() == null || stale && Boolean.FALSE.equals(connection.isOnline()) &&
+                XmrConnectionService.getCachedDaemonInfo(connection) == null);
+        responseTime = online && !stale && (!current || isConnected()) ? connection.getResponseTime() : null;
         rank = current ? 0 : checking ? 1 : online ? 2 : unchecked ? 3 : 4;
         status = NetworkSettingsView.text(statusKey(online));
         displayState = new DisplayState(getAddress(), owner, current, this.connected, checking, status, responseTime,
@@ -54,6 +57,12 @@ public class MoneroNetworkListItem {
                 XmrConnectionService.getCachedDaemonInfo(connection) != null && !Boolean.TRUE.equals(connection.isOnline()) ? "noNodePeers" :
                 Boolean.FALSE.equals(connection.isAuthenticated()) ? "requiresLogin" : online ? "online" :
                 isLocalNotRunning() ? "notRunning" : unchecked ? "notChecked" : "notReachable";
+    }
+
+    // other nodes are only checked when switching, so an old result no longer says anything about the node
+    private boolean isStaleCheck() {
+        Long checked = XmrConnectionService.getLastCheckedTimestamp(connection);
+        return !NetworkUtils.isLocalHost(connection.getUri()) && checked != null && System.currentTimeMillis() - checked > STALE_CHECK_MS;
     }
 
     private boolean isLocalNotRunning() {
